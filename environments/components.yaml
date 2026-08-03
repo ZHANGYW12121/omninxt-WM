@@ -1,0 +1,49 @@
+schema: omninxt_components_v1
+imported_at: "2026-08-03"
+components:
+  isaac_sim:
+    version: "5.1.0"
+    tracked_in_git: false
+    env: ISAACSIM_ROOT
+  pegasus:
+    url: https://github.com/PegasusSimulator/PegasusSimulator.git
+    commit: bef3c57f2cfef9c6dacf3262969e01b59eeb7c7a
+    patch: third_party/pegasus/patches/0001-portable-people-runtime.patch
+  px4:
+    url: https://github.com/PX4/PX4-Autopilot.git
+    commit: 6ea3539157ca358c70a515878b77077af7d4611d
+    build_target: px4_sitl_default
+    env: PX4_DIR
+  d2slam:
+    url: https://github.com/HKUST-Aerial-Robotics/D2SLAM.git
+    commit: 3a4b8071f6f9c40a151c7685aa738b717ce8916a
+    patch: simulation/omnidepth/patches/d2slam_current_geometry_and_depth.patch
+    env: D2SLAM_ROOT
+    bootstrap: tools/bootstrap_d2slam.sh
+  rtmlib:
+    url: https://github.com/Tau-J/rtmlib.git
+    note: Runtime subset is vendored with its upstream license for reproducibility.
+assets:
+  warehouse_usd:
+    sha256: 2f3eb49cf492e521ee4a7b7c682be14b9dfaacab0176bc24ecd8d49bb113d7cd
+    env: WAREHOUSE_USD
+  omninxt_body_usdc:
+    sha256: 4c796f07f694b2f8a89201cadbc56ce64f605a514ac06698cf24a9805d29b8ba
+    relative_to: OMNINXT_VISUAL_ASSET_DIR
+    path: Omininxt_body.usdc
+  rotor_fl_usdc:
+    sha256: e6d7c6169f78410a83f7ea763c799f9659ccfe101c65b4acbe296109ea4cc6a6
+    relative_to: OMNINXT_VISUAL_ASSET_DIR
+    path: fl.usdc
+  rotor_fr_usdc:
+    sha256: 95cf0952a57918a157d86747fe5be0b91489a518f8e691c0f520c1b12d9c63df
+    relative_to: OMNINXT_VISUAL_ASSET_DIR
+    path: fr.usdc
+  rotor_rl_usdc:
+    sha256: 11f637b667ad3f12e497d223d51da0195eb6771b2d9d2fd88cca68f9ded87aad
+    relative_to: OMNINXT_VISUAL_ASSET_DIR
+    path: rl.usdc
+  rotor_rr_usdc:
+    sha256: 973937f074de91bfe228447b75167ba96568b2e55f002c29c02c6c47f73303b4
+    relative_to: OMNINXT_VISUAL_ASSET_DIR
+    path: rr.usdc

@@ -1,0 +1,22 @@
+FROM omnidepth:ada
+
+COPY D2SLAM/quadcam_depth_est/CMakeLists.txt \
+     /root/swarm_ws/src/D2SLAM/quadcam_depth_est/CMakeLists.txt
+COPY D2SLAM/quadcam_depth_est/package.xml \
+     /root/swarm_ws/src/D2SLAM/quadcam_depth_est/package.xml
+COPY D2SLAM/quadcam_depth_est/include/ \
+     /root/swarm_ws/src/D2SLAM/quadcam_depth_est/include/
+COPY D2SLAM/quadcam_depth_est/src/ \
+     /root/swarm_ws/src/D2SLAM/quadcam_depth_est/src/
+COPY D2SLAM/quadcam_depth_est/launch/ \
+     /root/swarm_ws/src/D2SLAM/quadcam_depth_est/launch/
+COPY D2SLAM/d2common/include/ \
+     /root/swarm_ws/src/D2SLAM/d2common/include/
+COPY D2SLAM/tensorrt_utils/ \
+     /root/swarm_ws/src/D2SLAM/tensorrt_utils/
+
+RUN cd /root/swarm_ws && \
+    source /opt/ros/noetic/setup.bash && \
+    touch /root/swarm_ws/src/D2SLAM/D2SLAM/quadcam_depth_est/CATKIN_IGNORE && \
+    catkin clean quadcam_depth_est -y && \
+    catkin build quadcam_depth_est -j8 -p8

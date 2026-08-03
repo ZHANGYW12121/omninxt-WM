@@ -1,0 +1,252 @@
+diff --git a/extensions/pegasus.simulator/pegasus/simulator/logic/people/person.py b/extensions/pegasus.simulator/pegasus/simulator/logic/people/person.py
+index 7cb7ceb..8485deb 100644
+--- a/extensions/pegasus.simulator/pegasus/simulator/logic/people/person.py
++++ b/extensions/pegasus.simulator/pegasus/simulator/logic/people/person.py
+@@ -5,6 +5,9 @@
+ | Description: Definition of the Person class which is used as the base for spawning people in the simulation world.
+ """
+ 
++import os
++from pathlib import Path
++
+ import numpy as np
+ from scipy.spatial.transform import Rotation
+ 
+@@ -34,13 +37,56 @@ from pegasus.simulator.logic.people.person_controller import PersonController
+ from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
+ 
+ 
++REMOTE_PEOPLE_ASSET_ROOT = (
++    "https://omniverse-content-production.s3-us-west-2.amazonaws.com/"
++    "Assets/Isaac/5.1/Isaac/People/Characters"
++)
++
++PEGASUS_PEOPLE_CONTROL_HZ = float(
++    os.environ.get("PEGASUS_PEOPLE_CONTROL_HZ", "25")
++)
++if PEGASUS_PEOPLE_CONTROL_HZ <= 0.0:
++    raise ValueError("PEGASUS_PEOPLE_CONTROL_HZ must be greater than zero")
++
++# The old implementation registered a second 250 Hz callback just for state
++# reads.  The setting is retained as an explicit migration marker, but state
++# sampling is now always part of the single rate-limited people callback.
++PEGASUS_PEOPLE_STATE_CALLBACK = (
++    os.environ.get("PEGASUS_PEOPLE_STATE_CALLBACK", "0").strip().lower()
++    in ("1", "true", "yes", "on")
++)
++
++
++def _default_local_people_asset_root():
++    """Locate this checkout's downloaded people assets without a user-specific path."""
++    for parent in Path(__file__).resolve().parents:
++        if parent.name == "isaacsim":
++            return parent / "database" / "assets" / "people" / "Characters"
++    return Path.home() / "zyw" / "isaacsim" / "database" / "assets" / "people" / "Characters"
++
++
++def _asset_root_uri(value):
++    value = str(value).strip().rstrip("/")
++    if "://" in value:
++        return value
++    return Path(value).expanduser().resolve().as_uri()
++
++
+ class Person:
+     """
+     Class that implements a person in the simulation world. The person can be controlled by a controller that inherits from the PersonController class.
+     """
+ 
+-    # Get root assets path from setting, if not set, get the Isaac-Sim asset path
+-    people_asset_folder = "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/People/Characters/"
++    # Prefer a configured/downloaded local mirror so character creation works
++    # without Internet. The remote Isaac asset server remains a compatibility
++    # fallback until download_people_assets.py has been run.
++    _configured_asset_root = os.environ.get("PEGASUS_PEOPLE_ASSET_ROOT", "").strip()
++    _local_asset_root = _default_local_people_asset_root()
++    _state_callback_warning_logged = False
++    people_asset_folder = _asset_root_uri(
++        _configured_asset_root
++        or (_local_asset_root if _local_asset_root.is_dir() else REMOTE_PEOPLE_ASSET_ROOT)
++    )
+     character_root_prim_path = PrimPaths.characters_parent_path()
+ 
+     assets_root_path = None   
+@@ -82,7 +128,8 @@ class Person:
+ 
+         # Auxiliar variable to compute the velocity of the person using discrete differentiation
+         self._previous_position = np.array(init_pos)
+-        self._total_dt = 0.0
++        self._people_control_interval = 1.0 / PEGASUS_PEOPLE_CONTROL_HZ
++        self._people_control_accumulator = 0.0
+ 
+         # Set the target position for the character
+         self._target_position = np.array(init_pos)
+@@ -119,12 +166,19 @@ class Person:
+         if self._backend:
+             self._backend.initialize(self)
+ 
+-        # Add a callback to the physics engine to update the current state of the person
+-        self._world.add_physics_callback(self._stage_prefix + "/state", self.update_state)
+-
+-        # Add the update method to the physics callback if the world was received
+-        # so that we can apply the new references to be tracked by the person
++        # Keep exactly one physics callback per person.  It receives the 250 Hz
++        # physics dt, but all character state/controller/AnimationGraph work is
++        # performed together at PEGASUS_PEOPLE_CONTROL_HZ.
+         self._world.add_physics_callback(self._stage_prefix + "/update", self.update)
++        if (
++            PEGASUS_PEOPLE_STATE_CALLBACK
++            and not Person._state_callback_warning_logged
++        ):
++            Person._state_callback_warning_logged = True
++            carb.log_warn(
++                "PEGASUS_PEOPLE_STATE_CALLBACK is deprecated and ignored; "
++                "person state sampling is merged into the single people callback."
++            )
+ 
+         # Set the flag that signals if the simulation is running or not
+         self._sim_running = False
+@@ -140,7 +194,7 @@ class Person:
+             State: The current state of the person, i.e., position, orientation, linear and angular velocities...
+         """
+         return self._state
+-    
++
+     def sim_start_stop(self, event):
+         """
+         Callback that is called every time there is a timeline event such as starting/stoping the simulation.
+@@ -162,6 +216,8 @@ class Person:
+         """
+         Method that is called when the simulation starts. This method can be used to initialize any variables.
+         """
++        self._people_control_accumulator = 0.0
++        self._previous_position = np.array(self._state.position)
+         if self._controller:
+             self._controller.start()
+ 
+@@ -174,11 +230,33 @@ class Person:
+ 
+     def update(self, dt: float):
+         """
+-        Method that implements the logic to make the person move around in the simulation world and also play the animation
++        Run one ordered, rate-limited character update.
++
++        The callback itself remains attached to the 250 Hz physics clock so its
++        accumulator uses simulation dt.  Heavy character work is limited to
++        PEGASUS_PEOPLE_CONTROL_HZ and always runs in this order:
++        world transform -> controller -> AnimationGraph variables.
+ 
+         Args:
+             dt (float): The time elapsed between the previous and current function calls (s).
+         """
++        self._people_control_accumulator += max(0.0, float(dt))
++        if (
++            self._people_control_accumulator + 1e-9
++            < self._people_control_interval
++        ):
++            return
++
++        control_dt = self._people_control_accumulator
++        # Preserve the fractional remainder so the requested rate does not
++        # drift when physics_dt is not an exact divisor of the control period.
++        completed_periods = max(
++            1, int(control_dt / self._people_control_interval)
++        )
++        self._people_control_accumulator = max(
++            0.0,
++            control_dt - completed_periods * self._people_control_interval,
++        )
+ 
+         # Note: this is done to avoid the error of the character_graph being None. The animation graph is only created after the simulation starts
+         if not self.character_graph or self.character_graph is None:
+@@ -186,11 +264,25 @@ class Person:
+ 
+         # If the character graph is not None, then we can update the character
+         if self.character_graph:
++            # 1) Sample the current character transform before the controller
++            # evaluates formation, traffic reservations, or emergency spacing.
++            pos = carb.Float3(0, 0, 0)
++            rot = carb.Float4(0, 0, 0, 0)
++            self.character_graph.get_world_transform(pos, rot)
++            self._state.position = np.array([pos[0], pos[1], pos[2]])
++            self._state.attitude = np.array([rot.x, rot.y, rot.z, rot.w])
++            if control_dt > 1e-9:
++                self._state.linear_velocity = (
++                    self._state.position - self._previous_position
++                ) / control_dt
++            self._previous_position = np.array(self._state.position)
+ 
+-            # Call the controller update method that should update the reference of the target position
++            # 2) Deliver that state, then let the controller update the target.
+             if self._controller:
+-                self._controller.update(dt)
++                self._controller.update_state(self._state)
++                self._controller.update(control_dt)
+ 
++            # 3) Publish the controller result to the AnimationGraph.
+             # Compute the distance between the current position and the goal position
+             distance_to_target_position = np.linalg.norm(self._target_position - self._state.position)
+             
+@@ -206,7 +298,7 @@ class Person:
+ 
+             # If we have a backend, update the state of the person
+             if self._backend:
+-                self._backend.update(self._state, dt)
++                self._backend.update(self._state, control_dt)
+ 
+ 
+     def update_target_position(self, position, walk_speed=1.0):
+@@ -220,46 +312,6 @@ class Person:
+         self._target_speed = walk_speed
+ 
+ 
+-    def update_state(self, dt: float):
+-        """
+-        Method that is called at every physics step to retrieve and update the current state of the person, i.e., get
+-        the current position, orientation, linear and angular velocities and acceleration of the person.
+-
+-        Args:
+-            dt (float): The time elapsed between the previous and current function calls (s).
+-        """
+-        
+-        # # Note: this is done to avoid the error of the character_graph being None. The animation graph is only created after the simulation starts
+-        if not self.character_graph or self.character_graph is None:
+-            self.character_graph = ag.get_character(self.character_skel_root_stage_path)
+-
+-        # If the character graph is not None, then we can update the character
+-        if self.character_graph:
+-
+-            # Get the current position of the person
+-            pos = carb.Float3(0, 0, 0)
+-            rot = carb.Float4(0, 0, 0, 0)
+-            self.character_graph.get_world_transform(pos, rot)
+-
+-            # Update the current state of the person
+-            self._state.position = np.array([pos[0], pos[1], pos[2]])
+-            self._state.attitude = np.array([rot.x, rot.y, rot.z, rot.w])
+-
+-            # Compute the velocity in the inertial frame using discrete differentiation
+-            self._total_dt += dt
+-
+-            # Note: we are updating the linear velocity at 20 Hz to avoid noise in the velocity estimation
+-            # this is not ideal, but it works for now until NVIDIA provides a better way to get the linear velocity of the character
+-            if self._total_dt > 1/20.0:  # Update at 20 Hz
+-                self._state.linear_velocity = (self._state.position - self._previous_position) / self._total_dt
+-                self._previous_position = np.array(self._state.position)
+-                self._total_dt = 0.0
+-
+-            # Signal the controller the updated state
+-            if self._controller:
+-                self._controller.update_state(self._state)
+-
+-
+     def spawn_agent(self, usd_file, stage_name, init_pos, init_yaw):
+ 
+         # Get the last name after the last slash in the stage name
+@@ -370,5 +422,3 @@ class Person:
+                 return item.relative_path
+ 
+         carb.log_error("Unable to file a .usd file in {} character folder".format(character_folder_path))
+-
+-    
+\ No newline at end of file

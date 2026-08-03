@@ -1,0 +1,13 @@
+camera_order: [cam0, cam1, cam2, cam3]
+layout: horizontal
+rotation_deg: [0, 0, 0, 0]
+flip_horizontal: [false, false, false, false]
+flip_vertical: [false, false, false, false]
+source_width: 1280
+source_height: 720
+quad_width: 5120
+quad_height: 720
+disk_encoding: rgb_png
+ros_encoding: bgr8
+input_topic: /oak_ffc_4p/assemble_image
+output_topic: /depth_estimation/pointcloud

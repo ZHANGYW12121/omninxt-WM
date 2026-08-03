@@ -1,0 +1,65 @@
+schema: omninxt_server_sim_sync_v1
+date: '2026-08-02'
+runtime_flight_controller_required: false
+coordinate_frames:
+  body:
+    name: base_link
+    convention: ROS_FLU
+    axes: {x: forward, y: left, z: up}
+  optical:
+    convention: OpenCV
+    axes: {x: right, y: down, z: forward}
+matrix_convention: T_target_source maps homogeneous source coordinates to target
+physical_cameras:
+  resolution: [1280, 720]
+  model: Mei_omni_plus_radtan
+  mapping:
+    CAM_A: FRONT_RIGHT
+    CAM_B: REAR_RIGHT
+    CAM_C: REAR_LEFT
+    CAM_D: FRONT_LEFT
+  clockwise_order: [CAM_A, CAM_B, CAM_C, CAM_D]
+  assembled_order: [CAM_A, CAM_B, CAM_C, CAM_D]
+  rotate_180: false
+anchor_views:
+  resolution: [416, 320]
+  horizontal_fov_deg: 120.0
+  mosaic_resolution: [832, 640]
+  mosaic_layout: [[CAM_A, CAM_B], [CAM_C, CAM_D]]
+rectified_stereo:
+  resolution: [320, 240]
+  pairs:
+    - {id: 0, name: A_B_RIGHT, left: CAM_A, right: CAM_B, physical_side: right}
+    - {id: 1, name: B_C_REAR, left: CAM_B, right: CAM_C, physical_side: rear}
+    - {id: 2, name: C_D_LEFT, left: CAM_C, right: CAM_D, physical_side: left}
+    - {id: 3, name: D_A_FRONT, left: CAM_D, right: CAM_A, physical_side: front}
+  stereo_mosaic_resolution: [640, 960]
+  stereo_mosaic_rows: [A_B_RIGHT, B_C_REAR, C_D_LEFT, D_A_FRONT]
+depth:
+  model: models/hitnet_1x240x320_model_float16_quant_opt.onnx
+  input: {name: input, dtype: float32, shape: [1, 2, 240, 320], scale: 0_to_1}
+  output: {name: reference_output_disparity, dtype: float32, shape: [1, 240, 320, 1], unit: pixel}
+  disparity_sign: u_left_minus_u_right
+  depth_definition: rectified_left_optical_Z
+  formal_disparity_filter_enabled: false
+skeleton:
+  detector: models/yolox_nano_coco_416.onnx
+  pose: models/rtmpose_s_body17_256x192.onnx
+  topology: COCO17
+  output_schema: omninxt.skeleton3d.v1
+  network_transport: newline_delimited_JSON_over_TCP
+  stgcn_layout: [N, C, T, V, M]
+  stgcn_channels: [x_m, y_m, z_m, confidence, coordinate_valid]
+  joint_count: 17
+  default_window_frames: 30
+  default_max_people: 4
+authoritative_geometry:
+  - calibration/fisheye_cams.yaml
+  - calibration/stereo_calib_0_1_240_320.yaml
+  - calibration/stereo_calib_1_2_240_320.yaml
+  - calibration/stereo_calib_2_3_240_320.yaml
+  - calibration/stereo_calib_3_0_240_320.yaml
+  - derived/sim_geometry.yaml
+nonportable_files:
+  - '*.engine'
+  - '*.trt'

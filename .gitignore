@@ -8,11 +8,11 @@
 credentials*
 
 # Runtime data
-runtime/
-raw/
-logs/
-backups/
-artifacts/
+/runtime/
+/raw/
+/logs/
+/backups/
+/artifacts/
 
 # ROS and build output
 **/build/
@@ -53,3 +53,16 @@ Thumbs.db
 *.tmp
 *.swp
 *~
+
+# Machine-local configuration and heavyweight external dependencies
+/.local/
+/simulation/omnidepth/D2SLAM/
+/simulation/omnidepth/shared/
+/simulation/isaacsim/database/assets/
+/simulation/isaacsim/database/usd/
+/simulation/isaacsim/database/warehouse/
+
+# Preview and generated simulation output
+*_preview.jpg
+/simulation/isaacsim/database/output/
+/simulation/isaacsim/database/navrl_debug/

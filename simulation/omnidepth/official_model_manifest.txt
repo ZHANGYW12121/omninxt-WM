@@ -1,0 +1,17 @@
+Source repository: https://github.com/HKUST-Aerial-Robotics/D2SLAM
+Source commit: 3a4b8071f6f9c40a151c7685aa738b717ce8916a
+README model archive: https://www.dropbox.com/s/gcd0768vcclc9vj/models.zip?dl=0
+
+Runtime-selected ONNX (already tracked in official clone):
+models/hitnet_series/hitnet_1x240x320_model_float16_quant_opt.onnx
+size_bytes=9442506
+sha256=b589c3ff5e751603874de7d7ca0e88d06db4f9db0d87378d894da9e226ce369f
+
+Repository-provided TRT cache (do not assume portable):
+models/hitnet_series/hitnet_1x240x320_model_float16_quant_opt.trt
+size_bytes=7051614
+sha256=e88ae9ee80ad20a0bd5c8d232a1b614e44d1f53a99a7b1638beddc20e2146a82
+
+Policy: remove/rename the cached .trt inside the target PC GPU container when
+compatibility is uncertain. The official code will rebuild it from the selected
+ONNX. Record the newly generated engine hash after successful GPU execution.
