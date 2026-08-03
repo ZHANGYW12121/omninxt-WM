@@ -29,6 +29,7 @@ SOURCE_CODES = {
     "hitnet": 2,
     "temporal_prediction": 3,
     "other": 4,
+    "isaac_gt_depth": 5,
 }
 STGCN_FEATURES = ("x_m", "y_m", "z_m", "confidence", "coordinate_valid")
 
@@ -49,6 +50,8 @@ def _source_code(source, predicted):
         return SOURCE_CODES["stereo_geometry"]
     if source.startswith("hitnet_"):
         return SOURCE_CODES["hitnet"]
+    if source.startswith("isaac_gt_depth"):
+        return SOURCE_CODES["isaac_gt_depth"]
     if source.startswith("invalid"):
         return SOURCE_CODES["invalid"]
     return SOURCE_CODES["other"]
@@ -80,7 +83,9 @@ def _joint_row(joint):
         age_ms = max(0.0, _finite(joint.get("measurement_age_ms", 0.0)))
         source = joint.get("source")
         code = _source_code(source, False)
-        source_weight = 1.0 if code == SOURCE_CODES["stereo_geometry"] else \
+        source_weight = 1.0 if code in (
+            SOURCE_CODES["stereo_geometry"], SOURCE_CODES["isaac_gt_depth"]
+        ) else \
             0.55 if code == SOURCE_CODES["hitnet"] else 0.35
     if not valid:
         confidence = 0.0

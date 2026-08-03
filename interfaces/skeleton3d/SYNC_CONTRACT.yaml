@@ -53,6 +53,19 @@ skeleton:
   joint_count: 17
   default_window_frames: 30
   default_max_people: 4
+  source_codes:
+    0: invalid
+    1: stereo_geometry
+    2: hitnet
+    3: temporal_prediction
+    4: other
+    5: isaac_gt_depth
+  simulation_recording_source: isaac_gt_depth
+  simulation_recording_semantics: >-
+    COCO-17 image keypoints and tracking remain detector outputs, while each
+    valid 3D joint is lifted from the exact-timestamp Isaac distance_to_camera
+    ground truth converted to rectified optical-Z. Isaac animation joints are
+    privileged labels only and must not be substituted into the observation.
 authoritative_geometry:
   - calibration/fisheye_cams.yaml
   - calibration/stereo_calib_0_1_240_320.yaml

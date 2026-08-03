@@ -43,6 +43,9 @@ export OMNINXT_DEPTH_EXPORT=0
 # distance_to_camera ground truth.  This also attaches the annotator before
 # the four cameras start streaming.
 export OMNINXT_GT_RANGE_EXPORT=1
+# Keep 2D detection/tracking realistic while replacing only the unreliable
+# simulation depth estimator with exact-timestamp Isaac ground-truth depth.
+export OMNINXT_POSE_DEPTH_SOURCE="${OMNINXT_POSE_DEPTH_SOURCE:-isaac_gt}"
 
 echo "Starting Isaac Sim: mode=$MODE, live=${OMNINXT_LIVE_STREAM_HZ}Hz"
 echo "Depth + skeleton viewer: http://127.0.0.1:8766"
