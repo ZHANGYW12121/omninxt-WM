@@ -1,0 +1,76 @@
+defaults:
+  - _base_
+  - _self_
+
+rep_loss: dreamer
+
+factorized:
+  enabled: true
+  # Kept as private_dim for Hydra/checkpoint compatibility; it now simply
+  # means the normally encoded token dimension (there is no relation split).
+  private_dim: 128
+  goal_dim: 8
+  max_people: 20
+  num_joints: 17
+  pose_history: 8
+  human_feature_dim: 7
+  human_root_dim: 10
+  human_slot_reset: true
+  ego_state_mean: null
+  ego_state_std: null
+
+  # Posterior observation fusion:
+  # Ego <- Ego + all Humans; Human_n <- Ego + Human_n.
+  observation_attention:
+    type: sparse_asymmetric_content_attention
+    model_dim: 128
+    num_heads: 4
+    num_layers: 1
+    ff_mult: 4
+    posterior_only: true
+
+  # Causal coupling before each Ego/Human prior transition.  It uses its own
+  # parameters and the same structural visibility mask as above.
+  prior_coupling:
+    type: sparse_asymmetric_content_attention
+    model_dim: 128
+    num_heads: 4
+    num_layers: 1
+    ff_mult: 4
+    run_in_imagination: true
+
+  # Dense policy readout over [Action, Goal, Ego, Humans...].
+  latent_policy_attention:
+    enabled: true
+    model_dim: 128
+    num_heads: 4
+    num_layers: 1
+    ff_mult: 4
+    use_action_token: true
+    use_goal_token: true
+    output: action_token_only
+    run_in_imagination: true
+
+  rssm:
+    separate_branch_parameters: true
+    ego_human_share_parameters: false
+    human_slots_share_human_rssm: true
+    conditionally_coupled_prior: true
+
+loss_scales:
+  dyn_ego: 1.0
+  rep_ego: 0.1
+  dyn_human: 1.0
+  rep_human: 0.1
+  ego_recon: 1.0
+  ego_pred: 1.0
+  yaw_unit: 0.1
+  human_root: 1.0
+  human_mpjpe: 1.0
+  human_presence: 0.2
+  rew: 1.0
+  con: 1.0
+  policy: 1.0
+  value: 1.0
+  repval: 0.3
+  rew_components: 0.2

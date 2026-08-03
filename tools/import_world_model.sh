@@ -29,14 +29,17 @@ if (( APPLY )); then
 fi
 
 args=(-a --itemize-changes
-  --exclude=.git/ --exclude=.env --exclude='.env.*'
+  --exclude=.git/ --exclude=.agents/ --exclude=.codex/
+  --include=.env.example --exclude='.env*'
   --exclude='__pycache__/' --exclude='*.pyc' --exclude='.venv/' --exclude='venv/'
   --exclude='build/' --exclude='devel/' --exclude='install/' --exclude='logs/'
-  --exclude='checkpoints/' --exclude='weights/' --exclude='runs/'
+  --exclude='logdir/' --exclude='checkpoints/' --exclude='weights/'
   --exclude='outputs/' --exclude='replay/' --exclude='trajectories/'
+  --exclude='wandb/' --exclude='.hydra/'
   --exclude='conda_history*.yml' --exclude='pip_freeze*.txt'
   --exclude='*.bag' --exclude='*.pcd' --exclude='*.pkl' --exclude='*.npz'
-  --exclude='*.npy' --exclude='*.onnx' --exclude='*.engine' --exclude='*.trt'
+  --exclude='*.npy' --exclude='*.pt' --exclude='*.pth' --exclude='*.ckpt'
+  --exclude='*.onnx' --exclude='*.engine' --exclude='*.trt'
 )
 (( APPLY )) || args+=(--dry-run)
 rsync "${args[@]}" "$SOURCE/" "$REPO_ROOT/world_model/"

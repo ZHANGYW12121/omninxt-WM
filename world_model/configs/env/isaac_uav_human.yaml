@@ -1,0 +1,24 @@
+# Two-branch Ego/Human observation contract.  The Isaac wrapper or offline
+# adapter is responsible for providing these tensors.
+name: isaac_uav_human
+steps: 1e6
+eval_every: 1e4
+eval_episode_num: 5
+train_ratio: 64
+action_repeat: 1
+
+encoder:
+  mlp_keys: '^(ego_state|goal)$'
+  cnn_keys: '$^'
+decoder:
+  mlp_keys: '$^'
+  cnn_keys: '$^'
+
+observation:
+  ego_state_dim: 14
+  goal_feature_dim: 8
+  goal_position_dim: 3
+  max_people: 20
+  num_joints: 17
+  human_root_dim: 10
+  human_feature_dim: 7

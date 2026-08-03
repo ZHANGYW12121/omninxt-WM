@@ -1,0 +1,1200 @@
+Ego–Environment–Human 交互式因子化 Dreamer 实现说明
+========================================================
+
+用途
+----
+本文件作为交给 Codex 的实现任务说明。目标不是从零重写 Dreamer，而是在官方 NM512/r2dreamer
+代码库中，以其保留的 DreamerV3 实现分支为基础，改造成面向动态行人环境无人机控制的
+Ego–Environment–Human 交互式因子化联合世界模型。
+
+请先完整阅读现有仓库中的：
+- dreamer.py
+- rssm.py
+- networks.py
+- buffer.py
+- trainer.py
+- train.py
+- configs/configs.yaml
+- configs/model/_base_.yaml
+- docs/tensor_shapes.md
+
+不要直接大规模重写原仓库。优先通过新增模块、保持原接口、逐步替换的方式实现。
+
+
+一、必须遵守的基础选择
+======================
+
+1. 使用 R2-Dreamer 仓库作为代码基础，但第一版算法使用 DreamerV3 loss 分支：
+
+    model.rep_loss=dreamer
+
+官方仓库的 dreamer.py 中已经保留该分支：
+- 使用 RSSM posterior/prior；
+- 使用 dyn KL loss 和 rep KL loss；
+- 使用 decoder reconstruction losses；
+- 使用 reward loss；
+- 使用 continue loss；
+- 使用 latent imagination；
+- 使用 actor loss；
+- 使用 value loss；
+- 使用 replay value loss（repval）。
+
+第一版不要将 model.rep_loss 设置为 r2dreamer。
+r2dreamer 分支使用 Barlow-Twins 风格的 decoder-free 表征损失，它可以作为后续消融，
+但不是当前“三类物理状态显式预测”的首选基础。
+
+2. 整体只有一个 Dreamer 控制框架：
+- 一个 replay buffer；
+- 一个 Actor；
+- 一个 Critic/Value；
+- 一个 Reward head；
+- 一个 Continue head；
+- 一个 imagination 训练流程。
+
+内部世界模型由三个因子化动态分支组成：
+- Ego branch；
+- Environment branch；
+- Human branch。
+
+不要实现三个完整、互相独立的 Dreamer agent。
+
+3. 三类状态必须：
+- 保留独立的潜在状态和动态规律；
+- 在每一个真实 posterior 更新和 imagined rollout 步中发生交互；
+- 最终由同一策略联合读取。
+
+核心原则：
+
+    共享交互，独立演化，联合决策。
+
+
+二、任务输入定义
+================
+
+每个时间步的 observation 至少包含以下键。
+
+1. 无人机状态 ego_state
+
+形状：
+
+    ego_state: float32 [B, T, 14]
+
+特征顺序：
+
+    [
+        x, y, z,
+        vx, vy, vz,
+        ax, ay, az,
+        altitude,
+        roll, pitch,
+        sin_yaw, cos_yaw
+    ]
+
+要求：
+- 对各维度使用训练集统计量归一化；
+- sin_yaw 和 cos_yaw 不要再次做角度展开；
+- 解码预测后对 [sin_yaw, cos_yaw] 做单位圆归一化；
+- 优先预测 state delta，再加回当前状态，而不是直接预测绝对下一状态；
+- 不要在本阶段自行删除 x/y/z 或 altitude，即使可能存在冗余；
+- 后续可以增加 body-frame 状态作为消融，但不要改变当前接口。
+
+2. 环境输入
+
+主路线使用点云和 PointPillars：
+
+    point_cloud: float32 [B, T, P_max, C_point]
+    point_mask:  bool    [B, T, P_max]
+
+建议 C_point 至少为：
+
+    [x, y, z, intensity_or_occupancy]
+
+PointPillars 输出局部 ego-centric BEV feature map。
+
+环境监督目标：
+
+    env_target: float32 [B, T, C_env, H_bev, W_bev]
+
+建议至少包含：
+- occupied probability；
+- free probability 或 unknown probability；
+- 高度相关通道可选；
+- dynamic probability 可选。
+
+重要：
+- 如果上游已经直接生成稠密概率栅格/BEV，则提供一个配置项绕过 PointPillars，
+  使用 2D CNN BEV encoder。
+- 不要把已经稠密化的 BEV 再伪装成原始点云送入 PointPillars。
+- 第一版主配置仍以 PointPillars 为主。
+
+3. 人体三维骨架输入
+
+每个环境/episode 中生成的人数不固定，通常约 10–15 人。
+不要把人数硬编码成 10、15 或固定当前值。
+
+配置：
+
+    max_people: 20   # 默认值，可配置，不是实际人数
+    num_joints: 17   # 默认按 RTMPose/COCO，可配置
+    human_feat_dim: 7 或 8
+
+张量：
+
+    skeleton:
+        float32 [B, T, N_max, J, F]
+
+    human_mask:
+        bool [B, T, N_max]
+
+    joint_mask:
+        bool [B, T, N_max, J]
+
+    human_ids:
+        int64 [B, T, N_max]
+
+建议每个关节 F 包含：
+
+    [
+        x_rel, y_rel, z_rel,
+        vx_rel, vy_rel, vz_rel,
+        confidence
+    ]
+
+可增加 valid 标记，但 valid 应优先由 joint_mask 表达。
+
+要求：
+- 所有骨架位置和速度转换到无人机局部坐标系；
+- human_id 只用于时间关联、slot 分配和监督匹配；
+- 不要把原始整数 ID 当连续数值特征输入网络；
+- 同一 episode 内，同一 ID 尽量保持同一 slot；
+- 人进入或离开视野时动态更新 human_mask；
+- 需要额外生成：
+
+      human_is_first: bool [B, T, N_max]
+
+  当 episode reset、该 slot 第一次出现新 ID、或 slot 被重新分配时为 True，
+  用于重置该人的 Human RSSM state。
+
+超出 max_people 时：
+- 不要随机截断；
+- 按风险优先级保留；
+- 推荐排序依据：距离、TTC、是否位于航迹走廊；
+- 记录被截断人数到 metric。
+
+人数不足时：
+- 补零；
+- 通过 human_mask 和 joint_mask 完全屏蔽；
+- 所有 attention、loss、pooling 和 RSSM update 都必须正确使用 mask。
+
+
+三、总体结构
+============
+
+建议的第一版 token 结构：
+
+    Ego:
+        1 个 ego token
+
+    Environment:
+        1 个 global environment token
+        来源于 PointPillars BEV feature 的 spatial attention pooling
+
+    Human:
+        N_max 个 person tokens
+        每个人由 causal ST-GCN 输出一个 token
+
+拼接为：
+
+    tokens = [
+        ego_token,
+        env_token,
+        human_token_1,
+        ...,
+        human_token_Nmax
+    ]
+
+形状：
+
+    tokens: [B, 2 + N_max, D_model]
+
+使用 1–2 层共享 Transformer Self-Attention：
+
+    interacted_tokens = InteractionTransformer(
+        tokens,
+        key_padding_mask
+    )
+
+Self-Attention 输出槽位数量不变，再切分：
+
+    ego_context:
+        [B, 1, D_model]
+
+    env_context:
+        [B, 1, D_model]
+
+    human_context:
+        [B, N_max, D_model]
+
+这一步已经完成 Ego、Environment、Human 的联合交互。
+不要再额外创建一个重复的 global c_t attention 模块。
+
+策略侧只需要轻量 readout：
+
+    policy_feature = MLP(
+        concat(
+            ego_context.squeeze(1),
+            env_context.squeeze(1),
+            masked_attention_pool(human_context)
+        )
+    )
+
+该 MLP 只是策略投影，不应再实现第二套复杂跨模态融合。
+
+
+四、三个编码器
+==============
+
+A. EgoEncoder
+-------------
+
+新增：
+
+    models/ego_encoder.py
+
+结构：
+
+    LayerNorm(14)
+    Linear(14, hidden)
+    SiLU
+    Linear(hidden, D_model)
+    RMSNorm 或 LayerNorm
+
+接口：
+
+    ego_token = ego_encoder(ego_state)
+
+输入：
+    [B, T, 14]
+
+输出：
+    [B, T, 1, D_model]
+
+
+B. PointPillarsEnvironmentEncoder
+---------------------------------
+
+新增：
+
+    models/pointpillars_encoder.py
+
+实现步骤：
+1. Pillarization/voxelization；
+2. Pillar Feature Net；
+3. Scatter 到 BEV pseudo-image；
+4. 2D CNN backbone；
+5. 输出：
+   - bev_feature_map；
+   - global env token。
+
+建议接口：
+
+    result = env_encoder(point_cloud, point_mask)
+
+    result["feature_map"]:
+        [B, T, C, H', W']
+
+    result["env_token"]:
+        [B, T, 1, D_model]
+
+第一版使用 attention pooling 或 masked global average pooling 得到单个 env token。
+保留 feature_map 用于环境解码和可视化。
+
+后续可扩展：
+- 将 feature_map 切为 4×4 或 8×8 spatial tokens；
+- 但第一版先用一个 env token，减少 RSSM 和 attention 改造复杂度。
+
+
+C. Causal ST-GCN Human Encoder
+------------------------------
+
+新增：
+
+    models/stgcn_encoder.py
+
+关键要求：
+- 必须是 causal temporal modeling；
+- 当前时刻输出只能使用当前及过去骨架；
+- 禁止使用训练序列中的未来帧；
+- 可使用固定历史窗口 pose_history，例如 8 或 10 帧；
+- 对每个人共享同一套 ST-GCN 参数；
+- graph adjacency 使用人体骨架拓扑；
+- 对 joint_mask 做有效处理。
+
+推荐输入变换：
+
+原始：
+    [B, T, N, J, F]
+
+ST-GCN 内部：
+    [B*N, F, T_history, J]
+
+输出每个人每个时刻的 person token：
+
+    human_tokens:
+        [B, T, N_max, D_model]
+
+不要在 ST-GCN 内部直接把 10–15 人平均成一个人群向量。
+保留每个人的 token，以便：
+- Self-Attention 建模人–人交互；
+- Human RSSM 对每个 slot 建模；
+- 人体预测头逐人输出。
+
+human_ids 不作为网络特征。
+可输入相对根节点位置、速度和 confidence。
+
+
+五、模态编码与 Self-Attention
+=============================
+
+新增：
+
+    models/interaction.py
+
+实现类：
+
+    SlotPreservingInteraction
+
+输入：
+
+    ego_token:     [B, 1, D]
+    env_token:     [B, 1, D]
+    human_tokens:  [B, N, D]
+    human_mask:    [B, N]
+
+处理：
+1. 添加 modality type embedding：
+   - ego_type_embedding；
+   - env_type_embedding；
+   - human_type_embedding。
+
+2. Human token 中显式加入相对位置编码：
+   - 用 pelvis/root 的相对 x/y/z 经 MLP 投影；
+   - 不添加固定的人序号 positional embedding；
+   - 以免模型错误地把 slot 0、slot 1 当作固定身份。
+
+3. Env token 可加入局部地图尺度、分辨率等 metadata embedding，但第一版可省略。
+
+4. 拼接：
+
+    all_tokens = cat([ego, env, humans], dim=1)
+
+5. mask：
+
+    key_padding_mask:
+        [B, 2 + N]
+
+前两项始终 False。
+无效 human slot 为 True。
+
+6. TransformerEncoder：
+- batch_first=True；
+- norm_first=True；
+- model_dim 128 或 256；
+- num_heads=4；
+- num_layers=1 作为默认，稳定后再试 2；
+- FFN dimension = 4 * model_dim；
+- dropout 初始 0 或较小。
+
+7. 输出按槽位切分。
+
+注意 all-human-masked 情况：
+- 前两个 token 仍有效；
+- masked pooling 不能产生 NaN；
+- human pooled feature 在无人场景设为可学习 empty_human_token 或零向量。
+
+
+六、因子化 RSSM
+===============
+
+新增：
+
+    factorized_rssm.py
+
+不要直接复制并大改原 rssm.py。
+实现一个 wrapper，内部复用三个 rssm.RSSM：
+
+    self.ego_rssm
+    self.env_rssm
+    self.human_rssm
+
+其中：
+- Ego RSSM：每个 batch 一个状态；
+- Env RSSM：每个 batch 一个状态；
+- Human RSSM：同一套参数共享给所有 person slots；
+  实际计算时将 B 和 N 展平为 B*N。
+
+每个 branch 的 latent state 均包含原仓库的：
+- stochastic state；
+- deterministic state；
+- posterior logits；
+- prior logits。
+
+不要把三个 latent 直接拼成一个单一 RSSM 后再硬切分。
+
+
+A. 状态特征与交互
+-----------------
+
+当前三个 branch 的 feature：
+
+    ego_feat:
+        [B, F_ego]
+
+    env_feat:
+        [B, F_env]
+
+    human_feat:
+        [B, N, F_human]
+
+先通过 branch-specific projection 映射到 D_model：
+
+    ego_token = ego_feat_proj(ego_feat)
+    env_token = env_feat_proj(env_feat)
+    human_tokens = human_feat_proj(human_feat)
+
+再经过 SlotPreservingInteraction，得到：
+
+    ego_context
+    env_context
+    human_context
+
+B. 交互必须条件化下一步动态
+---------------------------
+
+不能只让 Self-Attention 服务 Actor。
+否则模型只是“联合策略”，不是“联合世界动态”。
+
+每个 branch 的下一步 transition 输入：
+
+    ego_transition_input =
+        concat(action, ego_context)
+
+    env_transition_input =
+        concat(action, env_context)
+
+    human_transition_input_n =
+        concat(action, human_context_n)
+
+因此三个 RSSM 初始化时的 act_dim 应为：
+
+    real_action_dim + context_dim
+
+Human branch 对 action 和 context 在 N 个 slot 上展开。
+
+这样在 imagined rollout 中：
+- Ego 下一步受 Env/Human 上下文影响；
+- Env 下一步受 Ego/Human 上下文影响；
+- Human 下一步受 Ego/Env/其他人上下文影响。
+
+
+C. 时间推进顺序
+---------------
+
+对每个时间步 t：
+
+1. 从上一时刻三个 latent state 得到 branch features；
+2. 运行共享 Self-Attention，得到三个 context；
+3. 将真实上一动作 a_(t-1) 与各 branch context 拼接；
+4. 三个 branch 分别计算 prior state at t；
+5. 使用当前 observation embeddings 修正为 posterior state at t；
+6. 从 posterior states 再计算一次交互后的 policy features；
+7. Actor 输出 a_t。
+
+在 imagination 中：
+
+1. 从 imagined latent states 得到 branch features；
+2. Self-Attention；
+3. Actor 读取联合 policy feature并采样 action；
+4. action + branch context 进入三个 RSSM img_step；
+5. 得到下一 imagined latent states；
+6. 循环。
+
+这保证联合交互发生在每个 imagination step。
+
+
+D. Human RSSM mask/reset
+------------------------
+
+Human branch 使用：
+
+    human_mask
+    human_is_first
+
+要求：
+- 无效 slot 不参与 KL、重建和策略 pooling；
+- 新人进入或 ID 更换时，重置该 slot 的 stochastic/deterministic state；
+- 人离开后，该 slot state 清零或保持但完全 mask；
+- 不允许旧人的隐藏状态泄漏给新 ID；
+- human KL loss 必须按有效 slot 归一化，而不是直接对 N_max 平均。
+
+
+E. 建议 wrapper 接口
+--------------------
+
+尽量保持与原 Dreamer 调用方式类似，但返回结构化字典。
+
+例如：
+
+    states, aux = factorized_rssm.observe(
+        embeddings={
+            "ego": ego_embed,
+            "env": env_embed,
+            "human": human_embed,
+        },
+        actions=actions,
+        initial=initial,
+        is_first=is_first,
+        human_mask=human_mask,
+        human_is_first=human_is_first,
+    )
+
+states 包含：
+
+    states["ego"]["stoch"]
+    states["ego"]["deter"]
+    states["env"]["stoch"]
+    states["env"]["deter"]
+    states["human"]["stoch"]
+    states["human"]["deter"]
+
+aux 包含：
+- branch posterior logits；
+- branch prior logits；
+- interacted contexts；
+- joint policy features；
+- masks。
+
+
+七、策略、价值、奖励和 Continue
+===============================
+
+Actor、Critic、Reward 和 Continue 都读取联合 policy feature，而不是只读取 Ego branch。
+
+策略输入：
+
+    ego_policy = ego_context.squeeze(1)
+    env_policy = env_context.squeeze(1)
+    human_policy = masked_attention_pool(human_context, human_mask)
+
+    joint_feat = policy_projection(
+        cat([ego_policy, env_policy, human_policy], dim=-1)
+    )
+
+形状：
+
+    joint_feat: [B, joint_feat_dim]
+
+替换原 dreamer.py 中所有直接使用：
+
+    self.rssm.get_feat(...)
+    self.rssm.feat_size
+
+作为 Actor/Value/Reward/Cont 输入的地方。
+
+改为：
+- factorized_rssm.get_joint_feat(states, masks)；
+- self.factorized_rssm.joint_feat_size。
+
+Actor：
+    actor(joint_feat)
+
+Value：
+    value(joint_feat)
+
+Reward：
+    reward(joint_feat)
+
+Continue：
+    cont(joint_feat)
+
+不要先把三类物理输出解码成 BEV/骨架/状态，再重新编码给 Actor。
+Actor 使用 latent joint feature。
+解码头仅用于监督、预测评估、风险可视化和调试。
+
+
+八、三个模态预测头
+==================
+
+新增：
+
+    models/prediction_heads.py
+
+A. EgoPredictionHead
+--------------------
+
+输入：
+    ego branch feature/context
+
+输出：
+    ego_state_delta [B, T, 14]
+
+预测：
+    next_ego_state = current_ego_state + delta
+
+损失：
+- SmoothL1 为主；
+- 各维按归一化尺度计算；
+- 可为 position/velocity/attitude 分组设置权重；
+- 对 yaw sin/cos 增加单位圆约束：
+
+      (sin^2 + cos^2 - 1)^2
+
+B. EnvironmentPredictionHead
+----------------------------
+
+输入：
+    env branch feature
+    可同时使用 PointPillars encoder 的 coarse feature shape 信息
+
+输出：
+    env logits [B, T, C_env, H_bev, W_bev]
+
+第一版可使用小型 deconvolution decoder。
+
+损失按 target 定义：
+- Occupancy probability：BCEWithLogits 或 focal；
+- mutually-exclusive occupied/free/unknown：CrossEntropy；
+- height regression：masked SmoothL1；
+- 可增加 Dice/IoU auxiliary loss。
+
+不要重建原始鱼眼 RGB。
+目标是任务相关的环境占据/BEV。
+
+C. HumanPredictionHead
+----------------------
+
+对每个 human slot 独立共享参数。
+
+输入：
+    human branch feature [B, T, N, F_h]
+
+输出至少包括：
+
+    root_delta:
+        [B, T, N, 3]
+
+    joint_relative_positions:
+        [B, T, N, J, 3]
+
+    presence_logit:
+        [B, T, N]
+
+可选：
+    joint_velocity；
+    joint uncertainty/log_std；
+    body occupancy radius/ellipsoid。
+
+最终 3D joint：
+
+    predicted_joint =
+        predicted_root + predicted_relative_joint
+
+损失：
+- root SmoothL1；
+- masked MPJPE；
+- velocity consistency；
+- bone-length consistency；
+- presence BCE；
+- 所有项必须使用 human_mask 和 joint_mask；
+- 对 human_mask 的分母使用 valid count clamp_min(1)。
+
+第一版 ID 匹配依赖 episode 内稳定 slot。
+后续如果 tracker 存在明显 ID switch，再增加 Hungarian matching，不要第一步就引入。
+
+
+九、DreamerV3 loss 改造
+======================
+
+基于官方 dreamer.py 的 model.rep_loss=dreamer 分支改造。
+
+必须保留原有：
+- dyn KL；
+- rep KL；
+- reward negative log likelihood；
+- continue negative log likelihood；
+- actor imagination loss；
+- value loss；
+- replay value loss；
+- return EMA；
+- slow value target；
+- lambda return；
+- gradient scaling、AGC、optimizer 和 scheduler 逻辑。
+
+将单一 RSSM KL 扩展为三分支：
+
+    losses["dyn_ego"]
+    losses["rep_ego"]
+
+    losses["dyn_env"]
+    losses["rep_env"]
+
+    losses["dyn_human"]
+    losses["rep_human"]
+
+Human KL 使用 mask。
+
+模态监督：
+
+    losses["ego_pred"]
+    losses["env_occ"]
+    losses["env_height"]        # 如有
+    losses["human_root"]
+    losses["human_mpjpe"]
+    losses["human_presence"]
+    losses["human_bone"]        # 可选
+    losses["yaw_unit"]          # 可选
+
+共享任务损失：
+
+    losses["rew"]
+    losses["con"]
+    losses["policy"]
+    losses["value"]
+    losses["repval"]
+
+建议总损失：
+
+    L_world =
+        lambda_dyn_ego   * dyn_ego +
+        lambda_rep_ego   * rep_ego +
+        lambda_dyn_env   * dyn_env +
+        lambda_rep_env   * rep_env +
+        lambda_dyn_human * dyn_human +
+        lambda_rep_human * rep_human +
+        lambda_ego       * ego_pred +
+        lambda_env       * env_losses +
+        lambda_human     * human_losses +
+        lambda_rew       * rew +
+        lambda_con       * con
+
+    L_total =
+        L_world +
+        lambda_policy * policy +
+        lambda_value  * value +
+        lambda_repval * repval
+
+所有 loss scale 放入 Hydra config。
+不要把权重硬编码在 Python 中。
+
+注意：
+- 先确保各 loss 数量级被日志记录；
+- 不要一开始加入过多复杂正则；
+- 第一版仅保留核心 KL、三类预测、reward、continue、actor/value。
+
+
+十、Replay Buffer 和环境接口
+============================
+
+修改：
+- buffer.py
+- trainer.py
+- 环境 wrapper
+
+Replay sample 至少返回：
+
+    {
+        "ego_state",
+        "point_cloud",
+        "point_mask",
+        "env_target",
+        "skeleton",
+        "human_mask",
+        "joint_mask",
+        "human_ids",
+        "human_is_first",
+        "action",
+        "reward",
+        "is_first",
+        "is_last",
+        "is_terminal",
+    }
+
+要求：
+- 所有字段时间戳对齐；
+- skeleton、point cloud、ego state 使用同一仿真时间；
+- 缺测人体用 mask，不要丢弃整个 frame；
+- 可在 buffer 中存预处理 PointPillars pillars，以减少训练期开销；
+- 先支持固定 P_max padding，后续再优化稀疏批处理；
+- episode 不同人数完全由 human_mask 表达；
+- batch 中不同 episode 可同时为 10、12、15 人。
+
+请增加数据验证函数：
+- 检查 NaN/Inf；
+- 检查 human_ids 在有效 mask 处是否合法；
+- 检查 joint_mask 是 human_mask 的子集；
+- 检查 sin_yaw/cos_yaw 范围；
+- 检查动作、观测时间长度；
+- 检查 episode reset 时 latent state 正确清零。
+
+
+十一、配置文件
+==============
+
+新增建议：
+
+    configs/env/isaac_uav_human.yaml
+    configs/model/factorized_dreamer.yaml
+
+factorized_dreamer.yaml 继承现有 model base 配置。
+
+核心配置示例：
+
+    rep_loss: dreamer
+
+    factorized:
+      enabled: true
+      model_dim: 128
+      num_heads: 4
+      num_layers: 1
+      ff_mult: 4
+      max_people: 20
+      num_joints: 17
+      pose_history: 8
+      human_slot_reset: true
+      env_tokens: 1
+      joint_feat_dim: 512
+
+    ego_encoder:
+      hidden: 128
+      out_dim: 128
+
+    pointpillars:
+      enabled: true
+      point_dim: 4
+      x_range: [...]
+      y_range: [...]
+      z_range: [...]
+      voxel_size: [...]
+      bev_channels: ...
+      output_dim: 128
+
+    stgcn:
+      causal: true
+      in_channels: 7
+      hidden_channels: [...]
+      output_dim: 128
+
+    loss_scales:
+      dyn_ego: ...
+      rep_ego: ...
+      dyn_env: ...
+      rep_env: ...
+      dyn_human: ...
+      rep_human: ...
+      ego_pred: ...
+      env_occ: ...
+      human_root: ...
+      human_mpjpe: ...
+      human_presence: ...
+      rew: ...
+      con: ...
+      policy: ...
+      value: ...
+      repval: ...
+
+不要现在擅自填写点云范围、BEV 范围、分辨率和动作维度。
+这些必须从 Isaac 环境配置或现有数据接口读取。
+
+
+十二、建议代码文件结构
+======================
+
+在仓库中新增：
+
+    models/
+      __init__.py
+      ego_encoder.py
+      pointpillars_encoder.py
+      stgcn_encoder.py
+      interaction.py
+      prediction_heads.py
+      masked_pooling.py
+
+    factorized_rssm.py
+    multimodal_dreamer.py
+
+但为了最大程度复用现有 trainer，推荐：
+
+第一阶段：
+- 新建 MultimodalDreamer 或 FactorizedDreamer；
+- 尽量继承/复用 dreamer.py 中的 optimizer、lambda return、update 和 logging；
+- 不要直接删除原 Dreamer 类；
+- 在 config 中选择 agent class。
+
+如果现有 trainer 强依赖 Dreamer 类名，则：
+- 保留 dreamer.py 原有逻辑；
+- 把 factorized 功能放到独立模块；
+- 仅在 enabled=true 时走新路径。
+
+
+十三、分阶段实现顺序
+====================
+
+Phase 0：验证原仓库
+-------------------
+1. 运行官方最小 DreamerV3 配置：
+       model.rep_loss=dreamer
+2. 确认 update、act、imagine、checkpoint、resume 均正常。
+3. 保存 baseline commit。
+
+Phase 1：只接入数据和简单编码器
+-------------------------------
+1. Ego MLP；
+2. 简单 BEV CNN 临时代替 PointPillars；
+3. 简单 skeleton MLP 临时代替 ST-GCN；
+4. 三个 token Self-Attention；
+5. 单步 forward shape test。
+
+目的是先验证联合接口，不要立即把所有复杂模块一起接入。
+
+Phase 2：Factorized RSSM
+-----------------------
+1. 三个 RSSM；
+2. Human RSSM B*N flatten；
+3. mask/reset；
+4. shared interaction；
+5. action + context transition；
+6. imagined rollout；
+7. Actor/Value 使用 joint feature。
+
+Phase 3：三个任务预测头与 Dreamer losses
+----------------------------------------
+1. Ego prediction；
+2. Environment occupancy prediction；
+3. Human skeleton/presence prediction；
+4. KL/reward/continue；
+5. Actor/value；
+6. 完整 backward。
+
+Phase 4：替换正式编码器
+-----------------------
+1. PointPillars；
+2. causal ST-GCN；
+3. 检查在线因果性；
+4. 性能和显存优化。
+
+Phase 5：多步预测和训练稳定性
+-----------------------------
+1. open-loop rollout evaluation；
+2. 各分支预测指标；
+3. loss scale；
+4. gradient norm；
+5. attention/mask 调试；
+6. 再考虑额外风险 head 或 R2 loss 消融。
+
+
+十四、必须编写的测试
+====================
+
+新增 tests，至少覆盖：
+
+1. Variable people count
+------------------------
+同一 batch 中测试：
+- 0 人；
+- 8 人；
+- 10 人；
+- 13 人；
+- 15 人；
+- 18 人。
+
+输出 shape 必须一致，mask 正确，无 NaN。
+
+2. Human slot reset
+-------------------
+同一 slot 从 ID=5 变成 ID=21 时：
+- human_is_first=True；
+- 旧 latent 不得泄漏。
+
+3. Attention mask
+-----------------
+无效 human token：
+- 不得被 Ego/Env/Human attention 读取；
+- 不得影响 policy feature；
+- 不得产生 loss。
+
+4. ST-GCN causal test
+---------------------
+修改未来帧骨架，当前时刻输出必须不变。
+
+5. Factorized imagination
+-------------------------
+给定 initial states：
+- rollout H 步；
+- ego/env/human state shape 正确；
+- 每步执行 interaction；
+- action shape 正确；
+- reward/value/continue 正确。
+
+6. Gradient flow
+----------------
+一个 dummy batch backward 后：
+- Ego encoder 有梯度；
+- PointPillars 有梯度；
+- ST-GCN 有梯度；
+- Interaction 有梯度；
+- 三个 RSSM 有梯度；
+- 三个 prediction heads 有梯度；
+- Actor/Value 有梯度。
+
+7. Masked loss
+--------------
+无效人和无效关节数值即使设置为极大值，也不能改变 human losses。
+
+8. Checkpoint
+-------------
+保存与加载：
+- 模型；
+- optimizer；
+- scaler；
+- slow value；
+- replay latent initial states；
+- config。
+
+
+十五、日志与指标
+================
+
+TensorBoard/W&B 至少记录：
+
+World model:
+- loss/dyn_ego
+- loss/rep_ego
+- loss/dyn_env
+- loss/rep_env
+- loss/dyn_human
+- loss/rep_human
+- loss/ego_pred
+- loss/env_occ
+- loss/human_root
+- loss/human_mpjpe
+- loss/human_presence
+- loss/rew
+- loss/con
+
+RL:
+- loss/policy
+- loss/value
+- loss/repval
+- return
+- action entropy
+- value statistics
+- continue probability
+
+Data/mask:
+- actual_people_mean
+- actual_people_min
+- actual_people_max
+- truncated_people_count
+- valid_joint_ratio
+- human_id_switch_count
+- all_human_missing_ratio
+
+Prediction evaluation:
+- Ego position/velocity error；
+- BEV occupancy IoU/F1；
+- Human root ADE/FDE；
+- 3D skeleton MPJPE；
+- Human presence precision/recall；
+- K-step open-loop degradation。
+
+Runtime:
+- encoder time；
+- world model update time；
+- imagination time；
+- policy inference time；
+- FPS/Hz；
+- GPU memory。
+
+
+十六、实现边界与禁止事项
+======================
+
+1. 不要把每次环境人数固定成 15。
+实际人数由 human_mask 表达，通常约 10–15，但可能更少或略多。
+
+2. 不要把 human_id 作为普通浮点特征。
+
+3. 不要使用非因果 ST-GCN 读取未来帧。
+
+4. 不要只在 Actor 前做一次 Self-Attention。
+交互 context 必须进入三个 branch 的下一步 transition。
+
+5. 不要把三类 latent 完全拼成单一 RSSM，然后仅在名称上切成三段。
+
+6. 不要实现三个 Actor 或三个 Critic。
+
+7. 不要删除原 DreamerV3 baseline。
+必须可以通过配置运行：
+- 原 DreamerV3；
+- factorized model；
+- 后续 R2-Dreamer 消融。
+
+8. 不要一开始加入大型 RGB decoder。
+环境输出是任务相关 BEV，人体输出是骨架/占据，无人机输出是状态。
+
+9. 不要在没有 mask 的情况下对 N_max 做普通 mean pooling。
+
+10. 不要一次性修改所有文件而不写测试。
+每个 Phase 单独 commit，并在 commit message 中说明 shape/API 变化。
+
+
+十七、第一版最小可运行配置
+========================
+
+为降低首次实现风险，第一版建议：
+
+- D_model = 128；
+- Self-Attention layers = 1；
+- heads = 4；
+- max_people = 20；
+- env token = 1；
+- 每个人一个 human token；
+- Ego/Env/Human 各一个独立 RSSM 参数组；
+- Human RSSM 参数在所有 person slots 共享；
+- PointPillars 可先用 stub encoder 替代；
+- ST-GCN 可先用 per-person MLP + causal GRU 替代；
+- 先验证 factorized Dreamer 完整训练；
+- 然后替换为正式 PointPillars 和 ST-GCN。
+
+第一版通过标准：
+- 能采样 replay；
+- 能 posterior observe；
+- 能完成三分支 KL 和任务预测；
+- 能 imagination rollout；
+- Actor/Value 能训练；
+- 可处理 batch 内不同人数；
+- 不出现 NaN；
+- 可 checkpoint/resume。
+
+
+十八、Codex 完成后需要返回的内容
+===============================
+
+请 Codex 最终输出：
+
+1. 修改文件列表；
+2. 每个文件的作用；
+3. 核心张量 shape 表；
+4. 真实 posterior 时序流程；
+5. imagined rollout 时序流程；
+6. 三分支 loss 明细；
+7. variable people mask/reset 处理；
+8. 运行命令；
+9. 单元测试命令；
+10. 当前仍未实现或使用 stub 的部分；
+11. 与原 DreamerV3 baseline 的兼容情况；
+12. 参数量和一次 forward 的显存/耗时初测。
+
+不要声称未测试的功能已经完成。
+若仓库实际接口与本说明不同，优先保持原仓库训练逻辑，并在改动记录中明确说明调整原因。

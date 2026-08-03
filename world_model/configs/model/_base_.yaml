@@ -1,0 +1,208 @@
+act_entropy: 3e-4
+kl_free: 1.0
+imag_horizon: 15
+horizon: 333
+lamb: 0.95
+compile: True
+log_grads: False
+device: ${device}
+rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro
+
+lr: 4e-5
+agc: 0.3
+pmin: 1e-3
+eps: 1e-20
+beta1: 0.9
+beta2: 0.999
+warmup: 1000
+slow_target_update: 1
+slow_target_fraction: 0.02
+
+loss_scales:
+  barlow: 0.05
+  infonce: 1.0
+  recon: 1.0
+  rew: 1.0
+  rew_components: 0.2
+  con: 1.0
+  dyn: 1.0
+  rep: 0.1
+  policy: 1.0
+  value: 1.0
+  repval: 0.3
+  swav: 1.0
+  temp: 1.0
+  norm: 1.0
+  pred_human_xy: 1.0
+  pred_human_keypoint: 0.2
+  pred_human_presence: 0.2
+  pred_env_occupancy: 1.0
+  pred_ego_state: 1.0
+
+r2dreamer:
+  lambd: 5e-4
+
+dreamer_pro:
+  warm_up: 1
+  num_prototypes: 2500
+  proto_dim: 32
+  temperature: 0.1
+  sinkhorn_eps: 0.05
+  sinkhorn_iters: 3
+  ema_update_every: 1
+  ema_update_fraction: 0.05
+  freeze_prototypes_iters: 10000
+  aug:
+    max_delta: 3.0
+    same_across_time: True
+    bilinear: True
+
+rssm:
+  stoch: 32
+  deter: ${model.deter}
+  hidden: ${model.hidden}
+  discrete: ${model.discrete}
+  img_layers: 2
+  obs_layers: 1
+  dyn_layers: 1
+  blocks: 8
+  act: ${model.act}
+  norm: ${model.norm}
+  unimix_ratio: 0.01
+  initial: 'learned'
+  device: ${device}
+  structured_posterior:
+    hidden: ${model.hidden}
+    layers: 1
+    dropout: 0.0
+
+prediction_heads:
+  hidden_dim: ${model.units}
+  layers: 2
+  dropout: 0.0
+  max_pose_people: 16
+  num_joints: 17
+  pose_keypoint_threshold: 0.05
+  smooth_l1_beta: 0.05
+  bev_hw: [24, 16]
+  env_pos_weight: 3.0
+  ego_state_dim: 17
+  ego_state_mean: [8.995327, 0.246958, 0.172817, 1.711806, 0.041022, 0.019189, 0.106714, -0.014942, -0.001329, -0.065051, -0.000567, 0.025388, 12.183057, 0.102215, 0.024278, 12.411147, 0.007853]
+  ego_state_std: [7.012647, 2.825569, 0.053251, 0.743784, 0.562118, 0.055965, 1.176846, 0.973456, 0.322863, 0.200897, 0.057211, 0.396776, 6.883211, 2.127180, 0.068720, 6.805112, 0.233828]
+  ego_state_scale: [60.0, 30.0, 5.0, 5.0, 5.0, 5.0, 10.0, 10.0, 10.0, 3.14159, 3.14159, 3.14159, 60.0, 30.0, 5.0, 70.0, 3.14159]
+
+encoder:
+  mlp_keys: ${env.encoder.mlp_keys}
+  cnn_keys: ${env.encoder.cnn_keys}
+  mlp:
+    shape: null
+    layers: 3
+    units: ${model.units}
+    act: ${model.act}
+    norm: ${model.norm}
+    device: ${device}
+    outscale: null
+    symlog_inputs: True
+    name: 'mlp_encoder'
+  cnn:
+    act: ${model.act}
+    norm: ${model.norm}
+    kernel_size: 5
+    minres: 4
+    depth: ${model.depth}
+    mults: [2, 3, 4, 4]
+
+decoder:
+  mlp_keys: ${env.decoder.mlp_keys}
+  cnn_keys: ${env.decoder.cnn_keys}
+  mlp_dist:
+    name: 'symlog_mse'
+  cnn_dist:
+    name: 'mse'
+  mlp:
+    shape: null
+    layers: 3
+    units: ${model.units}
+    act: ${model.act}
+    norm: ${model.norm}
+    dist:
+      name: 'identity'
+    device: ${device}
+    outscale: 1.0
+    symlog_inputs: False
+    name: 'mlp_decoder'
+  cnn:
+    depth: ${model.depth}
+    units: ${model.units}
+    bspace: 8
+    mults: [2, 3, 4, 4]
+    act: ${model.act}
+    norm: ${model.norm}
+    kernel_size: 5
+    minres: 4
+    outscale: 1.0
+
+reward_component_units: ${model.units}
+
+reward:
+  shape: [255,]
+  layers: 1
+  units: ${model.units}
+  act: ${model.act}
+  norm: ${model.norm}
+  dist:
+    name: 'symexp_twohot'
+    bin_num: 255
+  outscale: 0.0
+  device: ${device}
+  symlog_inputs: False
+  name: 'reward'
+
+cont:
+  shape: [1,]
+  layers: 1
+  units: ${model.units}
+  act: ${model.act}
+  norm: ${model.norm}
+  dist:
+    name: 'binary'
+  outscale: 1.0
+  device: ${device}
+  symlog_inputs: False
+  name: 'cont'
+
+actor:
+  shape: null
+  layers: 3
+  units: ${model.units}
+  act: ${model.act}
+  norm: ${model.norm}
+  device: ${device}
+  dist:
+    cont:
+      name: 'bounded_normal'
+      min_std: 0.1
+      max_std: 1.0
+    disc:
+      name: 'onehot'
+      unimix_ratio: 0.01
+    multi_disc:
+      name: 'multi_onehot'
+      unimix_ratio: 0.01
+  outscale: 0.01
+  symlog_inputs: False
+  name: 'actor'
+
+critic:
+  shape: [255,]
+  layers: 3
+  units: ${model.units}
+  act: ${model.act}
+  norm: ${model.norm}
+  device: ${device}
+  dist:
+    name: 'symexp_twohot'
+    bin_num: 255
+  outscale: 0.0
+  symlog_inputs: False
+  name: 'value'
