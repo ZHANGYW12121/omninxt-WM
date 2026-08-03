@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""10 Hz four-direction stereo 3D skeleton experiment.
+"""10 Hz four-direction 3D skeleton runtime.
 
-The processing path stays in memory: fresh rectified stereo inputs are used for
-2D pose and sparse joint triangulation, while the slower HITNet metric depth is
-cached only for validation and fallback.  JPEG generation is isolated in an
-optional display thread and never feeds perception.
+The real-camera path uses fresh rectified stereo inputs for sparse joint
+triangulation with dense depth as validation/fallback. The simulation recording
+path can instead require exact-timestamp Isaac ground-truth depth for every
+lifted RTMPose joint. JPEG generation is isolated in an optional display thread
+and never feeds perception.
 """
 
 import argparse
@@ -83,6 +84,17 @@ def parse_args():
                         help="Keep a 3D track through short detector/pose gaps")
     parser.add_argument("--max-person-range", type=float, default=0.0,
                         help="Maximum Euclidean base_link range in metres; <=0 disables the range gate")
+    parser.add_argument(
+        "--joint-depth-source", choices=("hybrid", "isaac_gt"),
+        default="hybrid",
+        help=("hybrid keeps sparse stereo with dense-depth fallback; "
+              "isaac_gt requires exact-timestamp Isaac depth for every "
+              "recorded 3D joint"),
+    )
+    parser.add_argument(
+        "--gt-depth-radius", type=int, default=1,
+        help="Finite local-median radius used for exact Isaac-GT joint depth",
+    )
     parser.add_argument("--backend-host", default="",
                         help="Optional backend IP/hostname for skeleton TCP")
     parser.add_argument("--backend-port", type=int, default=9765)
@@ -140,10 +152,13 @@ def build_anchor_maps(cameras, width, height, horizontal_fov_deg):
 
 
 class InputBridge:
-    """Synchronize two image bundles and cache slower four-pair HITNet depth."""
+    """Synchronize image bundles and optionally all four exact depth frames."""
 
-    def __init__(self):
+    def __init__(self, require_exact_depth=False):
+        self.require_exact_depth = bool(require_exact_depth)
         self.required = {"anchors", "stereo"}
+        if self.require_exact_depth:
+            self.required.update("depth{}".format(index) for index in range(4))
         self.buckets = defaultdict(dict)
         self.lock = threading.Lock()
         self.frames = queue.Queue(maxsize=1)
@@ -188,15 +203,31 @@ class InputBridge:
                 y = index * 240
                 images[(index, "left")] = image[y:y + 240, :320]
                 images[(index, "right")] = image[y:y + 240, 320:640]
+        self._store_bundle(stamp, kind, images)
+
+    def _store_bundle(self, stamp, kind, payload):
         complete = None
         with self.lock:
-            self.buckets[stamp][kind] = images
+            self.buckets[stamp][kind] = payload
             if self.required.issubset(self.buckets[stamp]):
                 bundles = self.buckets.pop(stamp)
                 complete_images = {}
                 complete_images.update(bundles["anchors"])
                 complete_images.update(bundles["stereo"])
-                complete = (stamp, complete_images)
+                if self.require_exact_depth:
+                    complete_depths = [
+                        bundles["depth{}".format(index)] for index in range(4)
+                    ]
+                    complete_stamps = [stamp] * 4
+                else:
+                    complete_depths = [
+                        None if value is None else value.copy()
+                        for value in self.depth
+                    ]
+                    complete_stamps = list(self.depth_stamp)
+                complete = (
+                    stamp, complete_images, complete_depths, complete_stamps,
+                )
             for old in sorted(self.buckets)[:-12]:
                 self.buckets.pop(old, None)
         if complete is not None:
@@ -210,10 +241,13 @@ class InputBridge:
                 pass
 
     def _depth_cb(self, message, index):
+        stamp = message.header.stamp.to_nsec()
         depth = decode_image(message)
         with self.lock:
             self.depth[index] = depth
-            self.depth_stamp[index] = message.header.stamp.to_nsec()
+            self.depth_stamp[index] = stamp
+        if self.require_exact_depth:
+            self._store_bundle(stamp, "depth{}".format(index), depth)
 
     def depth_snapshot(self):
         with self.lock:
@@ -891,6 +925,38 @@ def fill_anchor_monocular_joints(person, camera, focal, width, height):
     return filled
 
 
+def lift_isaac_gt_joint(geometry, left_point, depth, depth_stamp,
+                        frame_stamp, args):
+    """Lift one predicted 2D joint from exact-timestamp Isaac GT depth."""
+    if depth is None or depth_stamp is None or int(depth_stamp) != int(frame_stamp):
+        return None
+    sampled = pose3d.sample_depth(
+        depth, left_point[0], left_point[1],
+        max(0, int(args.gt_depth_radius)), args.min_depth, args.max_depth,
+    )
+    if sampled is None:
+        return None
+    depth_m, depth_mad_m, sample_count = sampled
+    xyz_rect, xyz_body = pose3d.lift_joint(
+        geometry, left_point[0], left_point[1], depth_m)
+    q = geometry["reprojection"]
+    disparity = (q[2, 3] / depth_m - q[3, 3]) / q[3, 2]
+    sigma = float(np.clip(0.02 + depth_mad_m, 0.02, 0.25))
+    return {
+        "source": "isaac_gt_depth",
+        "source_pair": geometry["name"],
+        "depth_m": round(float(depth_m), 6),
+        "depth_mad_m": round(float(depth_mad_m), 6),
+        "measurement_sigma_m": round(sigma, 6),
+        "measurement_age_ms": 0.0,
+        "gt_depth_m": round(float(depth_m), 6),
+        "gt_depth_samples": int(sample_count),
+        "disparity_px": round(float(disparity), 5),
+        "xyz_rect_m": xyz_rect.round(6).tolist(),
+        "xyz_imu_m": xyz_body.round(6).tolist(),
+    }
+
+
 def make_anchor_person(camera_id, anchor_person, anchor_box,
                        geometries, cameras,
                        left_images, right_images, depths, depth_stamps,
@@ -933,6 +999,33 @@ def make_anchor_person(camera_id, anchor_person, anchor_box,
         }
         best = None
         fallback = None
+        if args.joint_depth_source == "isaac_gt":
+            if confidence >= args.keypoint_threshold:
+                for pair_id, geometry in candidates_for_camera:
+                    projection = project_anchor_point(
+                        geometry, camera_id, anchor_point, anchor_focal,
+                        anchor_width, anchor_height)
+                    if projection is None:
+                        continue
+                    anchor_side, rectified_point = projection
+                    # The injected GT depth belongs to the rectified left view.
+                    # Each physical camera is the left member of one cyclic pair.
+                    if anchor_side != "left" or not (
+                            0 <= rectified_point[0] < 320 and
+                            0 <= rectified_point[1] < 240):
+                        continue
+                    lifted = lift_isaac_gt_joint(
+                        geometry, rectified_point, depths[pair_id],
+                        depth_stamps[pair_id], frame_stamp, args)
+                    if lifted is None:
+                        continue
+                    joint.update(lifted)
+                    joint["pixel"] = rectified_point.round(3).tolist()
+                    joint["pixel_int"] = np.rint(
+                        rectified_point).astype(int).tolist()
+                    break
+            person["joints"].append(joint)
+            continue
         if confidence >= max(.20, args.keypoint_threshold - .06):
             for pair_id, geometry in candidates_for_camera:
                 projection = project_anchor_point(
@@ -1046,9 +1139,10 @@ def make_anchor_person(camera_id, anchor_person, anchor_box,
                 "xyz_imu_m": xyz_body.round(6).tolist(),
             })
         person["joints"].append(joint)
-    fill_anchor_monocular_joints(
-        person, cameras["cam{}".format(camera_id)], anchor_focal,
-        anchor_width, anchor_height)
+    if args.joint_depth_source != "isaac_gt":
+        fill_anchor_monocular_joints(
+            person, cameras["cam{}".format(camera_id)], anchor_focal,
+            anchor_width, anchor_height)
     person["kinematic_rejected_joints"] = guard_anchor_skeleton(person)
     person["source_pairs"] = sorted({
         joint["source_pair"] for joint in person["joints"]
@@ -1083,6 +1177,15 @@ def make_stereo_person(sector, left_person, right_person, geometry,
             "hitnet_consistent": None, "xyz_rect_m": None,
             "xyz_imu_m": None,
         }
+        if args.joint_depth_source == "isaac_gt":
+            if left_score >= args.keypoint_threshold:
+                lifted = lift_isaac_gt_joint(
+                    geometry, left_point, depth, depth_stamp,
+                    frame_stamp, args)
+                if lifted is not None:
+                    joint.update(lifted)
+            person["joints"].append(joint)
+            continue
         if left_score >= args.keypoint_threshold and right_person is not None \
                 and right_score >= args.keypoint_threshold:
             semantic_right = np.asarray(
@@ -1381,6 +1484,8 @@ def fuse_people(raw_people, merge_distance):
                                          for value in candidates)), 6),
                 "source": best["source"],
                 "measurement_sigma_m": best.get("measurement_sigma_m"),
+                "measurement_age_ms": best.get("measurement_age_ms", 0.0),
+                "gt_depth_m": best.get("gt_depth_m"),
                 "hitnet_age_ms": best.get("hitnet_age_ms"),
                 "hitnet_consistent": best.get("hitnet_consistent"),
             })
@@ -1456,7 +1561,8 @@ class KalmanJoint:
 class SkeletonTracker:
     def __init__(self, hold_sec=.6, max_person_range=5.0):
         self.tracks = {}
-        self.next_id = 0
+        # Positive IDs are required by the factorized world-model slot schema.
+        self.next_id = 1
         self.hold_sec = max(0.0, float(hold_sec))
         self.max_person_range = max(0.0, float(max_person_range))
 
@@ -1500,8 +1606,9 @@ class SkeletonTracker:
                     body = np.asarray(xyz, dtype=np.float64)
                     sigma = float(joint.get("measurement_sigma_m") or .2)
                     source = str(joint.get("source") or "unknown")
-                    source_age_ms = float(joint.get("hitnet_age_ms") or 0.0) \
-                        if str(source).startswith("hitnet_") else 0.0
+                    source_age_ms = float(
+                        joint.get("measurement_age_ms") or
+                        joint.get("hitnet_age_ms") or 0.0)
                     if joint_filter is None:
                         joint_filter = KalmanJoint(
                             body, stamp_sec, sigma, joint.get("score", 0.0),
@@ -1512,8 +1619,11 @@ class SkeletonTracker:
                         # the motion-predicted joint by more than 0.6 m.  A
                         # fresh stereo triangulation is allowed a wider gate
                         # because it is the primary geometric measurement.
-                        primary_stereo = (source.startswith("stereo_") or
-                                          source == "anchor_epipolar")
+                        primary_stereo = (
+                            source.startswith("stereo_") or
+                            source == "anchor_epipolar" or
+                            source.startswith("isaac_gt_depth")
+                        )
                         # At 10 Hz a real joint should not jump half a metre
                         # between consecutive observations.  Reset to a fresh
                         # stereo measurement beyond that bound instead of
@@ -1989,7 +2099,8 @@ def main():
         det_mode="multiclass", nms_thr=.45, score_thr=args.det_threshold)
     estimator = TensorRTRTMPose(
         args.pose_engine, model_input_size=(192, 256))
-    bridge = InputBridge()
+    bridge = InputBridge(require_exact_depth=(
+        args.joint_depth_source == "isaac_gt"))
     publishers = {
         "poses": rospy.Publisher(
             "/omninxt_pose/joints_3d", PoseArray, queue_size=1),
@@ -2032,14 +2143,13 @@ def main():
               flush=True)
     while not rospy.is_shutdown():
         try:
-            stamp_ns, frame = bridge.frames.get(timeout=.5)
+            stamp_ns, frame, depths, depth_stamps = bridge.frames.get(timeout=.5)
         except queue.Empty:
             continue
         started = time.monotonic()
         left_images = [frame[(index, "left")] for index in range(4)]
         right_images = [frame[(index, "right")] for index in range(4)]
         input_times.append(started)
-        depths, depth_stamps = bridge.depth_snapshot()
         raw_people = []
         raw_by_sector = [[] for _ in range(4)]
         match_counts = [0] * 4
@@ -2188,6 +2298,7 @@ def main():
             "raw_sector_people": len(raw_people),
             "range_rejected_people": range_rejected_people,
             "max_person_range_m": args.max_person_range,
+            "joint_depth_source": args.joint_depth_source,
             "observed_person_ranges_m": observed_person_ranges,
             "monocular_raw_people": monocular_raw_people,
             "monocular_filled_joints": monocular_filled_joints,
@@ -2207,6 +2318,9 @@ def main():
                 for joint in all_joints),
             "hitnet_fallback_joints": sum(
                 joint["source"].startswith("hitnet_") for joint in all_joints),
+            "isaac_gt_depth_joints": sum(
+                joint["source"].startswith("isaac_gt_depth")
+                for joint in all_joints),
             "hitnet_consistent_joints": sum(
                 joint.get("hitnet_consistent") is True for joint in all_joints),
             "kinematic_rejected_joints": sum(
@@ -2238,9 +2352,10 @@ def main():
                             ensure_ascii=False, separators=(",", ":"))))
         if display is not None:
             banner = ("INPUT {:.2f}Hz  PROCESS {:.2f}Hz  PEOPLE {}  "
-                      "TRI {}  HITNET {}  {:.0f}ms").format(
+                      "TRI {}  GT {}  HITNET {}  {:.0f}ms").format(
                           input_hz, processing_hz, len(tracked),
                           status["triangulated_joints"],
+                          status["isaac_gt_depth_joints"],
                           status["hitnet_fallback_joints"], total_ms)
             display.submit({
                 "left": left_images, "right": right_images,
@@ -2255,9 +2370,10 @@ def main():
         if frame_index % 10 == 0:
             rospy.loginfo(
                 "stereo-pose input=%.2fHz process=%.2fHz people=%d "
-                "tri=%d hitnet_fallback=%d valid=%d total=%.1fms",
+                "tri=%d gt_depth=%d hitnet_fallback=%d valid=%d total=%.1fms",
                 input_hz, processing_hz, len(tracked),
                 status["triangulated_joints"],
+                status["isaac_gt_depth_joints"],
                 status["hitnet_fallback_joints"], len(valid_joints), total_ms)
         frame_index += 1
     if server is not None:

@@ -42,10 +42,14 @@ def _apply_crowd_cli_environment():
     if args.benchmark_run:
         # Batch trials start without keyboard input and must not spend GPU time
         # exporting camera/depth products unrelated to navigation evaluation.
+        # Dataset-v2 recording is the exception: its realistic 2D detector and
+        # exact-timestamp 3D lift require the synchronized camera/GT-depth
+        # stream configured by run_isaac_sync_live.sh.
         os.environ["CLASSIC_AUTO_START"] = "1"
-        os.environ["OMNINXT_DEPTH_EXPORT"] = "0"
-        os.environ["OMNINXT_GT_RANGE_EXPORT"] = "0"
-        os.environ.setdefault("OMNINXT_CAMERA_ENABLED", "0")
+        if os.environ.get("OMNINXT_DATA_RECORD_ENABLED", "0") != "1":
+            os.environ["OMNINXT_DEPTH_EXPORT"] = "0"
+            os.environ["OMNINXT_GT_RANGE_EXPORT"] = "0"
+            os.environ.setdefault("OMNINXT_CAMERA_ENABLED", "0")
         os.environ.setdefault("OMNINXT_VISUAL_ENABLED", "1")
 
 

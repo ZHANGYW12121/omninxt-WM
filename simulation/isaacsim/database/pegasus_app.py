@@ -33,7 +33,8 @@ from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
 from pegasus.simulator.logic.people.person import Person
 from pegasus.simulator.logic.graphical_sensors.monocular_camera import MonocularCamera
 
-from data_recorder import DatasetRecorder
+from skeleton_dataset_recorder import SkeletonStateDatasetRecorder
+from skeleton_packet_receiver import SkeletonPacketReceiver
 from keyboard_backend import SharedCommand, KeyboardVelocityController
 from classic_controller import ClassicAlgorithmController
 from ego_planner_controller import EgoPlannerController
@@ -60,10 +61,16 @@ from app_config import (
     DATA_DROP_WHEN_WRITER_BUSY,
     DATA_JSON_INDENT,
     DATA_RECORD_ENABLED,
+    DATA_RECORD_CHUNK_FRAMES,
     DATA_RECORD_HZ,
     DATA_RECORD_MAX_RECORD_BYTES,
     DATA_RECORD_MAX_TRAJECTORIES,
     DATA_RECORD_QUEUE_SIZE,
+    DATA_RECORD_PRIVILEGED_MAX_PEOPLE,
+    DATA_RECORD_SKELETON_HOST,
+    DATA_RECORD_SKELETON_PORT,
+    DATA_RECORD_STORAGE_MAX_PEOPLE,
+    DATA_RECORD_SYNC_TOLERANCE_SEC,
     DATA_RECORD_SIZE_CHECK_INTERVAL_SEC,
     DATA_RECORD_STUCK_TIMEOUT_SEC,
     DATA_REWARD_CONFIG,
@@ -113,9 +120,12 @@ from app_config import (
     PEGASUS_PEOPLE_CONTROL_HZ,
     PEGASUS_PEOPLE_STATE_CALLBACK,
     MAVSDK_COMMAND_HZ,
+    MAVSDK_BODY_DOWN_SIGN,
+    MAVSDK_BODY_RIGHT_SIGN,
     MAVSDK_CONNECT_TIMEOUT_SEC,
     MAVSDK_HEALTH_TIMEOUT_SEC,
     MAVSDK_SYSTEM_ADDRESS,
+    MAVSDK_YAWSPEED_SIGN,
     MAVSDK_USE_TELEMETRY_STATE,
     NAVRL_STATE_SOURCE,
     MVD35_BODY_MASS_KG,
@@ -525,7 +535,7 @@ class PegasusApp:
         self.discarded_trajectory_count = 0
         self.trajectory_limit_reached = False
         self._last_record_size_check_wall = 0.0
-        self._last_unrecorded_control_time = None
+        self._last_control_update_time = None
         self._ego_physical_collision_count = 0
         self._ego_human_collision_count = 0
         self._ego_environment_collision_count = 0
@@ -566,10 +576,22 @@ class PegasusApp:
             f"separate_state_callback={bool(PEGASUS_PEOPLE_STATE_CALLBACK)}, "
             f"skeleton={PEDESTRIAN_SKELETON_UPDATE_HZ:.1f}Hz"
         )
-        self.data_recorder = DatasetRecorder(
+        self.skeleton_packet_receiver = None
+        if DATA_RECORD_ENABLED:
+            self.skeleton_packet_receiver = SkeletonPacketReceiver(
+                host=DATA_RECORD_SKELETON_HOST,
+                port=DATA_RECORD_SKELETON_PORT,
+            )
+            self.skeleton_packet_receiver.start()
+            carb.log_warn(
+                "[REC][V2] Skeleton receiver listening on {}:{}".format(
+                    DATA_RECORD_SKELETON_HOST, DATA_RECORD_SKELETON_PORT))
+        self.data_recorder = SkeletonStateDatasetRecorder(
             drone=self.drone,
-            camera_sensor=self.front_camera_sensor,
             skeleton_tracker=self.skeleton_tracker,
+            skeleton_receiver=self.skeleton_packet_receiver,
+            privileged_provider=self._dataset_privileged_snapshot,
+            episode_metadata_provider=self._dataset_episode_metadata,
             target_point=TARGET_POINT,
             goal_region={
                 "x_range": DATASET_GOAL_X_RANGE,
@@ -589,6 +611,10 @@ class PegasusApp:
             altitude_agl_provider=self._altitude_agl_from_physx,
             reward_config=DATA_REWARD_CONFIG,
             control_rate_hz=DATA_CONTROL_HZ if self._uses_classic_controller() else None,
+            storage_max_people=DATA_RECORD_STORAGE_MAX_PEOPLE,
+            privileged_max_people=DATA_RECORD_PRIVILEGED_MAX_PEOPLE,
+            chunk_frames=DATA_RECORD_CHUNK_FRAMES,
+            sync_tolerance_sec=DATA_RECORD_SYNC_TOLERANCE_SEC,
         )
 
         self.gamepad = None
@@ -1044,33 +1070,31 @@ class PegasusApp:
                 self.navigation_benchmark.update()
             self._monitor_crowd_clearance()
             self._export_crowd_map_state()
-            dataset_frame_saved = False
             recording_event = self._detect_recording_event()
             if recording_event is None:
                 watchdog_event = self._detect_recording_watchdog_event()
                 if watchdog_event is None:
-                    dataset_frame_saved = self.data_recorder.update()
+                    self.data_recorder.update()
                 else:
                     self._finish_recording_for_watchdog(watchdog_event)
             else:
                 self._finish_recording_for_event(recording_event)
             self._update_post_episode_landing()
-            # Recorded missions follow successful frame saves. Flight-only
-            # missions use the same rate on an independent simulation clock.
+            # Controller cadence is independent of perception arrival and disk
+            # writes. Replacing the flight policy therefore cannot change the
+            # dataset timestamping contract, and recorder backpressure cannot
+            # stall the policy update schedule.
             if not self.trajectory_limit_reached:
                 if self._post_episode_landing_active:
                     pass
-                elif self.data_recorder.is_recording and dataset_frame_saved:
-                    self._update_control_mode()
-                elif (
-                    not self.data_recorder.is_recording
-                    and self._unrecorded_control_update_due()
-                ):
+                elif self._control_update_due():
                     self._update_control_mode()
 
         _debug_log("Simulation closing.")
         self._ego_contact_report_sub = None
         self.data_recorder.stop(reason="shutdown")
+        if self.skeleton_packet_receiver is not None:
+            self.skeleton_packet_receiver.stop()
         if self.input_controller is not None:
             self.input_controller.shutdown()
         if self.mavsdk_bridge is not None:
@@ -1398,13 +1422,34 @@ class PegasusApp:
 
         source = "classic_controller" if self.classic_controller is not None else "gamepad"
         applied = None
+        applied_body_flu = None
         mavsdk_snapshot = None
         if self.mavsdk_bridge is not None:
             source = "px4_mavsdk_classic_controller"
             mavsdk_snapshot = self.mavsdk_bridge.snapshot()
             applied = mavsdk_snapshot.get("applied")
+            if isinstance(applied, dict) and bool(
+                    mavsdk_snapshot.get("offboard_started", False)):
+                applied_body_flu = {
+                    "vx_body_mps": float(applied.get("forward_m_s", 0.0)),
+                    "vy_body_mps": float(applied.get("right_m_s", 0.0)) /
+                    float(MAVSDK_BODY_RIGHT_SIGN),
+                    "vz_world_mps": float(applied.get("down_m_s", 0.0)) /
+                    float(MAVSDK_BODY_DOWN_SIGN),
+                    "yaw_rate_rps": math.radians(
+                        float(applied.get("yawspeed_deg_s", 0.0)) /
+                        float(MAVSDK_YAWSPEED_SIGN)),
+                }
         elif self.keyboard_backend is not None:
             applied = self.keyboard_backend.get_applied_motion()
+            if isinstance(applied, dict):
+                applied_body_flu = {
+                    key: float(applied.get(key, 0.0))
+                    for key in (
+                        "vx_body_mps", "vy_body_mps",
+                        "vz_world_mps", "yaw_rate_rps",
+                    )
+                }
 
         return {
             "source": source,
@@ -1418,6 +1463,8 @@ class PegasusApp:
                 "yaw_rate_rps": float(yaw_rate),
             },
             "applied": applied,
+            # Stable controller-independent convention consumed by dataset v2.
+            "applied_body_flu": applied_body_flu,
             "mavsdk": mavsdk_snapshot,
             "control_update_sim_time": (
                 None if control_update_time is None else float(control_update_time)
@@ -1425,23 +1472,106 @@ class PegasusApp:
             "control_action_age_sec": action_age,
         }
 
+    def _dataset_privileged_snapshot(self):
+        """Return simulator truth that must never enter the policy encoder."""
+        drone_state = getattr(self.drone, "state", None)
+        drone = {}
+        if drone_state is not None:
+            drone = {
+                "position": np.asarray(drone_state.position, dtype=float).tolist(),
+                "velocity": np.asarray(
+                    drone_state.linear_velocity, dtype=float).tolist(),
+                "acceleration": np.asarray(
+                    drone_state.linear_acceleration, dtype=float).tolist(),
+                "quaternion_xyzw": np.asarray(
+                    drone_state.attitude, dtype=float).tolist(),
+            }
+        marker_positions = self.skeleton_tracker.marker_positions or {}
+        people = []
+        active_people = self.people[:int(self.crowd_scene.num_people)]
+        for person_index, person in enumerate(active_people):
+            name = person._stage_prefix.rstrip("/").split("/")[-1]
+            state = getattr(person, "state", None)
+            if state is None:
+                continue
+            position = np.asarray(state.position, dtype=float)
+            if position.shape != (3,) or not np.isfinite(position).all():
+                continue
+            velocity = np.asarray(
+                getattr(state, "linear_velocity", np.zeros(3)), dtype=float)
+            controller = getattr(person, "_controller", None)
+            joints_by_name = marker_positions.get(name, {}) or {}
+            collision_joints = []
+            collision_valid = []
+            for joint_name in self.skeleton_tracker.joint_names:
+                value = joints_by_name.get(joint_name)
+                valid = value is not None
+                array = np.zeros(3) if not valid else np.asarray(value, dtype=float)
+                valid = bool(valid and array.shape == (3,) and np.isfinite(array).all())
+                collision_joints.append(
+                    array.astype(float).tolist() if valid else [0.0, 0.0, 0.0])
+                collision_valid.append(valid)
+            pelvis = joints_by_name.get("Pelvis")
+            people.append({
+                "id": int(person_index),
+                "name": name,
+                "group_id": getattr(controller, "crowd_group_id", None),
+                "position": position.astype(float).tolist(),
+                "velocity": velocity.astype(float).tolist(),
+                "pelvis": None if pelvis is None else
+                np.asarray(pelvis, dtype=float).tolist(),
+                "collision_joints": collision_joints,
+                "collision_joint_valid": collision_valid,
+            })
+        return {"drone": drone, "people": people}
+
+    def _dataset_episode_metadata(self):
+        people = []
+        for person_index, spec in enumerate(self.crowd_scene.person_specs):
+            group_id = getattr(spec, "group_id", None)
+            people.append({
+                "id": int(person_index),
+                "name": str(spec.name),
+                "group_id": None if group_id is None else int(group_id),
+                "group_size": int(getattr(spec, "group_size", 1)),
+                "member_index": int(getattr(spec, "member_index", 0)),
+                "initial_position": [float(value) for value in spec.init_pos],
+                "waypoints": [
+                    [float(value) for value in point]
+                    for point in getattr(spec, "waypoints", ())
+                ],
+            })
+        return {
+            "scene_key": str(self.crowd_scene.key),
+            "crowd_seed": int(self.crowd_scene.seed),
+            "crowd_num_people": int(self.crowd_scene.num_people),
+            "control_mode": str(self.control_mode),
+            "benchmark_algorithm": (
+                None if self.benchmark_config is None else
+                self.benchmark_config.get("algorithm")
+            ),
+            "drone_spawn_world": [float(value) for value in SPAWN_POS],
+            "goal_world": [float(value) for value in TARGET_POINT],
+            "people": people,
+        }
+
     def _update_control_mode(self):
         update = getattr(self.input_controller, "update", None)
         if callable(update):
             update()
 
-    def _unrecorded_control_update_due(self):
+    def _control_update_due(self):
         now = self._simulation_time()
         if now is None:
             return True
 
         period = 1.0 / max(float(DATA_CONTROL_HZ), 1e-6)
         if (
-            self._last_unrecorded_control_time is None
-            or now < self._last_unrecorded_control_time
-            or now - self._last_unrecorded_control_time >= period - 1e-9
+            self._last_control_update_time is None
+            or now < self._last_control_update_time
+            or now - self._last_control_update_time >= period - 1e-9
         ):
-            self._last_unrecorded_control_time = now
+            self._last_control_update_time = now
             return True
         return False
 

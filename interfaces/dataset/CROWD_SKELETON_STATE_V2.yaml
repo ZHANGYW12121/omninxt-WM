@@ -1,0 +1,118 @@
+schema: omninxt.crowd_skeleton_state.v2
+status: recording_candidate
+sample_rate_hz: 10.0
+transition_alignment: >-
+  Row t contains observation_t, the action applied during the transition from
+  observation_(t-1) to observation_t, and the reward for that transition. The
+  first row has zero previous action, zero transition reward, and is_first=true.
+
+storage:
+  container: chunked_npz
+  frames_per_chunk: 256
+  atomic_chunk_commit: true
+  storage_max_people: 32
+  joint_count: 17
+  privileged_max_people: 32
+  privileged_joint_count: 10
+
+observation:
+  skeleton:
+    schema: omninxt.skeleton3d.v1
+    topology: COCO17
+    frame: base_link
+    convention: ROS_FLU
+    axes: {x: forward, y: left, z: up}
+    units: metre
+    simulation_depth_source: isaac_gt_depth
+    fields:
+      human_xyz: [T, 32, 17, 3]
+      human_pose_score: [T, 32, 17]
+      human_confidence: [T, 32, 17]
+      human_joint_valid: [T, 32, 17]
+      human_joint_measured: [T, 32, 17]
+      human_joint_predicted: [T, 32, 17]
+      human_measurement_sigma_m: [T, 32, 17]
+      human_measurement_age_ms: [T, 32, 17]
+      human_source_code: [T, 32, 17]
+      human_track_id: [T, 32]
+      human_mask: [T, 32]
+      human_is_first: [T, 32]
+      human_count: [T]
+      human_truncated_count: [T]
+  ego:
+    frame: episode_start_and_current_body_heading
+    fields:
+      ego_state: [T, 14]
+      ego_quaternion_xyzw: [T, 4]
+      ego_state_valid: [T]
+      ego_altitude_valid: [T]
+      ego_state_source: [T]
+    ego_state_order:
+      - local_x
+      - local_y
+      - local_z
+      - body_vx
+      - body_vy
+      - world_vz
+      - body_ax
+      - body_ay
+      - world_az
+      - altitude_agl
+      - roll
+      - pitch
+      - sin_relative_yaw
+      - cos_relative_yaw
+
+transition:
+  action_order: [vx_body_mps, vy_body_mps, vz_world_mps, yaw_rate_rps]
+  reward_component_order: [event, progress, human_clearance, smoothness, height, time]
+  required_fields:
+    - prev_action_requested_norm
+    - prev_action_requested_physical
+    - prev_action_applied
+    - prev_action_applied_valid
+    - reward
+    - reward_components
+    - is_first
+    - is_terminal
+    - discount
+    - termination_code
+
+privileged:
+  policy_visible: false
+  required_fields:
+    - priv_drone_position_world
+    - priv_drone_velocity_world
+    - priv_drone_acceleration_world
+    - priv_drone_quaternion_xyzw
+    - priv_human_id
+    - priv_human_group_id
+    - priv_human_mask
+    - priv_human_position_world
+    - priv_human_velocity_world
+    - priv_human_pelvis_world
+    - priv_collision_joints_world
+    - priv_min_human_clearance_m
+    - priv_min_human_ttc_s
+    - priv_collision
+    - priv_goal_distance_m
+  note: >-
+    Privileged values are labels for reward, evaluation, and debugging. They
+    must never be passed to the policy or world-model observation encoder.
+
+timing:
+  required_fields:
+    - frame_index
+    - simulation_time_s
+    - episode_time_s
+    - wall_timestamp_ns
+    - skeleton_timestamp_ns
+    - skeleton_sequence
+    - skeleton_time_offset_ms
+    - dt_s
+
+excluded_payloads:
+  - rgb_image
+  - depth_image
+  - point_cloud
+  - image_2d_skeleton

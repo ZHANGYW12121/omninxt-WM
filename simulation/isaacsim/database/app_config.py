@@ -103,11 +103,23 @@ TARGET_POINT = [
 DATA_RECORD_HZ = 10.0
 # Flight-only mode: PX4 takeoff and autonomous navigation remain active, while
 # dataset directories and frame files are never created.
-DATA_RECORD_ENABLED = False
+DATA_RECORD_ENABLED = os.environ.get("OMNINXT_DATA_RECORD_ENABLED", "0") == "1"
 # The autonomous policy is evaluated at the same rate as dataset sampling.
 # Its velocity command is held constant between two control ticks.
 DATA_CONTROL_HZ = DATA_RECORD_HZ
 DATA_RECORD_QUEUE_SIZE = 16
+DATA_RECORD_CHUNK_FRAMES = int(os.environ.get(
+    "OMNINXT_DATA_RECORD_CHUNK_FRAMES", "256"))
+DATA_RECORD_STORAGE_MAX_PEOPLE = int(os.environ.get(
+    "OMNINXT_DATA_RECORD_STORAGE_MAX_PEOPLE", "32"))
+DATA_RECORD_PRIVILEGED_MAX_PEOPLE = int(os.environ.get(
+    "OMNINXT_DATA_RECORD_PRIVILEGED_MAX_PEOPLE", "32"))
+DATA_RECORD_SYNC_TOLERANCE_SEC = float(os.environ.get(
+    "OMNINXT_DATA_RECORD_SYNC_TOLERANCE_SEC", "0.075"))
+DATA_RECORD_SKELETON_HOST = os.environ.get(
+    "OMNINXT_SKELETON_BACKEND_HOST", "127.0.0.1")
+DATA_RECORD_SKELETON_PORT = int(os.environ.get(
+    "OMNINXT_SKELETON_BACKEND_PORT", "9765"))
 DATASET_ROOT = os.path.expanduser(
     os.environ.get("OMNINXT_DATASET_ROOT", os.path.join(ZYW_ROOT, "database_quadcamera"))
 )
