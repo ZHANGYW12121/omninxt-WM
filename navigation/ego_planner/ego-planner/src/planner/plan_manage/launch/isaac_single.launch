@@ -1,0 +1,51 @@
+<launch>
+  <!-- Keep EGO trajectory execution synchronized with slow/fast Isaac runs. -->
+  <param name="/use_sim_time" value="true"/>
+  <arg name="map_size_x" default="30.0"/>
+  <arg name="map_size_y" default="70.0"/>
+  <arg name="map_size_z" default="4.0"/>
+  <arg name="max_vel" default="2.0"/>
+  <arg name="max_acc" default="2.0"/>
+
+  <node pkg="isaac_ego_bridge" name="isaac_udp_ros_bridge"
+        type="isaac_udp_ros_bridge.py" output="screen" required="true">
+    <param name="listen_port" value="15100"/>
+    <param name="isaac_host" value="127.0.0.1"/>
+    <param name="isaac_port" value="15101"/>
+  </node>
+
+  <include file="$(find ego_planner)/launch/advanced_param.xml">
+    <arg name="map_size_x_" value="$(arg map_size_x)"/>
+    <arg name="map_size_y_" value="$(arg map_size_y)"/>
+    <arg name="map_size_z_" value="$(arg map_size_z)"/>
+    <arg name="odometry_topic" value="/isaac/odom"/>
+    <arg name="camera_pose_topic" value="/unused/camera_pose"/>
+    <arg name="depth_topic" value="/unused/depth"/>
+    <arg name="cloud_topic" value="/isaac/cloud"/>
+    <arg name="cx" value="320.0"/><arg name="cy" value="240.0"/>
+    <arg name="fx" value="320.0"/><arg name="fy" value="320.0"/>
+    <arg name="max_vel" value="$(arg max_vel)"/>
+    <arg name="max_acc" value="$(arg max_acc)"/>
+    <arg name="planning_horizon" value="7.0"/>
+    <arg name="flight_type" value="1"/>
+    <arg name="point_num" value="1"/>
+    <arg name="point0_x" value="0.0"/><arg name="point0_y" value="0.0"/><arg name="point0_z" value="1.0"/>
+    <arg name="point1_x" value="0.0"/><arg name="point1_y" value="0.0"/><arg name="point1_z" value="1.0"/>
+    <arg name="point2_x" value="0.0"/><arg name="point2_y" value="0.0"/><arg name="point2_z" value="1.0"/>
+    <arg name="point3_x" value="0.0"/><arg name="point3_y" value="0.0"/><arg name="point3_z" value="1.0"/>
+    <arg name="point4_x" value="0.0"/><arg name="point4_y" value="0.0"/><arg name="point4_z" value="1.0"/>
+  </include>
+
+  <node pkg="ego_planner" name="traj_server" type="traj_server" output="screen">
+    <remap from="/position_cmd" to="/planning/pos_cmd"/>
+    <remap from="/odom_world" to="/isaac/odom"/>
+    <param name="traj_server/time_forward" value="1.0" type="double"/>
+  </node>
+
+  <node pkg="waypoint_generator" name="waypoint_generator"
+        type="waypoint_generator" output="screen">
+    <remap from="~odom" to="/isaac/odom"/>
+    <remap from="~goal" to="/move_base_simple/goal"/>
+    <param name="waypoint_type" value="manual-lonely-waypoint"/>
+  </node>
+</launch>

@@ -1,0 +1,5 @@
+**/.git
+**/build
+**/devel
+**/__pycache__
+docker_build.log

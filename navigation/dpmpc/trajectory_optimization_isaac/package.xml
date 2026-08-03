@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>trajectory_optimization</name>
+  <version>0.1.0</version>
+  <description>Official DPMPC trajectory optimization with an Isaac UDP adapter.</description>
+  <maintainer email="local@example.com">Isaac integration maintainer</maintainer>
+  <license>Upstream license not specified</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>geometry_msgs</depend>
+  <depend>octomap_msgs</depend>
+  <depend>octomap_ros</depend>
+  <depend>roscpp</depend>
+  <depend>std_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <export/>
+</package>

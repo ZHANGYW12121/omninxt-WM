@@ -23,6 +23,32 @@ components:
   rtmlib:
     url: https://github.com/Tau-J/rtmlib.git
     note: Runtime subset is vendored with its upstream license for reproducibility.
+  r2dreamer:
+    url: https://github.com/NM512/r2dreamer.git
+    commit: 1fadce46c40dc59cf5a7407e4a296a3c6e4d1416
+    path: world_model
+    note: Alienware working tree is the authoritative factorized ego-human model.
+  ego_planner:
+    url: https://github.com/ZJU-FAST-Lab/ego-planner.git
+    commit: bfda51284c8c1b476043255a8145ef925a3778a5
+    path: navigation/ego_planner/ego-planner
+  navrl:
+    url: https://github.com/Zhefan-Xu/NavRL.git
+    commit: 3725bcc2e7c1be4ecf1455d922299ae85042603a
+    path: navigation/navrl
+    checkpoint_installer: tools/fetch_navrl_checkpoint.sh
+  dpmpc:
+    url: https://github.com/Zhefan-Xu/trajectory_optimization.git
+    commit: c8a89203bb11a5bce5a852052b240ce8638b6122
+    path: navigation/dpmpc/trajectory_optimization_isaac
+  acado:
+    url: https://github.com/acado/acado.git
+    commit: b8e586639fc714bf3263152637da3b0efce23a32
+    path: navigation/dpmpc/dependencies/ACADOtoolkit
+  quadprogpp:
+    url: https://github.com/liuq/QuadProgpp.git
+    commit: 0c25447365c980876fdc395f55d60300a5e5793c
+    path: navigation/dpmpc/dependencies/QuadProgpp
 assets:
   warehouse_usd:
     sha256: 2f3eb49cf492e521ee4a7b7c682be14b9dfaacab0176bc24ecd8d49bb113d7cd

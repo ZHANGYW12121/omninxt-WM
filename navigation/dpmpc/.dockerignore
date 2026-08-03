@@ -1,0 +1,5 @@
+trajectory_optimization_official
+**/.git
+**/build
+**/__pycache__
+docker_build.log

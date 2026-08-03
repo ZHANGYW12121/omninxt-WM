@@ -1,0 +1,37 @@
+schema: omninxt_navigation_upstreams_v1
+components:
+  r2dreamer:
+    path: world_model
+    url: https://github.com/NM512/r2dreamer.git
+    base_commit: 1fadce46c40dc59cf5a7407e4a296a3c6e4d1416
+    note: Alienware working tree is authoritative and includes the factorized ego-human world model.
+  ego_planner:
+    path: navigation/ego_planner/ego-planner
+    url: https://github.com/ZJU-FAST-Lab/ego-planner.git
+    base_commit: bfda51284c8c1b476043255a8145ef925a3778a5
+    license: GPL-3.0
+    adaptation: ROS1 UDP bridge and Isaac single-drone launch files are vendored.
+  navrl:
+    path: navigation/navrl
+    url: https://github.com/Zhefan-Xu/NavRL.git
+    base_commit: 3725bcc2e7c1be4ecf1455d922299ae85042603a
+    license: MIT
+    checkpoint:
+      relative_upstream_path: quick-demos/ckpts/navrl_checkpoint.pt
+      sha256: 51fa3dbdc6ba89626b5dad3a4638deb53d40aa6f0caa9b289657da4a8e0b60c3
+      installer: tools/fetch_navrl_checkpoint.sh
+  dpmpc:
+    path: navigation/dpmpc/trajectory_optimization_isaac
+    url: https://github.com/Zhefan-Xu/trajectory_optimization.git
+    base_commit: c8a89203bb11a5bce5a852052b240ce8638b6122
+    adaptation: ROS1 UDP sidecar and Isaac observation/setpoint bridge are vendored.
+  acado:
+    path: navigation/dpmpc/dependencies/ACADOtoolkit
+    url: https://github.com/acado/acado.git
+    base_commit: b8e586639fc714bf3263152637da3b0efce23a32
+    license: LGPL-3.0
+  quadprogpp:
+    path: navigation/dpmpc/dependencies/QuadProgpp
+    url: https://github.com/liuq/QuadProgpp.git
+    base_commit: 0c25447365c980876fdc395f55d60300a5e5793c
+    license: MIT
