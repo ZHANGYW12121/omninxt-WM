@@ -13,7 +13,11 @@ Key entry points:
 
 - `simulation/isaacsim/database/run_people_warehouse_with_map.sh`
 - `simulation/omnidepth/run_isaac_sync_live.sh`
+- `simulation/isaacsim/database/run_navigation_benchmark.sh`
+- `navigation/README.md`
+- `world_model/README.md`
 - `tools/configure_machine.sh`
+- `tools/fetch_navrl_checkpoint.sh`
 - `tools/doctor.sh`
 
 The server copy imported on 2026-08-03 is authoritative for simulation,

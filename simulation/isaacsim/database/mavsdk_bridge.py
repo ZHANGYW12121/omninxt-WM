@@ -21,6 +21,7 @@ from app_config import (
     MAVSDK_COMMAND_HZ,
     MAVSDK_CONNECT_TIMEOUT_SEC,
     MAVSDK_HEALTH_TIMEOUT_SEC,
+    MAVSDK_SIM_MAVLINK_TIMEOUT_SEC,
     MAVSDK_OFFBOARD_RETRY_SEC,
     MAVSDK_START_OFFBOARD_ON_TAKEOFF,
     MAVSDK_SYSTEM_ADDRESS,
@@ -51,11 +52,22 @@ class MavsdkOffboardBridge:
         command_hz=MAVSDK_COMMAND_HZ,
         connect_timeout_sec=MAVSDK_CONNECT_TIMEOUT_SEC,
         health_timeout_sec=MAVSDK_HEALTH_TIMEOUT_SEC,
+        telemetry_rate_limits=None,
     ):
         self.system_address = str(system_address)
         self.command_hz = float(command_hz)
         self.connect_timeout_sec = float(connect_timeout_sec)
         self.health_timeout_sec = float(health_timeout_sec)
+        self.telemetry_rate_limits = telemetry_rate_limits
+        limits = dict(telemetry_rate_limits or {})
+        # Isaac can use its rigid-body state without subscribing to MAVSDK's
+        # high-rate position/attitude streams.  Keep the lightweight
+        # connection path in that mode, while still allowing low-rate
+        # health/armed callbacks needed for a truthful pre-arm gate.
+        self._callback_free = bool(limits) and all(
+            float(limits.get(name, 0.0)) <= 0.0
+            for name in ("position_velocity_ned", "attitude_euler")
+        )
 
         self.quit = False
         self._lock = threading.Lock()
@@ -79,6 +91,7 @@ class MavsdkOffboardBridge:
         self._latest_command_wall_time = None
         self._requested_motion = (0.0, 0.0, 0.0, 0.0)
         self._applied_command = self._empty_command()
+        self._rpc_failure_count = 0
 
     def start(self):
         if self._thread is not None and self._thread.is_alive():
@@ -119,6 +132,7 @@ class MavsdkOffboardBridge:
             self._latest_command_wall_time = None
             self._requested_motion = (0.0, 0.0, 0.0, 0.0)
             self._applied_command = self._empty_command()
+            self._rpc_failure_count = 0
 
     def trigger_takeoff(self):
         with self._lock:
@@ -149,6 +163,15 @@ class MavsdkOffboardBridge:
     def is_offboard_started(self):
         with self._lock:
             return bool(self._offboard_started)
+
+    def is_ready_for_takeoff(self):
+        """Return PX4's real health/armable gate, never a guessed state."""
+        with self._lock:
+            return bool(
+                self._connected
+                and self._position_ok
+                and (self._armable or self._armed)
+            )
 
     def get_state(self):
         with self._lock:
@@ -194,12 +217,22 @@ class MavsdkOffboardBridge:
             }
 
     def _run_thread(self):
-        try:
-            asyncio.run(self._async_main())
-        except Exception as exc:
+        while not self._stop_event.is_set():
+            try:
+                asyncio.run(self._async_main())
+                if self._stop_event.is_set():
+                    return
+                error = "MAVSDK connection ended unexpectedly"
+            except Exception as exc:
+                error = str(exc)
             with self._lock:
-                self._last_error = str(exc)
-            _log_warn(f"[MAVSDK] Bridge thread exited with error: {exc}")
+                self._last_error = error
+                self._connected = False
+                self._offboard_started = False
+            _log_warn(
+                f"[MAVSDK] Connection lost ({error}); rebuilding server/channel."
+            )
+            self._stop_event.wait(1.0)
 
     async def _async_main(self):
         try:
@@ -215,19 +248,49 @@ class MavsdkOffboardBridge:
         drone = System()
         _log_warn(f"[MAVSDK] Connecting to PX4 via {self.system_address}")
         await drone.connect(system_address=self.system_address)
-        connected = await self._wait_connected(drone)
+        if self._callback_free:
+            # Pegasus starts this bridge only after its PX4 backend has already
+            # received a heartbeat. Avoid core.connection_state(): under very
+            # slow lockstep simulation that callback stream alone can overflow
+            # mavsdk_server's user queue before it reports the first state.
+            # PX4 SITL emits heartbeats in simulation time, whereas MAVSDK's
+            # default timeout is measured in wall time. At RTF~0.1 a nominal
+            # 1 Hz heartbeat arrives only every ~10 wall seconds, so the
+            # default timeout incorrectly disconnects a healthy vehicle.
+            await drone.core.set_mavlink_timeout(MAVSDK_SIM_MAVLINK_TIMEOUT_SEC)
+            await asyncio.sleep(0.25)
+            connected = True
+            _log_warn(
+                "[MAVSDK] State-light Isaac mode connected to PX4 command "
+                "channel; waiting for real PX4 health/armable state before "
+                f"arming, MAVLink timeout={MAVSDK_SIM_MAVLINK_TIMEOUT_SEC:.1f}s."
+            )
+        else:
+            connected = await self._wait_connected(drone)
         with self._lock:
             self._connected = bool(connected)
         if not connected:
             return
 
-        telemetry_tasks = [
-            asyncio.create_task(self._watch_position_velocity(drone)),
-            asyncio.create_task(self._watch_attitude(drone)),
-            asyncio.create_task(self._watch_health(drone)),
-            asyncio.create_task(self._watch_armed(drone)),
-            asyncio.create_task(self._watch_in_air(drone)),
-        ]
+        if self.telemetry_rate_limits:
+            await self._configure_telemetry_rates(drone)
+        limits = dict(self.telemetry_rate_limits or {})
+        telemetry_tasks = []
+        # A configured rate <= 0 means that the Python subscription must not
+        # be created at all. Calling set_rate(..., 0) while retaining the gRPC
+        # stream still lets callbacks accumulate when Isaac runs below RTF 1.
+        if limits.get("position_velocity_ned", 1.0) > 0.0:
+            telemetry_tasks.append(asyncio.create_task(
+                self._watch_position_velocity(drone)
+            ))
+        if limits.get("attitude_euler", 1.0) > 0.0:
+            telemetry_tasks.append(asyncio.create_task(self._watch_attitude(drone)))
+        if limits.get("health", 1.0) > 0.0:
+            telemetry_tasks.append(asyncio.create_task(self._watch_health(drone)))
+        if limits.get("armed", 1.0) > 0.0:
+            telemetry_tasks.append(asyncio.create_task(self._watch_armed(drone)))
+        if limits.get("in_air", 1.0) > 0.0:
+            telemetry_tasks.append(asyncio.create_task(self._watch_in_air(drone)))
 
         try:
             await self._command_loop(drone, VelocityBodyYawspeed, ActionError, OffboardError)
@@ -238,6 +301,34 @@ class MavsdkOffboardBridge:
             with self._lock:
                 self._offboard_started = False
                 self._connected = False
+
+    async def _configure_telemetry_rates(self, drone):
+        """Bound gRPC callback traffic before starting telemetry streams.
+
+        MAVSDK's defaults can be much faster than the Isaac control loop. Under
+        renderer load the Python consumer then falls behind, mavsdk_server logs
+        an ever-growing "User callback queue slow" warning and can terminate.
+        These rates preserve all control/state information used here while
+        leaving ample queue headroom.
+        """
+        limits = dict(self.telemetry_rate_limits or {})
+        setters = (
+            (drone.telemetry.set_rate_position_velocity_ned,
+             limits.get("position_velocity_ned", 20.0), "position_velocity_ned"),
+            (drone.telemetry.set_rate_attitude_euler,
+             limits.get("attitude_euler", 10.0), "attitude_euler"),
+            (drone.telemetry.set_rate_health,
+             limits.get("health", 2.0), "health"),
+            (drone.telemetry.set_rate_in_air,
+             limits.get("in_air", 2.0), "in_air"),
+        )
+        for setter, rate_hz, name in setters:
+            if float(rate_hz) <= 0.0:
+                continue
+            try:
+                await setter(rate_hz)
+            except Exception as exc:
+                _log_warn(f"[MAVSDK] Could not set {name} rate to {rate_hz:.1f}Hz: {exc}")
 
     async def _wait_connected(self, drone):
         deadline = time.perf_counter() + self.connect_timeout_sec
@@ -265,9 +356,16 @@ class MavsdkOffboardBridge:
             )
             armable = bool(getattr(health, "is_armable", False))
             with self._lock:
+                was_ready = self._health_ok
                 self._position_ok = position_ok
                 self._armable = armable
                 self._refresh_health_ok_locked()
+                is_ready = self._health_ok
+            if is_ready and not was_ready:
+                _log_warn(
+                    "[MAVSDK] PX4 health is ready for takeoff: "
+                    "position valid and vehicle armable."
+                )
             if self._stop_event.is_set():
                 return
 
@@ -343,12 +441,19 @@ class MavsdkOffboardBridge:
                     with self._lock:
                         self._applied_command = dict(command)
                         self._last_error = None
+                        self._rpc_failure_count = 0
                 except offboard_error_cls as exc:
                     with self._lock:
                         self._last_error = f"set_velocity_body: {exc}"
                 except Exception as exc:
                     with self._lock:
                         self._last_error = f"set_velocity_body: {exc}"
+                        self._rpc_failure_count += 1
+                        failures = self._rpc_failure_count
+                    if failures >= 3:
+                        raise RuntimeError(
+                            f"MAVSDK RPC unavailable during offboard command: {exc}"
+                        ) from exc
 
             await asyncio.sleep(period)
 
@@ -370,18 +475,35 @@ class MavsdkOffboardBridge:
             return
         zero = self._motion_to_mavsdk_command((0.0, 0.0, 0.0, 0.0))
         try:
-            await drone.offboard.set_velocity_body(velocity_cls(**zero))
             try:
                 await drone.action.arm()
             except action_error_cls as exc:
-                _log_warn(f"[MAVSDK] Arm command was rejected; trying offboard anyway: {exc}")
+                with self._lock:
+                    self._offboard_started = False
+                    self._last_error = f"arm_rejected: {exc}"
+                _log_warn(
+                    "[MAVSDK] Arm command was rejected; offboard will NOT "
+                    f"start. Waiting for PX4 ready state and retrying: {exc}"
+                )
+                return
+            # Match the proven manual-T sequence: arm only after PX4 reports
+            # ready, then provide the initial offboard setpoint before asking
+            # PX4 to enter offboard mode.  Sending it before arm can race the
+            # PX4 commander and produce NO_SETPOINT_SET on the first attempt.
+            await drone.offboard.set_velocity_body(velocity_cls(**zero))
+            await asyncio.sleep(max(0.05, 1.0 / max(self.command_hz, 1e-6)))
+            await drone.offboard.set_velocity_body(velocity_cls(**zero))
             await drone.offboard.start()
             with self._lock:
                 self._offboard_started = True
                 self._takeoff_requested = False
                 self._applied_command = dict(zero)
                 self._last_error = None
-            _log_warn("[MAVSDK] PX4 armed and offboard velocity control started.")
+                self._rpc_failure_count = 0
+            _log_warn(
+                "[MAVSDK] PX4 arm command accepted and offboard velocity "
+                "control started."
+            )
         except (action_error_cls, offboard_error_cls) as exc:
             with self._lock:
                 self._offboard_started = False
@@ -391,7 +513,13 @@ class MavsdkOffboardBridge:
             with self._lock:
                 self._offboard_started = False
                 self._last_error = f"start_offboard: {exc}"
+                self._rpc_failure_count += 1
+                failures = self._rpc_failure_count
             _log_warn(f"[MAVSDK] Failed to start offboard: {exc}")
+            if failures >= 3:
+                raise RuntimeError(
+                    f"MAVSDK RPC unavailable during offboard start: {exc}"
+                ) from exc
 
     async def _try_land(self, drone, action_error_cls, offboard_error_cls):
         await self._try_stop_offboard(drone, offboard_error_cls)
@@ -420,7 +548,13 @@ class MavsdkOffboardBridge:
             self._applied_command = self._empty_command()
 
     async def _try_reset_vehicle(self, drone, action_error_cls, offboard_error_cls):
+        was_offboard = self._offboard_started
         await self._try_stop_offboard(drone, offboard_error_cls)
+        # Initial timeline/reset notifications arrive before the first arm.
+        # In callback-free simulation there is deliberately no armed stream;
+        # avoid issuing a redundant disarm RPC on an untouched vehicle.
+        if self._callback_free and not was_offboard:
+            return
         try:
             await drone.action.disarm()
             _log_warn("[MAVSDK] Disarmed after episode reset.")

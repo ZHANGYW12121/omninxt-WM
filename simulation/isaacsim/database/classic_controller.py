@@ -256,15 +256,21 @@ class ClassicAlgorithmController:
         self.path_index = 0
         self.last_plan_time = 0.0
         self.takeoff_start_time = None
+        self.takeoff_start_position = None
         self.last_takeoff_log_time = 0.0
         self.ground_wait_start_time = self._now()
         self.ground_ready_since = None
+        self.last_px4_ready_wait_log_time = -1e9
         self._last_control_time = None
         self.last_action_update_time = None
         self.last_nav_log_time = 0.0
         self._last_safe_velocity = np.zeros(2, dtype=float)
         self._person_positions = {}
         self._person_velocities = {}
+        self._benchmark_mode = False
+        self._benchmark_goal_radius_m = None
+        self._decision_latencies_ms = []
+        self._decision_latency_records = []
 
         self._pressed_keys = set()
         self.input_iface = carb.input.acquire_input_interface()
@@ -296,20 +302,63 @@ class ClassicAlgorithmController:
         self.path_index = 0
         self.last_plan_time = 0.0
         self.takeoff_start_time = None
+        self.takeoff_start_position = None
         self.last_takeoff_log_time = 0.0
         self.ground_wait_start_time = self._now()
         self.ground_ready_since = None
+        self.last_px4_ready_wait_log_time = -1e9
         self._last_control_time = None
         self.last_action_update_time = None
         self.last_nav_log_time = 0.0
         self._last_safe_velocity = np.zeros(2, dtype=float)
         self._person_positions = {}
         self._person_velocities = {}
+        self._decision_latencies_ms = []
+        self._decision_latency_records = []
         self._reset_motion()
         if CLASSIC_AUTO_START:
             _log(f"Episode reset after {reason}. Waiting for ground contact before auto takeoff.")
         else:
             _log(f"Episode reset after {reason}. Press {CLASSIC_START_KEY} to start another run.")
+
+    def configure_benchmark(self, goal_point, goal_radius_m=0.80):
+        """Use one exact 3-D map goal without changing the navigation policy."""
+        goal = np.asarray(goal_point, dtype=float).reshape(3)
+        if not np.all(np.isfinite(goal)):
+            raise ValueError("benchmark goal must be a finite 3-D point")
+        self.target_point = goal.copy()
+        self._benchmark_mode = True
+        self._benchmark_goal_radius_m = float(goal_radius_m)
+        self.path = []
+        self.path_index = 0
+
+    def _record_decision_latency(self, elapsed_sec, source="controller"):
+        elapsed_sec = float(elapsed_sec)
+        if self._benchmark_mode and math.isfinite(elapsed_sec) and elapsed_sec >= 0.0:
+            latency_ms = elapsed_sec * 1000.0
+            self._decision_latencies_ms.append(latency_ms)
+            self._decision_latency_records.append(
+                {"latency_ms": latency_ms, "source": str(source)}
+            )
+
+    def consume_decision_latencies_ms(self):
+        values = list(self._decision_latencies_ms)
+        self._decision_latencies_ms.clear()
+        self._decision_latency_records.clear()
+        return values
+
+    def consume_decision_latency_records(self):
+        records = [dict(item) for item in self._decision_latency_records]
+        self._decision_latency_records.clear()
+        self._decision_latencies_ms.clear()
+        return records
+
+    def decision_latency_metadata(self):
+        """Describe the wall-clock interval recorded by this controller."""
+        return {
+            "definition": "observation_ready_to_final_velocity_output_wall_clock",
+            "causal_pairing": True,
+        }
 
     def request_start(self):
         if self.state not in ("idle", "wait_ground"):
@@ -323,6 +372,7 @@ class ClassicAlgorithmController:
         self.path_index = 0
         self.last_plan_time = 0.0
         self.takeoff_start_time = None
+        self.takeoff_start_position = None
         self.last_takeoff_log_time = 0.0
         self.ground_ready_since = None
         self._last_control_time = None
@@ -338,6 +388,14 @@ class ClassicAlgorithmController:
 
     def _begin_takeoff(self):
         self._reset_motion()
+        takeoff_position = self._drone_position(
+            prefer_sim=self.command_sink is not None
+        )
+        self.takeoff_start_position = (
+            None
+            if takeoff_position is None
+            else np.asarray(takeoff_position, dtype=float).copy()
+        )
         self._trigger_takeoff()
         self.takeoff_start_time = self._now()
         self.last_takeoff_log_time = self.takeoff_start_time
@@ -397,13 +455,32 @@ class ClassicAlgorithmController:
             if self.ground_ready_since is None:
                 self.ground_ready_since = now
             if now - self.ground_ready_since >= CLASSIC_GROUND_SETTLE_SEC:
-                _log("Ground contact settled. Auto takeoff starts now.")
+                if not self._command_sink_ready_for_takeoff():
+                    if now - self.last_px4_ready_wait_log_time >= 1.0:
+                        self.last_px4_ready_wait_log_time = now
+                        _log(
+                            "Ground contact settled; waiting for PX4 "
+                            "Ready for takeoff before automatic arm/start."
+                        )
+                    return
+                _log(
+                    "Ground contact settled and PX4 is Ready for takeoff. "
+                    "Auto takeoff starts now."
+                )
                 self._begin_takeoff()
             return
 
         self.ground_ready_since = None
         waited = 0.0 if self.ground_wait_start_time is None else now - self.ground_wait_start_time
         if low_enough and waited >= CLASSIC_GROUND_MAX_WAIT_SEC:
+            if not self._command_sink_ready_for_takeoff():
+                if now - self.last_px4_ready_wait_log_time >= 1.0:
+                    self.last_px4_ready_wait_log_time = now
+                    _log(
+                        "Ground wait elapsed, but PX4 is not Ready for "
+                        "takeoff; automatic arm remains blocked."
+                    )
+                return
             _log("Ground wait timed out after low altitude. Auto takeoff starts now.")
             self._begin_takeoff()
 
@@ -910,6 +987,8 @@ class ClassicAlgorithmController:
         return delta / distance
 
     def _effective_goal_xy(self, current_xy):
+        if self._benchmark_mode:
+            return (float(self.target_point[0]), float(self.target_point[1]))
         if current_xy is None:
             return (float(self.target_point[0]), float(self.target_point[1]))
 
@@ -1073,12 +1152,24 @@ class ClassicAlgorithmController:
         if self.command_sink is None:
             return True
         getter = getattr(self.command_sink, "is_offboard_started", None)
-        if callable(getter):
-            try:
-                return bool(getter())
-            except Exception:
-                return False
-        return True
+        if not callable(getter):
+            return False
+        try:
+            return bool(getter())
+        except Exception:
+            return False
+
+    def _command_sink_ready_for_takeoff(self):
+        if self.command_sink is None:
+            return True
+        getter = getattr(self.command_sink, "is_ready_for_takeoff", None)
+        if not callable(getter):
+            # Non-PX4/local command sinks have no pre-arm health state.
+            return True
+        try:
+            return bool(getter())
+        except Exception:
+            return False
 
     @staticmethod
     def _person_name(person):

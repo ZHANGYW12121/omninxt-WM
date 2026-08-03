@@ -14,7 +14,7 @@ from omni.physx import get_physx_scene_query_interface, get_physx_simulation_int
 from omni.physx.bindings._physx import ContactEventType
 from omni.isaac.core.world import World
 from omni.isaac.core.objects import FixedCuboid
-from pxr import Gf, PhysicsSchemaTools, UsdGeom, UsdPhysics
+from pxr import Gf, PhysicsSchemaTools, Usd, UsdGeom, UsdPhysics
 from scipy.spatial.transform import Rotation
 
 try:
@@ -36,7 +36,11 @@ from pegasus.simulator.logic.graphical_sensors.monocular_camera import Monocular
 from data_recorder import DatasetRecorder
 from keyboard_backend import SharedCommand, KeyboardVelocityController
 from classic_controller import ClassicAlgorithmController
+from ego_planner_controller import EgoPlannerController
+from dpmpc_controller import DpmpcController
+from navrl_controller import NavRLController
 from mavsdk_bridge import MavsdkOffboardBridge
+from navigation_benchmark import NavigationBenchmarkEvaluator
 
 from app_config import (
     ACTIVE_CROWD_SCENE,
@@ -68,6 +72,17 @@ from app_config import (
     DATASET_GOAL_Y_MIN,
     DRONE_SPAWN_Z,
     DRONE_INIT_YAW_DEG,
+    DPMPC_OBSTACLE_POSITION_VARIANCE,
+    DPMPC_OBSTACLE_VELOCITY_VARIANCE,
+    DPMPC_PERSON_CENTER_Z_OFFSET_M,
+    DPMPC_PERSON_HEIGHT_M,
+    DPMPC_PERSON_XY_SIZE_M,
+    EGO_CLOUD_AABB_STEP_M,
+    EGO_CLOUD_MAX_POINTS,
+    EGO_CLOUD_PERSON_HEIGHT_M,
+    EGO_CLOUD_PERSON_RADIUS_M,
+    EGO_CLOUD_STATIC_HEIGHT_M,
+    EGO_POINT_SOURCE,
     ENABLE_PEDESTRIAN_OBSTACLE_AVOIDANCE,
     PEDESTRIAN_OBSTACLE_EXCLUDE_KEYWORDS,
     PEDESTRIAN_OBSTACLE_KEYWORDS,
@@ -102,6 +117,7 @@ from app_config import (
     MAVSDK_HEALTH_TIMEOUT_SEC,
     MAVSDK_SYSTEM_ADDRESS,
     MAVSDK_USE_TELEMETRY_STATE,
+    NAVRL_STATE_SOURCE,
     MVD35_BODY_MASS_KG,
     MVD35_CENTER_OF_MASS_M,
     MVD35_DIAGONAL_INERTIA_KGM2,
@@ -209,17 +225,36 @@ def _debug_log(*args, **kwargs):
 
 
 class PegasusApp:
-    def __init__(self, simulation_app, control_mode=None, headless=False):
+    def __init__(
+        self,
+        simulation_app,
+        control_mode=None,
+        headless=False,
+        benchmark_config=None,
+    ):
         self.simulation_app = simulation_app
         self.timeline = omni.timeline.get_timeline_interface()
         self.headless = bool(headless)
         self.control_mode = (control_mode or CONTROL_MODE).strip().lower()
+        self.benchmark_config = (
+            None if benchmark_config is None else dict(benchmark_config)
+        )
+        self.navigation_benchmark = None
         if self.control_mode not in (
             "gamepad",
             "classic",
+            "ego",
+            "navrl",
+            "dpmpc",
             "px4_classic",
+            "px4_ego",
+            "px4_navrl",
+            "px4_dpmpc",
         ):
-            raise ValueError("control_mode must be 'gamepad', 'classic', or 'px4_classic'")
+            raise ValueError(
+                "control_mode must be gamepad/classic/ego/navrl/dpmpc/"
+                "px4_classic/px4_ego/px4_navrl/px4_dpmpc"
+            )
 
         self.pg = PegasusInterface()
         if MVD35_SIM2REAL_ENABLED:
@@ -377,6 +412,32 @@ class PegasusApp:
                 command_hz=MAVSDK_COMMAND_HZ,
                 connect_timeout_sec=MAVSDK_CONNECT_TIMEOUT_SEC,
                 health_timeout_sec=MAVSDK_HEALTH_TIMEOUT_SEC,
+                telemetry_rate_limits=(
+                    {
+                        "position_velocity_ned": 0.0,
+                        "attitude_euler": 0.0,
+                        "health": 1.0,
+                        "armed": 1.0,
+                        "in_air": 0.0,
+                    }
+                    if (
+                        self.control_mode in ("px4_ego", "px4_dpmpc")
+                        or (
+                            self.control_mode == "px4_navrl"
+                            and NAVRL_STATE_SOURCE == "isaac"
+                        )
+                    )
+                    else (
+                        {
+                            "position_velocity_ned": 20.0,
+                            "attitude_euler": 10.0,
+                            "health": 1.0,
+                            "in_air": 1.0,
+                        }
+                        if self.control_mode == "px4_navrl"
+                        else None
+                    )
+                ),
             )
         else:
             self.keyboard_backend = KeyboardVelocityController(
@@ -385,7 +446,11 @@ class PegasusApp:
                 mass_kg=MVD35_TOTAL_MASS_KG if MVD35_SIM2REAL_ENABLED else 1.50,
             )
             drone_config.backends = [self.keyboard_backend]
-        if self.omninxt_camera_enabled:
+        if self.benchmark_config is not None:
+            # Navigation baselines use GT cloud/raycast observations. Camera
+            # rendering is intentionally excluded from benchmark latency/load.
+            drone_config.graphical_sensors = []
+        elif self.omninxt_camera_enabled:
             drone_config.graphical_sensors = [
                 self.omninxt_camera_sensors[camera_id]
                 for camera_id in self.omninxt_camera_ids
@@ -461,6 +526,16 @@ class PegasusApp:
         self.trajectory_limit_reached = False
         self._last_record_size_check_wall = 0.0
         self._last_unrecorded_control_time = None
+        self._ego_physical_collision_count = 0
+        self._ego_human_collision_count = 0
+        self._ego_environment_collision_count = 0
+        self._ego_collision_active_pairs = set()
+        self._ego_collision_last_seen = {}
+        self._ego_contact_report_sub = (
+            get_physx_simulation_interface().subscribe_contact_report_events(
+                self._on_ego_contact_report_event
+            )
+        )
 
         if self.omninxt_camera_enabled:
             self._refresh_omninxt_camera_paths()
@@ -520,7 +595,16 @@ class PegasusApp:
         self.classic_controller = None
         self.input_controller = None
         if self._uses_classic_controller():
-            self.classic_controller = ClassicAlgorithmController(
+            controller_class = (
+                EgoPlannerController
+                if self.control_mode in ("ego", "px4_ego")
+                else DpmpcController
+                if self.control_mode in ("dpmpc", "px4_dpmpc")
+                else NavRLController
+                if self.control_mode in ("navrl", "px4_navrl")
+                else ClassicAlgorithmController
+            )
+            controller_kwargs = dict(
                 shared_cmd=self.shared_cmd,
                 drone=self.drone,
                 people=self.people,
@@ -540,6 +624,16 @@ class PegasusApp:
                     else None
                 ),
             )
+            if self.control_mode in ("ego", "px4_ego"):
+                controller_kwargs["point_cloud_provider"] = self._ego_point_cloud
+            elif self.control_mode in ("dpmpc", "px4_dpmpc"):
+                controller_kwargs["static_point_cloud_provider"] = (
+                    lambda: self._ego_static_point_cloud(
+                        max(0.08, float(EGO_CLOUD_AABB_STEP_M))
+                    )
+                )
+                controller_kwargs["obstacle_state_provider"] = self._dpmpc_obstacles
+            self.classic_controller = controller_class(**controller_kwargs)
             self.input_controller = self.classic_controller
         else:
             self.gamepad = GamepadController(
@@ -547,6 +641,11 @@ class PegasusApp:
                 toggle_recording_callback=self._toggle_dataset_recording,
             )
             self.input_controller = self.gamepad
+
+        if self.benchmark_config is not None:
+            self.navigation_benchmark = NavigationBenchmarkEvaluator(
+                self, self.benchmark_config
+            )
 
         for person in self.people:
             person_name = person._stage_prefix.rstrip("/").split("/")[-1]
@@ -739,10 +838,149 @@ class PegasusApp:
                 )
 
     def _uses_classic_controller(self):
-        return self.control_mode in ("classic", "px4_classic")
+        return self.control_mode in (
+            "classic", "ego", "navrl", "dpmpc",
+            "px4_classic", "px4_ego", "px4_navrl", "px4_dpmpc",
+        )
 
     def _uses_px4_backend(self):
-        return self.control_mode == "px4_classic"
+        return self.control_mode in (
+            "px4_classic", "px4_ego", "px4_navrl", "px4_dpmpc"
+        )
+
+    def _ego_point_cloud(self):
+        """Return a world-ENU obstacle cloud without importing ROS into Isaac."""
+        if EGO_POINT_SOURCE != "isaac_gt":
+            carb.log_warn(
+                f"[EGO] Unsupported live point source {EGO_POINT_SOURCE!r}; "
+                "use isaac_gt for the closed-loop validation."
+            )
+            return np.empty((0, 3), dtype=np.float32)
+
+        step = max(0.08, float(EGO_CLOUD_AABB_STEP_M))
+        static_cloud = self._ego_static_point_cloud(step)
+        clouds = [static_cloud] if len(static_cloud) else []
+        angles = np.linspace(0.0, 2.0 * np.pi, 16, endpoint=False)
+        heights = np.arange(0.0, EGO_CLOUD_PERSON_HEIGHT_M + 0.5 * step, step)
+        for person in self.people:
+            try:
+                center = np.asarray(person.state.position, dtype=float)
+            except Exception:
+                continue
+            aa, zz = np.meshgrid(angles, heights, indexing="ij")
+            person_cloud = np.column_stack((
+                center[0] + EGO_CLOUD_PERSON_RADIUS_M * np.cos(aa.ravel()),
+                center[1] + EGO_CLOUD_PERSON_RADIUS_M * np.sin(aa.ravel()),
+                center[2] + zz.ravel(),
+            ))
+            clouds.append(person_cloud.astype(np.float32, copy=False))
+
+        if not clouds:
+            return np.empty((0, 3), dtype=np.float32)
+        points = np.concatenate(clouds, axis=0)
+        limit = max(1, int(EGO_CLOUD_MAX_POINTS))
+        if len(points) > limit:
+            indices = np.linspace(0, len(points) - 1, limit, dtype=np.int64)
+            points = points[indices]
+        return points
+
+    def _ego_static_point_cloud(self, step):
+        signature = (
+            tuple(self.obstacle_scan.accepted_paths),
+            round(float(step), 5),
+            float(EGO_CLOUD_STATIC_HEIGHT_M),
+        )
+        if getattr(self, "_ego_static_cloud_signature", None) == signature:
+            return self._ego_static_cloud_cache
+
+        clouds = []
+        bbox_cache = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(),
+            [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
+            useExtentsHint=True,
+        )
+        stage = omni.usd.get_context().get_stage()
+        for prim_path in self.obstacle_scan.accepted_paths:
+            prim = stage.GetPrimAtPath(prim_path)
+            if not prim.IsValid():
+                continue
+            try:
+                world_range = bbox_cache.ComputeWorldBound(prim).ComputeAlignedRange()
+                minimum = world_range.GetMin()
+                maximum = world_range.GetMax()
+            except Exception:
+                continue
+            x0, y0, z0 = (float(minimum[i]) for i in range(3))
+            x1, y1, z1 = (float(maximum[i]) for i in range(3))
+            z0 = max(0.0, z0)
+            z1 = min(float(EGO_CLOUD_STATIC_HEIGHT_M), z1)
+            if x1 <= x0 or y1 <= y0 or z1 <= z0:
+                continue
+            xs = np.arange(x0, x1 + 0.5 * step, step)
+            ys = np.arange(y0, y1 + 0.5 * step, step)
+            zs = np.arange(z0, z1 + 0.5 * step, step)
+            for fixed, varying, x_fixed in (
+                (x0, ys, True), (x1, ys, True),
+                (y0, xs, False), (y1, xs, False),
+            ):
+                vv, zz = np.meshgrid(varying, zs, indexing="ij")
+                ff = np.full(vv.size, float(fixed), dtype=np.float32)
+                face = (
+                    np.column_stack((ff, vv.ravel(), zz.ravel()))
+                    if x_fixed
+                    else np.column_stack((vv.ravel(), ff, zz.ravel()))
+                )
+                clouds.append(face.astype(np.float32, copy=False))
+            xx, yy = np.meshgrid(xs, ys, indexing="ij")
+            for z_fixed in (z0, z1):
+                clouds.append(np.column_stack((
+                    xx.ravel(), yy.ravel(), np.full(xx.size, z_fixed)
+                )).astype(np.float32, copy=False))
+
+        points = (
+            np.empty((0, 3), dtype=np.float32)
+            if not clouds
+            else np.concatenate(clouds, axis=0)
+        )
+        static_limit = max(1, int(EGO_CLOUD_MAX_POINTS * 0.75))
+        if len(points) > static_limit:
+            indices = np.linspace(0, len(points) - 1, static_limit, dtype=np.int64)
+            points = points[indices]
+        self._ego_static_cloud_signature = signature
+        self._ego_static_cloud_cache = points
+        carb.log_warn(
+            f"[EGO][PERF] Cached {len(points)} static warehouse points."
+        )
+        return points
+
+    def _dpmpc_obstacles(self):
+        """Return official DPMPC ellipsoid states from Isaac GT people state."""
+        obstacles = []
+        for index, person in enumerate(self.people):
+            try:
+                position = np.asarray(person.state.position, dtype=float).reshape(3)
+                velocity = np.asarray(person.state.linear_velocity, dtype=float).reshape(3)
+            except Exception:
+                continue
+            if not np.all(np.isfinite(position)) or not np.all(np.isfinite(velocity)):
+                continue
+            obstacles.append({
+                "id": index,
+                "position": [
+                    float(position[0]),
+                    float(position[1]),
+                    float(position[2] + DPMPC_PERSON_CENTER_Z_OFFSET_M),
+                ],
+                "velocity": velocity.tolist(),
+                "size": [
+                    float(DPMPC_PERSON_XY_SIZE_M),
+                    float(DPMPC_PERSON_XY_SIZE_M),
+                    float(DPMPC_PERSON_HEIGHT_M),
+                ],
+                "position_variance": [float(DPMPC_OBSTACLE_POSITION_VARIANCE)] * 3,
+                "velocity_variance": [float(DPMPC_OBSTACLE_VELOCITY_VARIANCE)] * 3,
+            })
+        return obstacles
 
     def _px4_backend_received_heartbeat(self):
         if self.px4_backend is None:
@@ -773,6 +1011,12 @@ class PegasusApp:
             carb.log_warn(f"[APP][PX4] MAVSDK bridge start failed: {exc}")
 
     def _vehicle_state_provider(self):
+        # EGO/DPMPC observations are in Isaac world ENU. NavRL can select
+        # Isaac GT state for simulation or MAVSDK/PX4 EKF state for deployment.
+        if self.control_mode in ("px4_ego", "px4_dpmpc"):
+            return None
+        if self.control_mode == "px4_navrl" and NAVRL_STATE_SOURCE == "isaac":
+            return None
         if (
             self._uses_px4_backend()
             and MAVSDK_USE_TELEMETRY_STATE
@@ -796,6 +1040,8 @@ class PegasusApp:
             self._export_omni_depth_frame_if_ready()
             self._refresh_obstacles_if_needed()
             self.skeleton_tracker.update_markers(self._simulation_time())
+            if self.navigation_benchmark is not None:
+                self.navigation_benchmark.update()
             self._monitor_crowd_clearance()
             self._export_crowd_map_state()
             dataset_frame_saved = False
@@ -823,6 +1069,7 @@ class PegasusApp:
                     self._update_control_mode()
 
         _debug_log("Simulation closing.")
+        self._ego_contact_report_sub = None
         self.data_recorder.stop(reason="shutdown")
         if self.input_controller is not None:
             self.input_controller.shutdown()
@@ -1224,6 +1471,12 @@ class PegasusApp:
         return bool(self.data_recorder.is_recording)
 
     def _abort_classic_episode(self):
+        if self.navigation_benchmark is not None:
+            self.navigation_benchmark.fail(
+                "controller_error",
+                {"message": "controller aborted the active episode"},
+            )
+            return
         if self.data_recorder.is_recording:
             self.data_recorder.stop(reason="manual_stop")
             self._register_completed_trajectory("manual_stop")
@@ -1476,6 +1729,91 @@ class PegasusApp:
             return marker0
 
         return None
+
+    def _classify_drone_contact(self, collider0, collider1):
+        """Classify any physical contact involving the drone."""
+        collider0_is_drone = self._is_drone_collider_path(collider0)
+        collider1_is_drone = self._is_drone_collider_path(collider1)
+        if collider0_is_drone == collider1_is_drone:
+            return None
+
+        drone_collider = collider0 if collider0_is_drone else collider1
+        other_collider = collider1 if collider0_is_drone else collider0
+        marker = self.skeleton_tracker.parse_marker_collider_path(other_collider)
+        if marker is not None:
+            result = dict(marker)
+            result["category"] = "human"
+        else:
+            result = {
+                "category": "environment",
+                "obstacle_collider": other_collider,
+            }
+        result["drone_collider"] = drone_collider
+        result["other_collider"] = other_collider
+        return result
+
+    def _on_ego_contact_report_event(self, contact_headers, _contact_data):
+        """Consume PhysX contacts every physics step for benchmark safety."""
+        controller = getattr(self, "classic_controller", None)
+        if self.control_mode not in (
+            "ego", "px4_ego", "navrl", "px4_navrl", "dpmpc", "px4_dpmpc"
+        ):
+            return
+        if controller is None or getattr(controller, "state", None) != "navigate":
+            return
+
+        found_contacts = []
+        for header in contact_headers:
+            collider0 = str(PhysicsSchemaTools.intToSdfPath(header.collider0))
+            collider1 = str(PhysicsSchemaTools.intToSdfPath(header.collider1))
+            contact = self._classify_drone_contact(collider0, collider1)
+            if contact is None:
+                continue
+            pair = tuple(sorted((collider0, collider1)))
+            if header.type in (
+                ContactEventType.CONTACT_FOUND,
+                getattr(
+                    ContactEventType,
+                    "CONTACT_PERSIST",
+                    ContactEventType.CONTACT_FOUND,
+                ),
+            ):
+                found_contacts.append((pair, contact))
+
+        sim_now = self._simulation_time()
+        for pair, contact in found_contacts:
+            self._ego_collision_active_pairs.add(pair)
+            episode_key = (
+                ("human", contact["pedestrian_id"])
+                if contact["category"] == "human"
+                else ("environment", contact["other_collider"])
+            )
+            last_seen = self._ego_collision_last_seen.get(
+                episode_key, -float("inf")
+            )
+            self._ego_collision_last_seen[episode_key] = sim_now
+            if sim_now - last_seen < 0.5:
+                continue
+            self._ego_physical_collision_count += 1
+            if contact["category"] == "human":
+                self._ego_human_collision_count += 1
+            else:
+                self._ego_environment_collision_count += 1
+            position = np.asarray(self.drone.state.position, dtype=float)
+            carb.log_warn(
+                f"[NAV][COLLISION] count={self._ego_physical_collision_count}, "
+                f"category={contact['category']}, "
+                f"position=({position[0]:.2f},{position[1]:.2f},{position[2]:.2f})"
+            )
+            if self.navigation_benchmark is not None:
+                self.navigation_benchmark.record_collision(
+                    sim_now,
+                    {
+                        **contact,
+                        "collider_pair": list(pair),
+                        "drone_position": position.tolist(),
+                    },
+                )
 
     def _is_drone_collider_path(self, collider_path):
         collider_path = str(collider_path)

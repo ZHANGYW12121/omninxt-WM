@@ -382,6 +382,9 @@ MAVSDK_SYSTEM_ADDRESS = "udpin://0.0.0.0:14540"
 MAVSDK_COMMAND_HZ = DATA_CONTROL_HZ
 MAVSDK_CONNECT_TIMEOUT_SEC = 30.0
 MAVSDK_HEALTH_TIMEOUT_SEC = 15.0
+MAVSDK_SIM_MAVLINK_TIMEOUT_SEC = float(
+    os.environ.get("MAVSDK_SIM_MAVLINK_TIMEOUT_SEC", "60.0")
+)
 MAVSDK_OFFBOARD_RETRY_SEC = 2.0
 MAVSDK_USE_TELEMETRY_STATE = True
 MAVSDK_TELEMETRY_STALE_SEC = 0.75
@@ -456,6 +459,93 @@ CLASSIC_SOFT_CLEARANCE_WEIGHT = 1.8
 CLASSIC_STATIC_LOOKAHEAD_SEC = 0.8
 CLASSIC_PERSON_VEL_FILTER = 0.45
 CLASSIC_MAX_PERSON_SPEED_ESTIMATE = 2.5
+
+# ===== EGO-Planner (ROS1 sidecar over localhost UDP) =====
+EGO_UDP_HOST = os.environ.get("EGO_UDP_HOST", "127.0.0.1")
+EGO_UDP_ROS_PORT = int(os.environ.get("EGO_UDP_ROS_PORT", "15100"))
+EGO_UDP_ISAAC_PORT = int(os.environ.get("EGO_UDP_ISAAC_PORT", "15101"))
+EGO_POINT_SOURCE = os.environ.get("EGO_POINT_SOURCE", "isaac_gt").strip().lower()
+EGO_ODOM_HZ = float(os.environ.get("EGO_ODOM_HZ", "20"))
+EGO_CLOUD_HZ = float(os.environ.get("EGO_CLOUD_HZ", "10"))
+EGO_GOAL_HZ = float(os.environ.get("EGO_GOAL_HZ", "1"))
+EGO_CLOUD_MAX_POINTS = int(os.environ.get("EGO_CLOUD_MAX_POINTS", "4500"))
+EGO_CLOUD_AABB_STEP_M = float(os.environ.get("EGO_CLOUD_AABB_STEP_M", "0.30"))
+EGO_CLOUD_STATIC_HEIGHT_M = float(os.environ.get("EGO_CLOUD_STATIC_HEIGHT_M", "2.6"))
+EGO_CLOUD_PERSON_RADIUS_M = float(os.environ.get("EGO_CLOUD_PERSON_RADIUS_M", "0.32"))
+EGO_CLOUD_PERSON_HEIGHT_M = float(os.environ.get("EGO_CLOUD_PERSON_HEIGHT_M", "1.75"))
+EGO_COMMAND_TIMEOUT_SEC = float(os.environ.get("EGO_COMMAND_TIMEOUT_SEC", "0.50"))
+EGO_POSITION_KP_XY = float(os.environ.get("EGO_POSITION_KP_XY", "1.25"))
+EGO_POSITION_KP_Z = float(os.environ.get("EGO_POSITION_KP_Z", "1.20"))
+EGO_YAW_KP = float(os.environ.get("EGO_YAW_KP", "1.8"))
+EGO_MAX_SPEED_XY = float(os.environ.get("EGO_MAX_SPEED_XY", "2.0"))
+EGO_MAX_SPEED_Z = float(os.environ.get("EGO_MAX_SPEED_Z", "0.65"))
+EGO_MAX_ACCEL = float(os.environ.get("EGO_MAX_ACCEL", "2.0"))
+EGO_MAX_YAW_RATE = float(os.environ.get("EGO_MAX_YAW_RATE", "0.8"))
+EGO_GOAL_HOLD_RADIUS_M = float(os.environ.get("EGO_GOAL_HOLD_RADIUS_M", "0.40"))
+EGO_GOAL_HOLD_MAX_SPEED_MPS = float(os.environ.get("EGO_GOAL_HOLD_MAX_SPEED_MPS", "0.5"))
+EGO_GOAL_SLOW_RADIUS_M = float(os.environ.get("EGO_GOAL_SLOW_RADIUS_M", "3.0"))
+EGO_GOAL_MIN_APPROACH_SPEED_MPS = float(
+    os.environ.get("EGO_GOAL_MIN_APPROACH_SPEED_MPS", "0.20")
+)
+
+# ===== DPMPC-Planner (official C++/ROS/ACADO sidecar) =====
+DPMPC_UDP_HOST = os.environ.get("DPMPC_UDP_HOST", "127.0.0.1")
+DPMPC_UDP_PLANNER_PORT = int(os.environ.get("DPMPC_UDP_PLANNER_PORT", "15200"))
+DPMPC_UDP_ISAAC_PORT = int(os.environ.get("DPMPC_UDP_ISAAC_PORT", "15201"))
+DPMPC_OBSERVATION_HZ = float(os.environ.get("DPMPC_OBSERVATION_HZ", "10"))
+DPMPC_COMMAND_TIMEOUT_SEC = float(os.environ.get("DPMPC_COMMAND_TIMEOUT_SEC", "0.50"))
+DPMPC_STATIC_MAP_RETRY_SEC = float(os.environ.get("DPMPC_STATIC_MAP_RETRY_SEC", "2.0"))
+DPMPC_POSITION_KP_XY = float(os.environ.get("DPMPC_POSITION_KP_XY", "1.25"))
+DPMPC_POSITION_KP_Z = float(os.environ.get("DPMPC_POSITION_KP_Z", "1.20"))
+DPMPC_YAW_KP = float(os.environ.get("DPMPC_YAW_KP", "1.8"))
+DPMPC_MAX_SPEED_XY = float(os.environ.get("DPMPC_MAX_SPEED_XY", "3.0"))
+DPMPC_MAX_SPEED_Z = float(os.environ.get("DPMPC_MAX_SPEED_Z", "1.0"))
+DPMPC_PERSON_XY_SIZE_M = float(os.environ.get("DPMPC_PERSON_XY_SIZE_M", "0.50"))
+DPMPC_PERSON_HEIGHT_M = float(os.environ.get("DPMPC_PERSON_HEIGHT_M", "2.20"))
+DPMPC_PERSON_CENTER_Z_OFFSET_M = float(
+    os.environ.get("DPMPC_PERSON_CENTER_Z_OFFSET_M", "1.00")
+)
+DPMPC_OBSTACLE_POSITION_VARIANCE = float(
+    os.environ.get("DPMPC_OBSTACLE_POSITION_VARIANCE", "0.0001")
+)
+DPMPC_OBSTACLE_VELOCITY_VARIANCE = float(
+    os.environ.get("DPMPC_OBSTACLE_VELOCITY_VARIANCE", "0.0001")
+)
+
+# ===== NavRL official pretrained-policy baseline =====
+# Model weights remain outside Git. tools/fetch_navrl_checkpoint.sh installs
+# the pinned official checkpoint under the machine-local asset root.
+NAVRL_CHECKPOINT = os.path.expanduser(
+    os.environ.get(
+        "NAVRL_CHECKPOINT",
+        os.path.join(OMNINXT_ASSET_ROOT, "models", "navrl", "navrl_checkpoint.pt"),
+    )
+)
+NAVRL_DEVICE = os.environ.get("NAVRL_DEVICE", "cpu")
+NAVRL_STATIC_HEIGHT_M = float(os.environ.get("NAVRL_STATIC_HEIGHT_M", "2.6"))
+NAVRL_FIXED_GOAL_X = float(os.environ.get("NAVRL_FIXED_GOAL_X", "2.25"))
+NAVRL_FIXED_GOAL_Y = float(os.environ.get("NAVRL_FIXED_GOAL_Y", "27.00"))
+NAVRL_GOAL_HOLD_RADIUS_M = float(os.environ.get("NAVRL_GOAL_HOLD_RADIUS_M", "1.00"))
+NAVRL_GOAL_HOLD_MAX_SPEED_MPS = float(
+    os.environ.get("NAVRL_GOAL_HOLD_MAX_SPEED_MPS", "0.50")
+)
+NAVRL_LOG_INTERVAL_SEC = float(os.environ.get("NAVRL_LOG_INTERVAL_SEC", "1.0"))
+NAVRL_DIAGNOSTICS_ENABLED = os.environ.get("NAVRL_DIAGNOSTICS_ENABLED", "1") == "1"
+NAVRL_DIAGNOSTICS_DIR = os.path.expanduser(
+    os.environ.get("NAVRL_DIAGNOSTICS_DIR", os.path.join(ZYW_ROOT, "navrl_debug"))
+)
+NAVRL_STATE_SOURCE = os.environ.get("NAVRL_STATE_SOURCE", "isaac").strip().lower()
+if NAVRL_STATE_SOURCE not in ("isaac", "mavsdk"):
+    raise ValueError("NAVRL_STATE_SOURCE must be 'isaac' or 'mavsdk'")
+NAVRL_SAFETY_SHIELD_ENABLED = os.environ.get("NAVRL_SAFETY_SHIELD_ENABLED", "1") == "1"
+NAVRL_SAFETY_TIME_HORIZON_SEC = float(
+    os.environ.get("NAVRL_SAFETY_TIME_HORIZON_SEC", "2.0")
+)
+NAVRL_SAFETY_TIME_STEP_SEC = float(os.environ.get("NAVRL_SAFETY_TIME_STEP_SEC", "0.05"))
+NAVRL_SAFETY_DISTANCE_M = float(os.environ.get("NAVRL_SAFETY_DISTANCE_M", "0.30"))
+NAVRL_SAFETY_AGENT_RADIUS_M = float(
+    os.environ.get("NAVRL_SAFETY_AGENT_RADIUS_M", "0.30")
+)
 
 SCENE_DRONE_X_RANGE = ACTIVE_SCENE_PRESET["drone_x_range"]
 SCENE_DRONE_Y_RANGE = ACTIVE_SCENE_PRESET["drone_y_range"]

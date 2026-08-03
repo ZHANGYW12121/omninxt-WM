@@ -1,0 +1,19 @@
+[Unit]
+Description=Automatically resume the active Isaac navigation benchmark
+Documentation=file://@REPO_ROOT@/simulation/isaacsim/database/NAVIGATION_BENCHMARK_GUIDE.md
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO_ROOT@/simulation/isaacsim/database
+ExecStart=@REPO_ROOT@/simulation/isaacsim/database/navigation_benchmark_autoresume.py
+Restart=on-failure
+RestartSec=30
+KillMode=control-group
+TimeoutStopSec=45
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=append:@REPO_ROOT@/simulation/isaacsim/database/navigation_benchmark_autoresume_service.log
+StandardError=append:@REPO_ROOT@/simulation/isaacsim/database/navigation_benchmark_autoresume_service.log
+
+[Install]
+WantedBy=default.target

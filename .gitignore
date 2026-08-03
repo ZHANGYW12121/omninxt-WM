@@ -33,6 +33,9 @@ credentials*
 *.engine
 *.trt
 *.plan
+*.pt
+*.pth
+*.ckpt
 
 # Large models: add later through Git LFS or artifact storage
 *.onnx
@@ -66,3 +69,14 @@ Thumbs.db
 *_preview.jpg
 /simulation/isaacsim/database/output/
 /simulation/isaacsim/database/navrl_debug/
+/simulation/isaacsim/database/navigation_benchmark_results/
+/simulation/isaacsim/database/navigation_benchmark_autoresume_state.json
+/simulation/isaacsim/database/navigation_benchmark_launcher.lock
+/simulation/isaacsim/database/navigation_benchmark_autoresume_service.log
+
+# Navigation algorithm runtime/build products
+/navigation/**/mavsdk_server.log
+/navigation/**/docker_build.log
+/navigation/**/results/
+/navigation/**/output/
+/navigation/navrl/upstream/
