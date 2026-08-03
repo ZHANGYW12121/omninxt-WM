@@ -1,0 +1,17 @@
+M	config/quadcam_drone_nxt_tmp/fisheye_cams.yaml
+M	config/quadcam_drone_nxt_tmp/quadcam_depth.yaml
+M	config/quadcam_drone_nxt_tmp/stereo_calib_0_1_240_320.yaml
+M	config/quadcam_drone_nxt_tmp/stereo_calib_1_2_240_320.yaml
+M	config/quadcam_drone_nxt_tmp/stereo_calib_2_3_240_320.yaml
+M	config/quadcam_drone_nxt_tmp/stereo_calib_3_0_240_320.yaml
+M	models/hitnet_series/hitnet_1x240x320_model_float16_quant_opt.trt
+D	models/hitnet_series/hitnet_model_240x320_fp16_quant_opt.trt
+M	quadcam_depth_est/CMakeLists.txt
+M	quadcam_depth_est/include/hitnet.hpp
+M	quadcam_depth_est/include/pcl_utils.hpp
+M	quadcam_depth_est/include/quadcam_depth_est_trt.hpp
+M	quadcam_depth_est/include/virtual_stereo.hpp
+M	quadcam_depth_est/package.xml
+M	quadcam_depth_est/src/hitnet.cpp
+M	quadcam_depth_est/src/quadcam_depth_est_trt.cpp
+M	quadcam_depth_est/src/virtual_stereo.cpp

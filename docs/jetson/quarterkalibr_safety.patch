@@ -1,0 +1,75 @@
+diff --git a/utils/BagExtractor.py b/utils/BagExtractor.py
+index 6155704..7e0140e 100644
+--- a/utils/BagExtractor.py
++++ b/utils/BagExtractor.py
+@@ -3,6 +3,7 @@ from cv_bridge import CvBridge
+ import cv2 as cv
+ import tqdm
+ import os
++import shutil
+ import sys
+ import utils.Utils as common_utils
+ sys.path.append(os.path.join(os.path.dirname(__file__), '.'))
+@@ -11,22 +12,30 @@ import PrivateGlobalValue
+ #if want to modify, need to both modify 
+ 
+ def write_april_tag_target(ouput_dir):
+-    # write aprilgrid.yaml
+-    with open(ouput_dir + "april_6x6.yaml", "w") as f:
+-        f.write("target_type: 'aprilgrid'\n")
+-        f.write("tagCols: 6\n")
+-        f.write("tagRows: 6\n")
+-        f.write("tagSize: 0.088\n")
+-        f.write("tagSpacing: 0.3\n")
++    # Never silently manufacture board dimensions.  Formal calibration must
++    # use the target file measured and confirmed by the user.
++    target_yaml = os.environ.get("QUARTERKALIBR_TARGET_YAML", "")
++    if not target_yaml or not os.path.isfile(target_yaml):
++        raise RuntimeError(
++            "Set QUARTERKALIBR_TARGET_YAML to the confirmed calibration "
++            "target YAML before extracting a formal calibration bag")
++    shutil.copy2(target_yaml, os.path.join(ouput_dir, "april_6x6.yaml"))
+ 
+ 
+ def extract_calibration_bag(bag_path, output_path, image_topic):
+-    arucoParams = cv.aruco.DetectorParameters()
++    if hasattr(cv.aruco, "DetectorParameters"):
++        arucoParams = cv.aruco.DetectorParameters()
++    else:
++        arucoParams = cv.aruco.DetectorParameters_create()
+     arucoParams.markerBorderBits = 2
+     arucoParams.adaptiveThreshWinSizeStep = 1
+     arucoParams.adaptiveThreshWinSizeMin = 3
+-    detector_opencv = cv.aruco.ArucoDetector(cv.aruco.getPredefinedDictionary(cv.aruco.DICT_APRILTAG_36h11),
+-                                            arucoParams)
++    aruco_dictionary = cv.aruco.getPredefinedDictionary(
++        cv.aruco.DICT_APRILTAG_36h11)
++    detector_opencv = None
++    if hasattr(cv.aruco, "ArucoDetector"):
++        detector_opencv = cv.aruco.ArucoDetector(
++            aruco_dictionary, arucoParams)
+     print(cv.__version__)
+ 
+     current_step = 1
+@@ -59,7 +68,14 @@ def extract_calibration_bag(bag_path, output_path, image_topic):
+                 # image_name = "image_" + str(i)
+                 # cv.imshow(image_name, images[i])
+                 # cv.waitKey(1)
+-                marker_corners, ids, rejectedImgPoints = detector_opencv.detectMarkers(gray_images[i])
++                if detector_opencv is not None:
++                    marker_corners, ids, rejectedImgPoints = \
++                        detector_opencv.detectMarkers(gray_images[i])
++                else:
++                    marker_corners, ids, rejectedImgPoints = \
++                        cv.aruco.detectMarkers(
++                            gray_images[i], aruco_dictionary,
++                            parameters=arucoParams)
+                 if ids is not None and len(ids) > 0:
+                     status |= 1 << i
+             if  PrivateGlobalValue.step_dict.get(status) - current_step == 1:
+@@ -165,4 +181,3 @@ def extract_individual_calibration_bag(bag_path, original_topics, extract_topics
+   ouput_bag.close()
+   bag.close()
+   print("Extracted bag saved to: ", output_path)
+-  
+\ No newline at end of file

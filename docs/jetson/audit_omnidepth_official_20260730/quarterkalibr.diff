@@ -1,0 +1,309 @@
+diff --git a/utils/BagExtractor.py b/utils/BagExtractor.py
+index 6155704..7e0140e 100644
+--- a/utils/BagExtractor.py
++++ b/utils/BagExtractor.py
+@@ -3,6 +3,7 @@ from cv_bridge import CvBridge
+ import cv2 as cv
+ import tqdm
+ import os
++import shutil
+ import sys
+ import utils.Utils as common_utils
+ sys.path.append(os.path.join(os.path.dirname(__file__), '.'))
+@@ -11,22 +12,30 @@ import PrivateGlobalValue
+ #if want to modify, need to both modify 
+ 
+ def write_april_tag_target(ouput_dir):
+-    # write aprilgrid.yaml
+-    with open(ouput_dir + "april_6x6.yaml", "w") as f:
+-        f.write("target_type: 'aprilgrid'\n")
+-        f.write("tagCols: 6\n")
+-        f.write("tagRows: 6\n")
+-        f.write("tagSize: 0.088\n")
+-        f.write("tagSpacing: 0.3\n")
++    # Never silently manufacture board dimensions.  Formal calibration must
++    # use the target file measured and confirmed by the user.
++    target_yaml = os.environ.get("QUARTERKALIBR_TARGET_YAML", "")
++    if not target_yaml or not os.path.isfile(target_yaml):
++        raise RuntimeError(
++            "Set QUARTERKALIBR_TARGET_YAML to the confirmed calibration "
++            "target YAML before extracting a formal calibration bag")
++    shutil.copy2(target_yaml, os.path.join(ouput_dir, "april_6x6.yaml"))
+ 
+ 
+ def extract_calibration_bag(bag_path, output_path, image_topic):
+-    arucoParams = cv.aruco.DetectorParameters()
++    if hasattr(cv.aruco, "DetectorParameters"):
++        arucoParams = cv.aruco.DetectorParameters()
++    else:
++        arucoParams = cv.aruco.DetectorParameters_create()
+     arucoParams.markerBorderBits = 2
+     arucoParams.adaptiveThreshWinSizeStep = 1
+     arucoParams.adaptiveThreshWinSizeMin = 3
+-    detector_opencv = cv.aruco.ArucoDetector(cv.aruco.getPredefinedDictionary(cv.aruco.DICT_APRILTAG_36h11),
+-                                            arucoParams)
++    aruco_dictionary = cv.aruco.getPredefinedDictionary(
++        cv.aruco.DICT_APRILTAG_36h11)
++    detector_opencv = None
++    if hasattr(cv.aruco, "ArucoDetector"):
++        detector_opencv = cv.aruco.ArucoDetector(
++            aruco_dictionary, arucoParams)
+     print(cv.__version__)
+ 
+     current_step = 1
+@@ -59,7 +68,14 @@ def extract_calibration_bag(bag_path, output_path, image_topic):
+                 # image_name = "image_" + str(i)
+                 # cv.imshow(image_name, images[i])
+                 # cv.waitKey(1)
+-                marker_corners, ids, rejectedImgPoints = detector_opencv.detectMarkers(gray_images[i])
++                if detector_opencv is not None:
++                    marker_corners, ids, rejectedImgPoints = \
++                        detector_opencv.detectMarkers(gray_images[i])
++                else:
++                    marker_corners, ids, rejectedImgPoints = \
++                        cv.aruco.detectMarkers(
++                            gray_images[i], aruco_dictionary,
++                            parameters=arucoParams)
+                 if ids is not None and len(ids) > 0:
+                     status |= 1 << i
+             if  PrivateGlobalValue.step_dict.get(status) - current_step == 1:
+@@ -165,4 +181,3 @@ def extract_individual_calibration_bag(bag_path, original_topics, extract_topics
+   ouput_bag.close()
+   bag.close()
+   print("Extracted bag saved to: ", output_path)
+-  
+\ No newline at end of file
+diff --git a/utils/VirtualStereoCalibration.py b/utils/VirtualStereoCalibration.py
+index 0c3d7fe..4809d3d 100644
+--- a/utils/VirtualStereoCalibration.py
++++ b/utils/VirtualStereoCalibration.py
+@@ -14,7 +14,26 @@ import cv2 as cv
+ import numpy as np
+ import argparse
+ import rosbag
+-import tqdm
++try:
++    import tqdm
++except ImportError:
++    class _Progress:
++        def __init__(self, total, **_kwargs):
++            self.total = total
++            self.current = 0
++
++        def update(self, increment):
++            self.current += increment
++            if self.current == 1 or self.current % 100 == 0:
++                print(
++                    f"Generated virtual stereo frames: "
++                    f"{self.current}/{self.total}",
++                    flush=True)
++
++    class _TqdmFallback:
++        tqdm = _Progress
++
++    tqdm = _TqdmFallback()
+ from cv_bridge import CvBridge
+ import os
+ import shutil
+@@ -67,12 +86,19 @@ def kablirCalibratePinhole(topic_a, topic_b, bagfile, output_calib_name, verbose
+     if bagpath == "":
+         bagpath = os.getcwd()
+         print("bagpath", bagpath)
++    local_execution = os.environ.get("QUARTERKALIBR_LOCAL_EXEC") == "1"
++    if local_execution:
++        calibration_bag = bagfile
++        target_yaml = os.path.join(bagpath, "aprilgrid.yaml")
++    else:
++        calibration_bag = f"/data/{bagname}"
++        target_yaml = "/data/aprilgrid.yaml"
+     cmd = f"""#!/bin/bash
+ export KALIBR_MANUAL_FOCAL_LENGTH_INIT=1
+ export KALIBR_FOCAL_LENGTH_INIT_VALUE={init_focal_length}
+ export DISPLAY=:0.0
+ source /catkin_ws/devel/setup.bash &&
+-rosrun kalibr kalibr_calibrate_cameras --bag /data/{bagname} --target /data/aprilgrid.yaml --models pinhole-radtan pinhole-radtan --approx-sync 0.01 --topics {topic_a} {topic_b}"""
++rosrun kalibr kalibr_calibrate_cameras --bag {calibration_bag} --target {target_yaml} --models pinhole-radtan pinhole-radtan --approx-sync 0.01 --topics {topic_a} {topic_b}"""
+     if not verbose:
+         cmd += " --dont-show-report"
+     cmd += f"""<<EOF
+@@ -85,13 +111,19 @@ EOF"""
+     # dockercmd = f"""docker run  -it --rm -e "DISPLAY" -e "QT_X11_NO_MITSHM=1" \
+     # -v "/tmp/.X11-unix:/tmp/.X11-unix:rw" \
+     # -v "{bagpath}:/data" kalibr:latest /bin/bash /data/stereo_calib.sh"""
+-    dockercmd = f"""docker run --rm -e "DISPLAY" -e "QT_X11_NO_MITSHM=1" --entrypoint="/data/stereo_calib.sh" \
+-    -v "/tmp/.X11-unix:/tmp/.X11-unix:rw" \
+-    -v "{bagpath}:/data" mortyl0834/omnitartancalib:kalibr  """
+-    print(dockercmd)
+-    # with new kalibr docker, this cmd can not run properly
+-    p_docker = subprocess.Popen(dockercmd, shell=True, stderr=subprocess.STDOUT)
+-    p_docker.wait()
++    if local_execution:
++        localcmd = f"bash {bagpath}/stereo_calib.sh"
++        print(localcmd)
++        subprocess.run(localcmd, shell=True, check=True)
++    else:
++        image = os.environ.get(
++            "QUARTERKALIBR_KALIBR_IMAGE",
++            "omninxt/tartancalib-noetic-arm64:jp512")
++        dockercmd = f"""docker run --rm -e "DISPLAY" -e "QT_X11_NO_MITSHM=1" --entrypoint="/data/stereo_calib.sh" \
++        -v "/tmp/.X11-unix:/tmp/.X11-unix:rw" \
++        -v "{bagpath}:/data" {image}  """
++        print(dockercmd)
++        subprocess.run(dockercmd, shell=True, check=True)
+     calibration_resualt_title = bagname.split(".")[0]
+     print("calibration_resualt_title", calibration_resualt_title)
+     results = f"{bagpath}/{calibration_resualt_title}-results-cam.txt"
+@@ -105,6 +137,7 @@ EOF"""
+ def calibration_task(calibration_gen, stereo_calib_gens, input_bag_path, height, width, verbose):
+     retries = 0
+     max_retries = 3
++    last_error = None
+     output_calib_name = f"stereo_calib_{calibration_gen.cam_idx_a}_{calibration_gen.cam_idx_b}_{height}_{width}"
+     calib_bag_path = os.path.join(os.path.dirname(input_bag_path), output_calib_name + '.bag')
+     report_pdf_path = os.path.join(os.path.dirname(calib_bag_path), f"{output_calib_name}-report-cam.pdf")
+@@ -120,18 +153,22 @@ def calibration_task(calibration_gen, stereo_calib_gens, input_bag_path, height,
+             else:
+                 break
+         except KeyboardInterrupt:
+-            os.remove(calib_bag_path)
++            if os.path.exists(calib_bag_path):
++                os.remove(calib_bag_path)
+             print("Ctrl+C detected. Exiting.")
+-            break
++            raise
+         except Exception as e:
+-            os.remove(calib_bag_path)
++            last_error = e
++            if os.path.exists(calib_bag_path):
++                os.remove(calib_bag_path)
+             print(e)
+             retries += 1
+             if retries < max_retries:
+                 print(f"Retrying... ({retries}/{max_retries})")
+             else:
+-                print("Max retries reached. Exiting.")
+-                break
++                raise RuntimeError(
++                    f"{output_calib_name} failed after {max_retries} attempts"
++                ) from last_error
+ 
+ def calibrate_virtual_stereo(input_bag, fov, width, height, fisheye_config, output_path, step,photometric_calibration= None , verbose = False):
+     if not os.path.exists(fisheye_config):
+@@ -144,7 +181,13 @@ def calibrate_virtual_stereo(input_bag, fov, width, height, fisheye_config, outp
+             os.makedirs(output_path)
+             print("copy aprilgrid.yaml to output folder")
+             print(f"{output_path} created")
+-        aprilgrid_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "april_6x6.yaml")
++        run_aprilgrid_path = "/data/april_6x6.yaml"
++        aprilgrid_path = (
++            run_aprilgrid_path
++            if os.path.exists(run_aprilgrid_path)
++            else os.path.join(
++                os.path.dirname(os.path.abspath(__file__)),
++                "april_6x6.yaml"))
+         shutil.copyfile(aprilgrid_path, os.path.join(output_path, "aprilgrid.yaml"))
+         print("copy aprilgrid.yaml to output folder")
+         output_bag_name = os.path.join(output_path, "stereo_calibration_step_%s_width_%s_height_%s.bag" % (step, width, height))
+@@ -167,8 +210,11 @@ def calibrate_virtual_stereo(input_bag, fov, width, height, fisheye_config, outp
+ 
+     # If bag already exists, no need to generate again
+     if not os.path.exists(output_bag_name):
++        partial_bag_name = output_bag_name + ".partial"
++        if os.path.exists(partial_bag_name):
++            os.remove(partial_bag_name)
+         #Read from bag
+-        output_bag = rosbag.Bag(output_bag_name, mode="w")
++        output_bag = rosbag.Bag(partial_bag_name, mode="w")
+         bag = rosbag.Bag(input_bag)
+         num_imgs = bag.get_message_count("/arducam/image/compressed") + bag.get_message_count("/arducam/image") + \
+             bag.get_message_count("/oak_ffc_4p/assemble_image/compressed") + bag.get_message_count("/oak_ffc_4p/assemble_image")
+@@ -212,18 +258,27 @@ def calibrate_virtual_stereo(input_bag, fov, width, height, fisheye_config, outp
+             except KeyboardInterrupt:
+                 break
+         output_bag.close()
++        bag.close()
++        os.replace(partial_bag_name, output_bag_name)
+     else:
+         print('Using the previours bag: %s' % str(output_bag_name))
+ 
+     ### I prefer do it in docker
+     # Create a multiprocessing pool with 4 processes
+     try:
+-        pool = multiprocessing.Pool(processes=4)
++        process_count = int(os.environ.get("QUARTERKALIBR_PROCESSES", "1"))
++        pool = multiprocessing.Pool(processes=process_count)
++        tasks = []
+         for gen in stereo_gens:
+             # Apply the calibration_task function to each generator in parallel
+-            pool.apply_async(calibration_task, args=(gen, stereo_gens, output_bag_name, height, width, verbose,), error_callback=print)
++            tasks.append(pool.apply_async(
++                calibration_task,
++                args=(gen, stereo_gens, output_bag_name, height, width, verbose,),
++                error_callback=print))
+         pool.close()
+         pool.join()
++        for task in tasks:
++            task.get()
+     except KeyboardInterrupt:
+         # Catch Ctrl+C
+         # TODO: Ctrl+C still not working
+diff --git a/utils/VirtualStereoUtils/config_loader.py b/utils/VirtualStereoUtils/config_loader.py
+index 43c3ece..e03b96c 100644
+--- a/utils/VirtualStereoUtils/config_loader.py
++++ b/utils/VirtualStereoUtils/config_loader.py
+@@ -21,8 +21,8 @@ def initStereoFromConfig(config_file, stereo_gen, force_width=None):
+             K1 *= force_width/size[0]
+             size = (force_width, int(force_width*size[1]/size[0]))
+             print("Force width to", force_width, "\nK0\n", K0, "\nK1\n", K1)
+-        D0 = np.array(config["cam0"]['distortion_coeffs'], dtype=np.float)
+-        D1 = np.array(config["cam1"]['distortion_coeffs'], dtype=np.float)
++        D0 = np.array(config["cam0"]['distortion_coeffs'], dtype=float)
++        D1 = np.array(config["cam1"]['distortion_coeffs'], dtype=float)
+         T = np.array(config["cam1"]["T_cn_cnm1"])
+         R = T[0:3,0:3]
+         t = T[0:3,3]
+diff --git a/utils/VirtualStereoUtils/fisheye_undist.py b/utils/VirtualStereoUtils/fisheye_undist.py
+index e317c15..2fee066 100755
+--- a/utils/VirtualStereoUtils/fisheye_undist.py
++++ b/utils/VirtualStereoUtils/fisheye_undist.py
+@@ -1,7 +1,39 @@
+ #!/usr/bin/env python3
+ import cv2 as cv
+ import numpy as np
+-from transformations import *
++
++
++def euler_matrix(ai, aj, ak, axes='sxyz'):
++    """Return a 4x4 static-XYZ Euler rotation matrix.
++
++    quarterKalibr only uses the ``sxyz`` convention, so keeping the
++    implementation local avoids its undeclared dependency on the external
++    ``transformations`` Python package.
++    """
++    if axes != 'sxyz':
++        raise ValueError("Only the static XYZ Euler convention is supported")
++    si, sj, sk = np.sin([ai, aj, ak])
++    ci, cj, ck = np.cos([ai, aj, ak])
++    rotation_x = np.array([
++        [1.0, 0.0, 0.0],
++        [0.0, ci, -si],
++        [0.0, si, ci],
++    ])
++    rotation_y = np.array([
++        [cj, 0.0, sj],
++        [0.0, 1.0, 0.0],
++        [-sj, 0.0, cj],
++    ])
++    rotation_z = np.array([
++        [ck, -sk, 0.0],
++        [sk, ck, 0.0],
++        [0.0, 0.0, 1.0],
++    ])
++    transform = np.eye(4)
++    transform[:3, :3] = rotation_z @ rotation_y @ rotation_x
++    return transform
++
++
+ class FisheyeUndist:
+     def __init__(self, camera_matrix, dist_coeffs, xi, fov=190, width=1000, height=500, extrinsic=None):
+         self.camera_matrix = camera_matrix

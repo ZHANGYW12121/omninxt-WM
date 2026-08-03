@@ -1,0 +1,33 @@
+FROM ros:noetic-robot-focal
+
+ARG USE_PROC=2
+ARG OAK_WS=/root/oak_ffc_ws
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN dpkg --print-architecture | grep -qx arm64 \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       build-essential \
+       ca-certificates \
+       cmake \
+       git \
+       libfmt-dev \
+       libopencv-dev \
+       libspdlog-dev \
+       python3-catkin-tools \
+       ros-noetic-cv-bridge \
+       ros-noetic-depthai-bridge \
+       ros-noetic-depthai-ros-msgs \
+       ros-noetic-image-transport \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p "${OAK_WS}/src"
+WORKDIR ${OAK_WS}
+
+RUN printf '%s\n' \
+      'source /opt/ros/noetic/setup.bash' \
+      '[ -f /root/oak_ffc_ws/devel/setup.bash ] && source /root/oak_ffc_ws/devel/setup.bash' \
+      >> /root/.bashrc
+
+CMD ["bash"]

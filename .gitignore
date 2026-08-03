@@ -1,0 +1,55 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.secret
+credentials*
+
+# Runtime data
+runtime/
+raw/
+logs/
+backups/
+artifacts/
+
+# ROS and build output
+**/build/
+**/devel/
+**/install/
+**/log/
+**/logs/
+
+# Calibration and sensor recordings
+*.bag
+*.pcd
+*.pkl
+*.npz
+*.npy
+*.csv.tmp
+
+# Generated GPU/model artifacts
+*.engine
+*.trt
+*.plan
+
+# Large models: add later through Git LFS or artifact storage
+*.onnx
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.swp
+*~

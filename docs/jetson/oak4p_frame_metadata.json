@@ -1,0 +1,66 @@
+{
+  "CAM_A": {
+    "channel_mean_bgr": [
+      130.171,
+      104.087,
+      88.754
+    ],
+    "channel_std_bgr": [
+      85.162,
+      88.733,
+      81.736
+    ],
+    "encoding": "bgr8",
+    "height": 720,
+    "stamp_ns": 1784951733515760272,
+    "width": 1280
+  },
+  "CAM_B": {
+    "channel_mean_bgr": [
+      155.215,
+      132.677,
+      120.555
+    ],
+    "channel_std_bgr": [
+      91.715,
+      100.31,
+      97.361
+    ],
+    "encoding": "bgr8",
+    "height": 720,
+    "stamp_ns": 1784951733515760272,
+    "width": 1280
+  },
+  "CAM_C": {
+    "channel_mean_bgr": [
+      157.974,
+      140.963,
+      131.237
+    ],
+    "channel_std_bgr": [
+      85.864,
+      96.549,
+      95.639
+    ],
+    "encoding": "bgr8",
+    "height": 720,
+    "stamp_ns": 1784951733515760272,
+    "width": 1280
+  },
+  "CAM_D": {
+    "channel_mean_bgr": [
+      126.143,
+      107.603,
+      98.086
+    ],
+    "channel_std_bgr": [
+      89.925,
+      96.365,
+      92.641
+    ],
+    "encoding": "bgr8",
+    "height": 720,
+    "stamp_ns": 1784951733515760272,
+    "width": 1280
+  }
+}

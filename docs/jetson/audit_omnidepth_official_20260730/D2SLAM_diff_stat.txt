@@ -1,0 +1,18 @@
+ config/quadcam_drone_nxt_tmp/fisheye_cams.yaml     | 247 +++++--------
+ config/quadcam_drone_nxt_tmp/quadcam_depth.yaml    |  27 +-
+ .../stereo_calib_0_1_240_320.yaml                  |  14 +-
+ .../stereo_calib_1_2_240_320.yaml                  |  14 +-
+ .../stereo_calib_2_3_240_320.yaml                  |  14 +-
+ .../stereo_calib_3_0_240_320.yaml                  |  14 +-
+ .../hitnet_1x240x320_model_float16_quant_opt.trt   | Bin 7051614 -> 6958779 bytes
+ .../hitnet_model_240x320_fp16_quant_opt.trt        | Bin 6923760 -> 0 bytes
+ quadcam_depth_est/CMakeLists.txt                   |  17 +-
+ quadcam_depth_est/include/hitnet.hpp               |  21 +-
+ quadcam_depth_est/include/pcl_utils.hpp            |  20 +-
+ .../include/quadcam_depth_est_trt.hpp              |  34 +-
+ quadcam_depth_est/include/virtual_stereo.hpp       |  10 +-
+ quadcam_depth_est/package.xml                      |   2 -
+ quadcam_depth_est/src/hitnet.cpp                   | 148 ++++++--
+ quadcam_depth_est/src/quadcam_depth_est_trt.cpp    | 405 +++++++++++++++++++--
+ quadcam_depth_est/src/virtual_stereo.cpp           |  48 ++-
+ 17 files changed, 741 insertions(+), 294 deletions(-)

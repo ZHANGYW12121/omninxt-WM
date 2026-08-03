@@ -1,0 +1,1 @@
+b589c3ff5e751603874de7d7ca0e88d06db4f9db0d87378d894da9e226ce369f  /home/neu/OmniNxt/source/D2SLAM/models/hitnet_series/hitnet_1x240x320_model_float16_quant_opt.onnx

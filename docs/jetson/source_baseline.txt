@@ -1,0 +1,54 @@
+
+===== OmniNxt =====
+origin	https://github.com/HKUST-Aerial-Robotics/OmniNxt.git (fetch)
+origin	https://github.com/HKUST-Aerial-Robotics/OmniNxt.git (push)
+## main...origin/main
+* main
+  remotes/origin/HEAD -> origin/main
+  remotes/origin/gh-pages
+  remotes/origin/main
+79ce1d4b69a5a8c861417716adaac00c2bc6f594
+79ce1d4
+
+===== D2SLAM =====
+origin	https://github.com/HKUST-Aerial-Robotics/D2SLAM.git (fetch)
+origin	https://github.com/HKUST-Aerial-Robotics/D2SLAM.git (push)
+## main...origin/main
+* main
+  remotes/origin/3DGS
+  remotes/origin/CXX17
+  remotes/origin/HEAD -> origin/main
+  remotes/origin/chuhao_semantic
+  remotes/origin/develop
+  remotes/origin/feat_jeston_orin_drone
+  remotes/origin/fix_parrallel_net
+  remotes/origin/graco
+  remotes/origin/main
+  remotes/origin/non-cuda
+  remotes/origin/pr_fix_main
+  remotes/origin/shared_ptr
+  remotes/origin/shared_ptr_vinsframe
+  remotes/origin/track_sp_use_lk
+4c33871083e4ae97b97973eb5bd88dc6735359d7
+4c33871
+
+===== driver-oak_ffc_4p_ros =====
+origin	https://github.com/UAV-Swarm/driver-oak_ffc_4p_ros.git (fetch)
+origin	https://github.com/UAV-Swarm/driver-oak_ffc_4p_ros.git (push)
+## main...origin/main
+* main
+  remotes/origin/HEAD -> origin/main
+  remotes/origin/feat_imu_camera
+  remotes/origin/main
+3babba51c6842492dfef1bbf646fa11b9d3416cd
+3babba5
+
+===== tools-quarterKalibr =====
+origin	https://github.com/D2SLAM-Fusion/tools-quarterKalibr.git (fetch)
+origin	https://github.com/D2SLAM-Fusion/tools-quarterKalibr.git (push)
+## main...origin/main
+* main
+  remotes/origin/HEAD -> origin/main
+  remotes/origin/main
+5a2be86094d7f513c343d89fdf0d39ca009a1263
+5a2be86

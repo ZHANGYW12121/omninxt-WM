@@ -1,0 +1,101 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 08ae839..6bfdac4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -43,21 +43,12 @@ include_directories(
+   ${catkin_INCLUDE_DIRS}
+ )
+ 
+-link_directories(
+-  /root/3rd_party/depthai-core-v2.26.0/build/
+-  /root/3rd_party/XLink/build
+-  /root/3rd_party/spdlog-1.8.2/build
+-  /root/3rd_party/fmt-7.1.3/build
+-)
+-
+ add_executable(${PROJECT_NAME}_test test.cpp)
+ 
+ target_link_libraries(${PROJECT_NAME}_test
+   ${catkin_LIBRARIES}
+   ${OpenCV_LIBRARIES}
+   depthai::opencv
+-  depthai-core
+-  XLink
+   spdlog
+   fmt::fmt
+   pthread
+@@ -66,8 +57,6 @@ target_link_libraries(${PROJECT_NAME}_test
+ target_include_directories(${PROJECT_NAME}_test PUBLIC
+   ${catkin_INCLUDE_DIRS}
+   ${OpenCV_INCLUDE_DIRS}
+-  /root/3rd_party/depthai-core-v2.26.0/build/install/include
+-  /root/3rd_party/XLink/build/install/include
+ )
+ 
+ add_library(${PROJECT_NAME}_lib STATIC
+@@ -78,8 +67,6 @@ target_link_libraries(${PROJECT_NAME}_lib
+   ${catkin_LIBRARIES}
+   ${OpenCV_LIBRARIES}
+   depthai::opencv
+-  depthai-core
+-  XLink
+   spdlog
+   fmt::fmt
+   pthread
+@@ -93,4 +80,4 @@ target_link_libraries(${PROJECT_NAME}_node
+   ${catkin_LIBRARIES}
+   ${OpenCV_LIBRARIES}
+   depthai::opencv
+-)
+\ No newline at end of file
++)
+diff --git a/launch/OV9782.launch b/launch/OV9782.launch
+index ada897d..fc2a03f 100644
+--- a/launch/OV9782.launch
++++ b/launch/OV9782.launch
+@@ -10,7 +10,7 @@
+     <arg name="ros_defined_freq" default = "true"/>
+     <arg name="sharpness_calibration_mode" default = "false"/>
+     <arg name="compressed_mode" default= "false" />
+-    <arg name="enable_upside_down" default = "true"/>
++    <arg name="enable_upside_down" default = "false"/>
+ 
+     <node name="oak_ffc_4p_ros" pkg="oak_ffc_4p_ros" type="oak_ffc_4p_ros_node" output="screen">
+         <param name="fps" value="$(arg fps)" />
+diff --git a/oak_ffc_4p.cpp b/oak_ffc_4p.cpp
+index ed8dfe3..d6a7984 100644
+--- a/oak_ffc_4p.cpp
++++ b/oak_ffc_4p.cpp
+@@ -269,11 +269,10 @@ void FFC4PDriver::GrabImg() {
+   }
+ 
+   if (this->module_config_.sharpness_calibration_mode) {
+-    // for (auto& image_node : this->image_pub_node_) {
+-    //   cv_img.image = image_node.second.image;
+-    //   image_node.second.ros_publisher_ptr->publish(
+-    //       cv_img.toCompressedImageMsg());
+-    // }
++    for (auto& image_node : this->image_pub_node_) {
++      cv_img.image = image_node.second.image;
++      image_node.second.ros_publisher_ptr->publish(cv_img.toImageMsg());
++    }
+   } else {
+     for (auto& image_node : this->image_pub_node_) {
+       image_node.second.image.copyTo(
+@@ -287,7 +286,8 @@ void FFC4PDriver::GrabImg() {
+     }
+     this->expose_time_publisher_.publish(expose_time_msg);
+   }
+-  if (this->module_config_.sharpness_calibration_mode) {
++  if (this->module_config_.sharpness_calibration_mode &&
++      std::getenv("DISPLAY") != nullptr) {
+     for (auto& image_node : image_pub_node_) {
+       this->ShowImg(image_node.second, host_time_now);
+     }
+@@ -346,4 +346,4 @@ ros::Time convertToRosTime(
+   return currentTime;
+ };
+ 
+-}  // namespace OAKCAM
+\ No newline at end of file
++}  // namespace OAKCAM

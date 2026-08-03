@@ -1,0 +1,9 @@
+aarch64
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2022 NVIDIA Corporation
+Built on Sun_Oct_23_22:16:07_PDT_2022
+Cuda compilation tools, release 11.4, V11.4.315
+Build cuda_11.4.r11.4/compiler.31964100_0
+libcudnn8	8.6.0.166-1+cuda11.4
+libnvinfer8	8.5.2-1+cuda11.4
+lrwxrwxrwx 1 root root 22 Jul 25  2023 /usr/local/cuda -> /etc/alternatives/cuda

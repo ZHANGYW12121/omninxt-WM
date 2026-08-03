@@ -1,0 +1,19 @@
+logical:
+  cam0: CAM_A
+  cam1: CAM_B
+  cam2: CAM_C
+  cam3: CAM_D
+
+physical:
+  CAM_A: FRONT_RIGHT
+  CAM_B: REAR_RIGHT
+  CAM_C: REAR_LEFT
+  CAM_D: FRONT_LEFT
+
+verification:
+  method: ROS_SINGLE_LENS_OCCLUSION
+  date: 2026-07-28
+  image_rotation_180: false
+  ring_order_viewed_from_above: [CAM_A, CAM_B, CAM_C, CAM_D]
+  ring_direction: CLOCKWISE
+  default_adjacent_pairs_valid: true

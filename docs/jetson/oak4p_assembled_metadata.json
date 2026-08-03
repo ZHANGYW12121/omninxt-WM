@@ -1,0 +1,8 @@
+{
+  "encoding": "bgr8",
+  "height": 720,
+  "output": "/root/oak_ffc_ws/runtime/oak4p_frames/assemble_CAM_A_B_C_D.png",
+  "stamp_ns": 1784951795171764168,
+  "topic": "/oak_ffc_4p/assemble_image",
+  "width": 5120
+}

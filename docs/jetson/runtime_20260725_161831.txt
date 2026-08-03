@@ -1,0 +1,53 @@
+2026-07-25T16:18:31+08:00
+Linux neu-desktop 5.10.120-tegra #21 SMP PREEMPT Sat Aug 23 12:12:39 CST 2025 aarch64 aarch64 aarch64 GNU/Linux
+nvidia-jetpack	5.1.2-b104
+nvidia-l4t-core	35.4.1-20230801124926
+NV Power Mode: 15W
+0
+NVPM ERROR: Error opening /sys/kernel/nvpmodel_emc_cap/emc_iso_cap: 13
+NVPM ERROR: failed to read PARAM EMC: ARG MAX_FREQ: PATH /sys/kernel/nvpmodel_emc_cap/emc_iso_cap
+              总计         已用        空闲      共享    缓冲/缓存    可用
+内存：       7.3Gi       4.1Gi       1.8Gi       8.0Mi       1.4Gi       3.0Gi
+交换：       3.6Gi       2.0Gi       1.6Gi
+文件系统        容量  已用  可用 已用% 挂载点
+/dev/nvme0n1p1  233G   46G  176G   21% /
+Docker client=26.1.3 server=26.1.3
+Docker arch=aarch64 default=runc
+Docker runtimes=io.containerd.runc.v2 nvidia runc 
+OmniDepth image=sha256:e6381f7769ee9d2dafdc9854ff6b34f7348c41e8395510b1bbe2741d8acfa90e arch=arm64
+Build cuda_11.4.r11.4/compiler.31964100_0
+libcudnn8	8.6.0.166-1+cuda11.4
+libnvinfer8	8.5.2-1+cuda11.4
+b589c3ff5e751603874de7d7ca0e88d06db4f9db0d87378d894da9e226ce369f  /home/neu/OmniNxt/source/D2SLAM/models/hitnet_series/hitnet_1x240x320_model_float16_quant_opt.onnx
+Engine bytes=6958779 mtime=2026-07-25 14:26:01.484097015 +0800
+4197ba2c3ac0696ad9e9e3483e2eac04ee5f7c6e8b39f5883ece1da660fe7142  /home/neu/OmniNxt/source/D2SLAM/models/hitnet_series/hitnet_1x240x320_model_float16_quant_opt.trt
+3a4b8071f6f9c40a151c7685aa738b717ce8916a
+ M models/hitnet_series/hitnet_1x240x320_model_float16_quant_opt.trt
+ D models/hitnet_series/hitnet_model_240x320_fp16_quant_opt.trt
+ M quadcam_depth_est/CMakeLists.txt
+ M quadcam_depth_est/include/hitnet.hpp
+ M quadcam_depth_est/include/quadcam_depth_est_trt.hpp
+ M quadcam_depth_est/package.xml
+ M quadcam_depth_est/src/hitnet.cpp
+ M quadcam_depth_est/src/quadcam_depth_est_trt.cpp
+ M quadcam_depth_est/src/virtual_stereo.cpp
+?? config/quadcam_drone_nxt_tmp/quadcam_depth_PLACEHOLDER_NOT_CALIBRATED.yaml
+?? docker/Dockerfile.jetson_orin_base_35.4.1
+?? docker/Dockerfile.omnidepth_orin_jp512
+?? quadcam_depth_est/include/camera_config_loader.hpp
+?? quadcam_depth_est/src/camera_config_loader.cpp
+/root/swarm_ws/src/D2SLAM/quadcam_depth_est
+/root/swarm_ws/src/D2SLAM/quadcam_depth_est/launch/depth-node.launch
+	libnvinfer.so.8 => /lib/aarch64-linux-gnu/libnvinfer.so.8 (0x0000ffff8327b000)
+	libnvinfer_plugin.so.8 => /lib/aarch64-linux-gnu/libnvinfer_plugin.so.8 (0x0000ffff64d51000)
+	libopencv_calib3d.so.406 => /usr/local/lib/libopencv_calib3d.so.406 (0x0000ffff93d68000)
+	libopencv_ccalib.so.406 => /usr/local/lib/libopencv_ccalib.so.406 (0x0000ffff90400000)
+	libopencv_core.so.406 => /usr/local/lib/libopencv_core.so.406 (0x0000ffff90b3a000)
+	libopencv_cudaarithm.so.406 => /usr/local/lib/libopencv_cudaarithm.so.406 (0x0000ffff91f34000)
+	libopencv_cudaimgproc.so.406 => /usr/local/lib/libopencv_cudaimgproc.so.406 (0x0000ffff9192d000)
+	libopencv_cudawarping.so.406 => /usr/local/lib/libopencv_cudawarping.so.406 (0x0000ffff91092000)
+	libopencv_features2d.so.406 => /usr/local/lib/libopencv_features2d.so.406 (0x0000ffff82b5f000)
+	libopencv_flann.so.406 => /usr/local/lib/libopencv_flann.so.406 (0x0000ffff82adc000)
+	libopencv_highgui.so.406 => /usr/local/lib/libopencv_highgui.so.406 (0x0000ffff93d1d000)
+	libopencv_imgcodecs.so.406 => /usr/local/lib/libopencv_imgcodecs.so.406 (0x0000ffff905cf000)
+	libopencv_imgproc.so.406 => /usr/local/lib/libopencv_imgproc.so.406 (0x0000ffff90784000)

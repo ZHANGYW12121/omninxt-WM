@@ -1,0 +1,4 @@
+ CMakeLists.txt       | 15 +--------------
+ launch/OV9782.launch |  2 +-
+ oak_ffc_4p.cpp       | 14 +++++++-------
+ 3 files changed, 9 insertions(+), 22 deletions(-)

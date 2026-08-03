@@ -1,0 +1,44 @@
+/work/inspect_onnx_trt.cpp: In instantiation of 'void Destroy<T>::operator()(T*) const [with T = nvinfer1::IBuilder]':
+/usr/include/c++/9/bits/unique_ptr.h:292:17:   required from 'std::unique_ptr<_Tp, _Dp>::~unique_ptr() [with _Tp = nvinfer1::IBuilder; _Dp = Destroy<nvinfer1::IBuilder>]'
+/work/inspect_onnx_trt.cpp:42:43:   required from here
+/work/inspect_onnx_trt.cpp:21:7: warning: 'void nvinfer1::IBuilder::destroy()' is deprecated [-Wdeprecated-declarations]
+   21 |       value->destroy();
+      |       ^~~~~
+In file included from /work/inspect_onnx_trt.cpp:1:
+/usr/include/aarch64-linux-gnu/NvInfer.h:9422:25: note: declared here
+ 9422 |     TRT_DEPRECATED void destroy() noexcept
+      |                         ^~~~~~~
+/work/inspect_onnx_trt.cpp: In instantiation of 'void Destroy<T>::operator()(T*) const [with T = nvinfer1::INetworkDefinition]':
+/usr/include/c++/9/bits/unique_ptr.h:292:17:   required from 'std::unique_ptr<_Tp, _Dp>::~unique_ptr() [with _Tp = nvinfer1::INetworkDefinition; _Dp = Destroy<nvinfer1::INetworkDefinition>]'
+/work/inspect_onnx_trt.cpp:49:46:   required from here
+/work/inspect_onnx_trt.cpp:21:7: warning: 'void nvinfer1::INetworkDefinition::destroy()' is deprecated [-Wdeprecated-declarations]
+   21 |       value->destroy();
+      |       ^~~~~
+In file included from /work/inspect_onnx_trt.cpp:1:
+/usr/include/aarch64-linux-gnu/NvInfer.h:7015:25: note: declared here
+ 7015 |     TRT_DEPRECATED void destroy() noexcept
+      |                         ^~~~~~~
+/work/inspect_onnx_trt.cpp: In instantiation of 'void Destroy<T>::operator()(T*) const [with T = nvonnxparser::IParser]':
+/usr/include/c++/9/bits/unique_ptr.h:292:17:   required from 'std::unique_ptr<_Tp, _Dp>::~unique_ptr() [with _Tp = nvonnxparser::IParser; _Dp = Destroy<nvonnxparser::IParser>]'
+/work/inspect_onnx_trt.cpp:51:51:   required from here
+/work/inspect_onnx_trt.cpp:21:7: warning: 'virtual void nvonnxparser::IParser::destroy()' is deprecated [-Wdeprecated-declarations]
+   21 |       value->destroy();
+      |       ^~~~~
+In file included from /work/inspect_onnx_trt.cpp:2:
+/usr/include/aarch64-linux-gnu/NvOnnxParser.h:199:33: note: declared here
+  199 |     TRT_DEPRECATED virtual void destroy() = 0;
+      |                                 ^~~~~~~
+[TensorRT] onnx2trt_utils.cpp:375: Your ONNX model has been generated with INT64 weights, while TensorRT does not natively support INT64. Attempting to cast down to INT32.
+[TensorRT] Tensor DataType is determined at build time for tensors not marked as input or output.
+[TensorRT] Tensor DataType is determined at build time for tensors not marked as input or output.
+[TensorRT] Tensor DataType is determined at build time for tensors not marked as input or output.
+[TensorRT] Tensor DataType is determined at build time for tensors not marked as input or output.
+[TensorRT] Tensor DataType is determined at build time for tensors not marked as input or output.
+[TensorRT] Tensor DataType is determined at build time for tensors not marked as input or output.
+[TensorRT] Tensor DataType is determined at build time for tensors not marked as input or output.
+[TensorRT] Tensor DataType is determined at build time for tensors not marked as input or output.
+[TensorRT] Tensor DataType is determined at build time for tensors not marked as input or output.
+[TensorRT] Tensor DataType is determined at build time for tensors not marked as input or output.
+inputs=1 outputs=1
+input[0] name=input dims=[1,2,240,320] dtype=0
+output[0] name=reference_output_disparity dims=[1,240,320,1] dtype=0

@@ -1,0 +1,1294 @@
+diff --git a/quadcam_depth_est/CMakeLists.txt b/quadcam_depth_est/CMakeLists.txt
+index 1e31437..4c9f68b 100644
+--- a/quadcam_depth_est/CMakeLists.txt
++++ b/quadcam_depth_est/CMakeLists.txt
+@@ -8,14 +8,14 @@ set(CMAKE_CXX_FLAGS_RELEASE "-g -O3")
+ set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
+ add_compile_options(-Wno-deprecated-declarations -Wno-reorder  -Wno-format -Wno-sign-compare)
+ 
+-find_package(catkin REQUIRED)
+-SET("OpenCV_DIR"  "/usr/local/share/OpenCV/")
++if(NOT OpenCV_DIR)
++  set(OpenCV_DIR "/usr/local/lib/cmake/opencv4")
++endif()
+ SET("TENSORRT_UTILS_INC" "../tensorrt_utils/include/")
+-find_package(OpenCV REQUIRED)
++find_package(OpenCV 4.6 REQUIRED PATHS "${OpenCV_DIR}" NO_DEFAULT_PATH)
+ find_package(Eigen3 REQUIRED)
+ find_package(yaml-cpp REQUIRED)
+ find_package(CUDA REQUIRED)
+-find_package(d2frontend REQUIRED)
+ find_package(catkin REQUIRED COMPONENTS
+   roscpp
+   rosmsg
+@@ -23,7 +23,6 @@ find_package(catkin REQUIRED COMPONENTS
+   std_msgs
+   swarm_msgs
+   cv_bridge
+-  d2common
+   message_generation
+   camera_models
+   message_filters
+@@ -41,13 +40,13 @@ catkin_package(
+ include_directories(
+ # include
+ ${CMAKE_CURRENT_SOURCE_DIR}/include
++${CMAKE_CURRENT_SOURCE_DIR}/../d2common/include
+ ${TENSORRT_UTILS_INC}
+ ${catkin_INCLUDE_DIRS}
+ ${EIGEN3_INCLUDE_DIRS}
+-${d2frontend_INCLUDE_DIRS}
+ ${YAML_CPP_INCLUDE_DIRS}
+-${ONNXRUNTIME_INC_DIR}
+ ${CUDA_INCLUDE_DIRS}
++${OpenCV_INCLUDE_DIRS}
+ )
+ 
+ add_subdirectory(../tensorrt_utils  tensorrt_utils)
+@@ -56,15 +55,15 @@ add_subdirectory(../tensorrt_utils  tensorrt_utils)
+ add_library(${PROJECT_NAME}
+   src/virtual_stereo.cpp
+   src/hitnet.cpp
++  src/camera_config_loader.cpp
+   src/quadcam_depth_est_trt.cpp
+ )
+ 
+ target_link_libraries(
+   ${PROJECT_NAME}
+   ${catkin_LIBRARIES}
+-  ${d2frontend_LIBRARIES}
++  ${OpenCV_LIBRARIES}
+   ${CUDA_LIBRARIES}
+-  onnxruntime
+   nvinfer
+   nvinfer_plugin
+   nvonnxparser
+diff --git a/quadcam_depth_est/include/hitnet.hpp b/quadcam_depth_est/include/hitnet.hpp
+index a48d36b..312f916 100644
+--- a/quadcam_depth_est/include/hitnet.hpp
++++ b/quadcam_depth_est/include/hitnet.hpp
+@@ -27,14 +27,9 @@ class HitnetLogger: public nvinfer1::ILogger{
+ class HitnetExcutor{
+  public:
+   HitnetExcutor(){};
+-  ~HitnetExcutor(){
+-    if(nv_context_ptr_ != nullptr){
+-      nv_context_ptr_ = nullptr;
+-    }
+-    if(buffer_manager_ptr_ != nullptr){
+-      buffer_manager_ptr_ = nullptr;
+-    }
+-  };
++  ~HitnetExcutor();
++  HitnetExcutor(const HitnetExcutor&) = delete;
++  HitnetExcutor& operator=(const HitnetExcutor&) = delete;
+ 
+   int32_t init(std::shared_ptr<nvinfer1::ICudaEngine> engine_ptr, 
+     std::string input_tensor_name = "input",
+@@ -48,12 +43,14 @@ class HitnetExcutor{
+  private:
+   std::shared_ptr<nvinfer1::ICudaEngine> engine_ptr_ = nullptr;
+   nvinfer1::IExecutionContext* nv_context_ptr_ = nullptr;
+-  std::shared_ptr <tensorrt_buffer::BufferManager> buffer_manager_ptr_; //TODO: risky
+-  cudaStream_t stream_;
++  std::unique_ptr<tensorrt_buffer::BufferManager> buffer_manager_ptr_;
++  cudaStream_t stream_ = nullptr;
+   std::string input_tensor_name_ = "input";
+   std::string output_tensor_name_ = "output";
+   int32_t input_size_ = 0;
+   int32_t output_size_ = 0;
++  int32_t output_height_ = 0;
++  int32_t output_width_ = 0;
+   int32_t input_index_ = -1;
+   int32_t output_index_ = -1;
+ };
+@@ -70,8 +67,9 @@ class HitnetTrt{
+   int32_t buildEngine(const std::string& onnx_model_path, const std::string& trt_engine_path);
+ 
+   int32_t stream_number_ = 4;
+-  std::vector<HitnetExcutor> executors_;
++  std::vector<std::unique_ptr<HitnetExcutor>> executors_;
+   std::shared_ptr<nvinfer1::ICudaEngine> nv_engine_ptr_ = nullptr;
++  std::shared_ptr<nvinfer1::IRuntime> nv_runtime_ptr_ = nullptr;
+   HitnetLogger logger_;
+   bool show_info_;
+ };
+@@ -79,4 +77,3 @@ class HitnetTrt{
+ 
+ 
+ }
+-
+diff --git a/quadcam_depth_est/include/pcl_utils.hpp b/quadcam_depth_est/include/pcl_utils.hpp
+index e842640..9009050 100644
+--- a/quadcam_depth_est/include/pcl_utils.hpp
++++ b/quadcam_depth_est/include/pcl_utils.hpp
+@@ -2,6 +2,7 @@
+ #include <sensor_msgs/PointCloud.h>
+ #include <pcl_ros/point_cloud.h>
+ #include <opencv2/opencv.hpp>
++#include <cmath>
+ 
+ namespace D2QuadCamDepthEst {
+ typedef pcl::PointCloud<pcl::PointXYZ> PointCloud;
+@@ -31,9 +32,9 @@ inline void addtoPCL(PointCloudRGB & pcl, Vector3f point, cv::Vec3b color) {
+     p.x = point(0);
+     p.y = point(1);
+     p.z = point(2);
+-    p.r = color[2], 255;
+-    p.g = color[1], 255;
+-    p.b = color[0], 255;
++    p.r = color[2];
++    p.g = color[1];
++    p.b = color[0];
+     pcl.points.push_back(p);
+ }
+ 
+@@ -50,21 +51,26 @@ inline void addtoPCL(PointCloudRGB &pcl, Vector3f point, uchar grayscale) {
+ 
+ template<typename PointType>
+ void addPointsToPCL(const cv::Mat & pts3d, const cv::Mat & color, Swarm::Pose pose, 
+-        pcl::PointCloud<PointType> & pcl, int step, double min_z, double max_z) {
++        pcl::PointCloud<PointType> & pcl, int step, double min_z, double max_z,
++        const cv::Mat & valid_mask = cv::Mat()) {
+     bool rgb_color = color.channels() == 3;
+     Matrix3f R = pose.R().template cast<float>();
+     Vector3f t = pose.pos().template cast<float>();
+     for(int v = 0; v < pts3d.rows; v += step) {
+         for(int u = 0; u < pts3d.cols; u += step) {
++            if (!valid_mask.empty() && valid_mask.at<uchar>(v, u) == 0) {
++                continue;
++            }
+             cv::Vec3f vec = pts3d.at<cv::Vec3f>(v, u);
+             Vector3f pts_i(vec[0], vec[1], vec[2]);
+-            if (pts_i.z() < max_z && pts_i.z() > min_z) {
++            if (std::isfinite(pts_i.x()) && std::isfinite(pts_i.y()) &&
++                std::isfinite(pts_i.z()) &&
++                pts_i.z() < max_z && pts_i.z() > min_z) {
+                 Vector3f w_pts_i = R * pts_i + t;
+                 // Vector3d w_pts_i = pts_i;
+                 if (color.empty()) {
+                     addtoPCL(pcl, w_pts_i);
+                 } else {
+-                    int32_t rgb_packed;
+                     if(rgb_color) {
+                         if (color.type() == CV_8UC3) {
+                             const cv::Vec3b& bgr = color.at<cv::Vec3b>(v, u);
+@@ -86,4 +92,4 @@ void addPointsToPCL(const cv::Mat & pts3d, const cv::Mat & color, Swarm::Pose po
+         }
+     }
+ }
+-}
+\ No newline at end of file
++}
+diff --git a/quadcam_depth_est/include/quadcam_depth_est_trt.hpp b/quadcam_depth_est/include/quadcam_depth_est_trt.hpp
+index 83fdfe2..9bc862b 100644
+--- a/quadcam_depth_est/include/quadcam_depth_est_trt.hpp
++++ b/quadcam_depth_est/include/quadcam_depth_est_trt.hpp
+@@ -11,6 +11,7 @@
+ #include <image_transport/subscriber_filter.h>
+ #include <message_filters/time_synchronizer.h>
+ #include <thread>
++#include <atomic>
+ #include "hitnet.hpp"
+ 
+ namespace D2QuadCamDepthEst{
+@@ -32,6 +33,9 @@ class QuadcamDepthEstTrt{
+   void rawImageProcessThread();
+   void inferrenceThread();
+   void publishThread();
++  cv::Mat buildDisparityValidityMask(const cv::Mat & disparity,
++      const cv::Mat & left, const cv::Mat & right,
++      const cv::Rect & stereo_roi) const;
+   void stoprawImageProcessThread(){
+     raw_image_process_thread_running_ = 0;
+   };
+@@ -57,8 +61,15 @@ class QuadcamDepthEstTrt{
+   image_transport::Subscriber image_sub_;
+ 
+   ros::Publisher pub_pcl_;
++  ros::Publisher pub_pcl_colored_;
++  ros::Publisher pub_sector_pcl_[kCamerasNum];
++  image_transport::Publisher pub_rect_left_[kCamerasNum];
++  image_transport::Publisher pub_rect_right_[kCamerasNum];
++  image_transport::Publisher pub_disparity_[kCamerasNum];
++  image_transport::Publisher pub_depth_[kCamerasNum];
+   PointCloud * pcl_ = nullptr;
+   PointCloudRGB * pcl_color_ = nullptr;
++  PointCloudRGB * pcl_debug_color_ = nullptr;
+   CameraConfig camera_config_ = D2Common::FOURCORNER_FISHEYE;
+ 
+   //configurations
+@@ -73,6 +84,16 @@ class QuadcamDepthEstTrt{
+   double max_z_ = 10;
+   int image_count_ = 0;
+   bool cnn_input_rgb_ = false;
++  bool enable_photometric_calib_ = false;
++  bool enable_disparity_filter_ = true;
++  bool publish_debug_clouds_ = true;
++  double min_disparity_ = 2.0;
++  double max_disparity_ = 96.0;
++  double max_median_deviation_ = 3.0;
++  double max_photometric_error_ = 50.0;
++  double min_texture_gradient_ = 3.0;
++  int valid_roi_margin_ = 4;
++  int min_valid_component_size_ = 20;
+ 
+   int32_t fps_ = 10;
+   std::string onnx_path_;
+@@ -102,15 +123,26 @@ class QuadcamDepthEstTrt{
+   cv::Mat split_raw_images_[kCamerasNum];
+   cv::cuda::GpuMat rectified_images_[kCamerasNum][2];//{left,right},{left,right},{left,right},{left,right}
+   cv::Mat input_tensors_[kCamerasNum];
++  cv::Mat input_rect_left_[kCamerasNum];
++  cv::Mat input_rect_right_[kCamerasNum];
++  std_msgs::Header input_header_;
+   std::mutex input_tensors_mutex_;
+ 
+   cv::Mat output_tensors_[kCamerasNum];
++  cv::Mat output_rect_left_[kCamerasNum];
++  cv::Mat output_rect_right_[kCamerasNum];
++  std_msgs::Header output_header_;
+   std::mutex output_tensors_mutex_;
++  std::atomic<bool> output_ready_{false};
+ 
+   cv::Mat recity_images_for_show_and_texture_[kCamerasNum][2];
+   cv::Mat publish_disparity_[kCamerasNum];
++  cv::Mat publish_rect_left_[kCamerasNum];
++  cv::Mat publish_rect_right_[kCamerasNum];
++  std_msgs::Header publish_header_;
++  cv::Mat publish_validity_mask_[kCamerasNum];
+   cv::Mat photometric_inv_vingette_[kCamerasNum];
+ 
+ };
+ 
+-}
+\ No newline at end of file
++}
+diff --git a/quadcam_depth_est/include/virtual_stereo.hpp b/quadcam_depth_est/include/virtual_stereo.hpp
+index 96d7136..0b9b7aa 100644
+--- a/quadcam_depth_est/include/virtual_stereo.hpp
++++ b/quadcam_depth_est/include/virtual_stereo.hpp
+@@ -75,6 +75,14 @@ class VirtualStereo {
+         return this->Q;
+     }
+ 
++    const cv::Mat& getLeftRectificationRotation() const {
++        return R1;
++    }
++
++    cv::Rect getValidRoi() const {
++        return roi_l & roi_r;
++    }
++
+     int32_t showDispartiy(const cv::Mat & disparity,
+         cv::Mat & left_rect_mat, cv::Mat & right_rect_mat);
+ 
+@@ -100,4 +108,4 @@ class VirtualStereo {
+     void initVingette(const cv::Mat & _inv_vingette_l, const cv::Mat & _inv_vingette_r);
+     void initRecitfy(const Swarm::Pose & baseline, cv::Mat K0, cv::Mat D0, cv::Mat K1, cv::Mat D1);
+ };
+-}
+\ No newline at end of file
++}
+diff --git a/quadcam_depth_est/package.xml b/quadcam_depth_est/package.xml
+index caa4a04..4c520a9 100644
+--- a/quadcam_depth_est/package.xml
++++ b/quadcam_depth_est/package.xml
+@@ -27,9 +27,7 @@
+   <build_depend>rospy</build_depend>
+   <build_export_depend>roscpp</build_export_depend>
+   <build_export_depend>rospy</build_export_depend>
+-  <build_export_depend>d2frontend</build_export_depend>
+   <build_export_depend>pcl_ros</build_export_depend>
+-  <build_depend>d2frontend</build_depend>
+   <exec_depend>roscpp</exec_depend>
+   <exec_depend>rospy</exec_depend>
+   <exec_depend>pcl_ros</exec_depend>
+diff --git a/quadcam_depth_est/src/hitnet.cpp b/quadcam_depth_est/src/hitnet.cpp
+index 98846fc..a479754 100644
+--- a/quadcam_depth_est/src/hitnet.cpp
++++ b/quadcam_depth_est/src/hitnet.cpp
+@@ -36,13 +36,13 @@ int32_t HitnetTrt::init(const std::string& onnx_model_path, const std::string& t
+ 
+   //Create executors
+   for(int32_t i = 0; i < stream_number_; i++){
+-    HitnetExcutor excutor;
+-    int32_t ret = excutor.init(this->nv_engine_ptr_,std::string(kInputTensorName),std::string(kOutputTensorName));
++    auto executor = std::make_unique<HitnetExcutor>();
++    int32_t ret = executor->init(this->nv_engine_ptr_,std::string(kInputTensorName),std::string(kOutputTensorName));
+     if(ret != 0){
+       spdlog::error("Hitnet multistream Excutor init failed");
+       return -5;
+     }
+-    this->executors_.push_back(std::move(excutor));
++    this->executors_.push_back(std::move(executor));
+   }
+   printf("Success to init HitnetTrt\n");
+   return 0;
+@@ -54,7 +54,7 @@ int32_t HitnetTrt::doInference(const cv::Mat input[4]){
+     if(input[i].empty()){
+       return 0;
+     }
+-    int32_t ret = this->executors_[i].setInputImages(input[i]);
++    int32_t ret = this->executors_[i]->setInputImages(input[i]);
+     if(ret != 0){
+       std::cout << "setInputImages failed" << std::endl;
+       return -2;
+@@ -62,7 +62,7 @@ int32_t HitnetTrt::doInference(const cv::Mat input[4]){
+   }
+ 
+   for(int32_t i = 0; i < this->stream_number_; i++){
+-    int32_t ret = this->executors_[i].doInference();
++    int32_t ret = this->executors_[i]->doInference();
+     if(ret != 0){
+       std::cout << "doInference failed" << std::endl;
+       return -3;
+@@ -70,7 +70,7 @@ int32_t HitnetTrt::doInference(const cv::Mat input[4]){
+   }
+ 
+   for(int32_t i = 0; i < this->stream_number_; i++){
+-    int32_t ret = this->executors_[i].copyBack();
++    int32_t ret = this->executors_[i]->copyBack();
+     if(ret != 0){
+       std::cout << "doInference failed" << std::endl;
+       return -3;
+@@ -78,7 +78,7 @@ int32_t HitnetTrt::doInference(const cv::Mat input[4]){
+   }
+ 
+   for(int32_t i = 0; i < this->stream_number_; i++){
+-    int32_t ret = this->executors_[i].synchronize();
++    int32_t ret = this->executors_[i]->synchronize();
+     if(ret != 0){
+       std::cout << "synchronize failed" << std::endl;
+       return -4;
+@@ -94,7 +94,7 @@ int32_t HitnetTrt::doInference(const cv::Mat input[4]){
+ 
+ int32_t HitnetTrt::getOutput(cv::Mat output[4]){
+   for(int32_t i = 0; i < this->stream_number_; i++){
+-    int32_t ret = this->executors_[i].getOutput(output[i]);
++    int32_t ret = this->executors_[i]->getOutput(output[i]);
+     if(ret != 0){
+       std::cout << "getOutput failed" << std::endl;
+       return -5;
+@@ -104,11 +104,9 @@ int32_t HitnetTrt::getOutput(cv::Mat output[4]){
+ }
+ 
+ HitnetTrt::~HitnetTrt(){
+-  for(int32_t i = 0; i < this->stream_number_; i++){
+-    this->executors_[i].~HitnetExcutor();
+-  }
+-  usleep(100);
+-  this->nv_engine_ptr_->destroy();  //TODO: deconstruct bug here
++  executors_.clear();
++  nv_engine_ptr_.reset();
++  nv_runtime_ptr_.reset();
+ }
+ 
+ 
+@@ -119,12 +117,19 @@ int32_t HitnetTrt::deserializeEngine(const std::string& trt_engine_path){
+     engine_file.seekg(0, std::ios::end);
+     size_t size = engine_file.tellg();
+     engine_file.seekg(0, std::ios::beg);
+-    char * engine_data = new char[size];
+-    engine_file.read(engine_data, size);
++    std::vector<char> engine_data(size);
++    engine_file.read(engine_data.data(), size);
+     engine_file.close();
+-    IRuntime* nv_runtime = createInferRuntime(tensorrt_log::gLogger);
+-    this->nv_engine_ptr_ = std::shared_ptr<nvinfer1::ICudaEngine>(nv_runtime->deserializeCudaEngine(engine_data, size, nullptr));
+-    delete[] engine_data;
++    nv_runtime_ptr_ = std::shared_ptr<nvinfer1::IRuntime>(
++        createInferRuntime(tensorrt_log::gLogger),
++        [](nvinfer1::IRuntime* ptr) { if (ptr) ptr->destroy(); });
++    if (!nv_runtime_ptr_) {
++      spdlog::error("createInferRuntime failed");
++      return -3;
++    }
++    this->nv_engine_ptr_ = std::shared_ptr<nvinfer1::ICudaEngine>(
++        nv_runtime_ptr_->deserializeCudaEngine(engine_data.data(), size, nullptr),
++        [](nvinfer1::ICudaEngine* ptr) { if (ptr) ptr->destroy(); });
+     if(this->nv_engine_ptr_ == nullptr){
+       spdlog::error("deserializeCudaEngine failed");
+       return -3;
+@@ -159,19 +164,45 @@ int32_t HitnetTrt::buildEngine(const std::string& onnx_model_path, const std::st
+     spdlog::error("createParser failed");
+     return -4;
+   }
+-  auto profile = builder->createOptimizationProfile();
+-  if (profile == nullptr){
+-    spdlog::error("createOptimizationProfile failed");
+-    return -5;
+-  }
+-  profile->setDimensions(kInputTensorName, nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims4{1, 1, 240, 320});
+-  config->addOptimizationProfile(profile);
+-
+   auto parsed = parser->parseFromFile(onnx_model_path.c_str(), static_cast<int>(tensorrt_log::gLogger.getReportableSeverity()));
+   if (!parsed){
+     spdlog::error("parseFromFile failed");
+     return -6;
+   }
++  if (network->getNbInputs() != 1) {
++    spdlog::error("Expected one HITNet input, got {}", network->getNbInputs());
++    return -6;
++  }
++  const nvinfer1::Dims4 expected_input{1, 2, 240, 320};
++  auto* input_tensor = network->getInput(0);
++  auto input_dims = input_tensor->getDimensions();
++  bool dynamic_input = false;
++  for (int i = 0; i < input_dims.nbDims; ++i) {
++    dynamic_input = dynamic_input || input_dims.d[i] == -1;
++  }
++  if (dynamic_input) {
++    auto profile = builder->createOptimizationProfile();
++    if (profile == nullptr ||
++        !profile->setDimensions(input_tensor->getName(), nvinfer1::OptProfileSelector::kMIN, expected_input) ||
++        !profile->setDimensions(input_tensor->getName(), nvinfer1::OptProfileSelector::kOPT, expected_input) ||
++        !profile->setDimensions(input_tensor->getName(), nvinfer1::OptProfileSelector::kMAX, expected_input) ||
++        config->addOptimizationProfile(profile) < 0) {
++      spdlog::error("Failed to configure the dynamic HITNet input profile");
++      return -5;
++    }
++  } else {
++    if (input_dims.nbDims != expected_input.nbDims) {
++      spdlog::error("Unexpected HITNet input rank {}", input_dims.nbDims);
++      return -5;
++    }
++    for (int i = 0; i < input_dims.nbDims; ++i) {
++      if (input_dims.d[i] != expected_input.d[i]) {
++        spdlog::error("Unexpected static HITNet input dimension at {}: {}", i,
++                      input_dims.d[i]);
++        return -5;
++      }
++    }
++  }
+   config ->setMaxWorkspaceSize(1024_MiB);
+   config ->setFlag(nvinfer1::BuilderFlag::kFP16);
+   config ->setFlag(nvinfer1::BuilderFlag::kSTRICT_TYPES);
+@@ -187,22 +218,25 @@ int32_t HitnetTrt::buildEngine(const std::string& onnx_model_path, const std::st
+     spdlog::error("buildSerializedNetwork failed");
+     return -8;
+   }
+-  tensorrt_common::TensorRTUniquePtr<IRuntime> runtime{createInferRuntime(tensorrt_log::gLogger.getTRTLogger())};
+-  if (runtime == nullptr){
++  nv_runtime_ptr_ = std::shared_ptr<nvinfer1::IRuntime>(
++      createInferRuntime(tensorrt_log::gLogger.getTRTLogger()),
++      [](nvinfer1::IRuntime* ptr) { if (ptr) ptr->destroy(); });
++  if (nv_runtime_ptr_ == nullptr){
+     spdlog::error("createInferRuntime failed");
+     return -9;
+   }
+-  this->nv_engine_ptr_ = std::shared_ptr<nvinfer1::ICudaEngine>(runtime->deserializeCudaEngine(plan->data(), plan->size(), nullptr));
++  this->nv_engine_ptr_ = std::shared_ptr<nvinfer1::ICudaEngine>(
++      nv_runtime_ptr_->deserializeCudaEngine(plan->data(), plan->size(), nullptr),
++      [](nvinfer1::ICudaEngine* ptr) { if (ptr) ptr->destroy(); });
+   if (this->nv_engine_ptr_ == nullptr){
+     spdlog::error("deserializeCudaEngine failed");
+     return -10;
+   }
+ 
+   //Save engine to file
+-  nvinfer1::IHostMemory* engine_data = this->nv_engine_ptr_->serialize();
+   std::ofstream engine_file(trt_engine_path.c_str(), std::ios::binary);
+   if (engine_file.is_open()){
+-    engine_file.write(static_cast<const char*>(engine_data->data()), engine_data->size());
++    engine_file.write(static_cast<const char*>(plan->data()), plan->size());
+     engine_file.close();
+     spdlog::info("Success to save engine to file: {}", trt_engine_path);
+   } else {
+@@ -214,6 +248,19 @@ int32_t HitnetTrt::buildEngine(const std::string& onnx_model_path, const std::st
+ 
+ 
+ 
++HitnetExcutor::~HitnetExcutor(){
++  buffer_manager_ptr_.reset();
++  if (nv_context_ptr_ != nullptr) {
++    nv_context_ptr_->destroy();
++    nv_context_ptr_ = nullptr;
++  }
++  if (stream_ != nullptr) {
++    cudaStreamDestroy(stream_);
++    stream_ = nullptr;
++  }
++  engine_ptr_.reset();
++}
++
+ int32_t HitnetExcutor::init(std::shared_ptr<nvinfer1::ICudaEngine> engine_ptr, 
+   std::string input_tensor_name,
+   std::string output_tensor_name){
+@@ -223,8 +270,7 @@ int32_t HitnetExcutor::init(std::shared_ptr<nvinfer1::ICudaEngine> engine_ptr,
+     std::cout << "createExecutionContext failed" << std::endl;
+     return -1;
+   }
+-  cudaStreamCreate(&this->stream_);
+-  if(this->stream_ == nullptr){
++  if(cudaStreamCreate(&this->stream_) != cudaSuccess){
+     std::cout << "cudaStreamCreate failed" << std::endl;
+     return -2;
+   }
+@@ -243,19 +289,43 @@ int32_t HitnetExcutor::init(std::shared_ptr<nvinfer1::ICudaEngine> engine_ptr,
+     return -4;
+   }
+   auto input_dim = this->engine_ptr_->getBindingDimensions(this->input_index_);
+-  //Easy Coredump is donnot know your data type
+-  this->input_size_ = input_dim.d[0] * input_dim.d[1] * input_dim.d[2] * input_dim.d[3] * sizeof(float); 
++  if (this->engine_ptr_->getBindingDataType(this->input_index_) !=
++          nvinfer1::DataType::kFLOAT ||
++      input_dim.nbDims != 4 || input_dim.d[0] != 1 ||
++      input_dim.d[1] != 2 || input_dim.d[2] != 240 ||
++      input_dim.d[3] != 320) {
++    std::cout << "Unexpected HITNet input; expected float32 [1,2,240,320]"
++              << std::endl;
++    return -5;
++  }
++  this->input_size_ = this->buffer_manager_ptr_->size(this->input_tensor_name_);
+   this->output_index_ = this->engine_ptr_->getBindingIndex(output_tensor_name.c_str());
+   if(this->output_index_  < 0){
+     std::cout << "getBindingIndex failed" << std::endl;
+     return -5;
+   }
+   auto output_dim = this->engine_ptr_->getBindingDimensions(this->output_index_ );
+-  this->output_size_ = output_dim.d[0] * output_dim.d[1] * output_dim.d[2] * output_dim.d[3] * sizeof(float);
++  if (this->engine_ptr_->getBindingDataType(this->output_index_) !=
++          nvinfer1::DataType::kFLOAT ||
++      output_dim.nbDims != 4 || output_dim.d[0] != 1 ||
++      output_dim.d[1] != 240 || output_dim.d[2] != 320 ||
++      output_dim.d[3] != 1) {
++    std::cout << "Unexpected HITNet output; expected float32 [1,240,320,1]"
++              << std::endl;
++    return -6;
++  }
++  this->output_size_ = this->buffer_manager_ptr_->size(this->output_tensor_name_);
++  this->output_height_ = output_dim.d[1];
++  this->output_width_ = output_dim.d[2];
+   return 0;
+ }
+ 
+ int32_t HitnetExcutor::setInputImages(const cv::Mat& input){
++  if (!input.isContinuous() || input.depth() != CV_32F ||
++      input.total() * input.elemSize() != static_cast<size_t>(input_size_)) {
++    std::cout << "Unexpected HITNet input buffer layout or size" << std::endl;
++    return -1;
++  }
+   memcpy(this->buffer_manager_ptr_->getHostBuffer(this->input_tensor_name_), input.data, this->input_size_);
+   buffer_manager_ptr_->copyInputToDeviceAsync(this->stream_);
+   return 0;
+@@ -280,7 +350,11 @@ int32_t HitnetExcutor::synchronize(){
+ }
+ 
+ int32_t HitnetExcutor::getOutput(cv::Mat& output){
++  if (output.empty() || output.rows != output_height_ ||
++      output.cols != output_width_ || output.type() != CV_32F) {
++    output = cv::Mat(output_height_, output_width_, CV_32F);
++  }
+   memcpy(output.data, this->buffer_manager_ptr_->getHostBuffer(this->output_tensor_name_), this->output_size_);
+   return 0;
+ }
+-}
+\ No newline at end of file
++}
+diff --git a/quadcam_depth_est/src/quadcam_depth_est_trt.cpp b/quadcam_depth_est/src/quadcam_depth_est_trt.cpp
+index 3bd9391..72b2982 100644
+--- a/quadcam_depth_est/src/quadcam_depth_est_trt.cpp
++++ b/quadcam_depth_est/src/quadcam_depth_est_trt.cpp
+@@ -1,13 +1,16 @@
+ #include "quadcam_depth_est_trt.hpp"
+ #include <d2common/fisheye_undistort.h>
+ #include <image_transport/image_transport.h>
++#include <sensor_msgs/image_encodings.h>
+ #include <pcl_ros/point_cloud.h>
+ #include <pcl/point_types.h>
+ #include <pcl_conversions/pcl_conversions.h>
+-#include <d2frontend/d2frontend_params.h>
+ #include <NvInferRuntime.h>
+ #include <spdlog/spdlog.h>
++#include <stdexcept>
++#include <cmath>
+ 
++#include "camera_config_loader.hpp"
+ #include "pcl_utils.hpp"
+ 
+ 
+@@ -24,7 +27,7 @@ cv::Mat quadReadVingette(const std::string & mask_file, double avg_brightness) {
+     std::cout << photometric_calib.type() << std::endl;
+     if (photometric_calib.type() == CV_8U) {
+         photometric_calib.convertTo(photometric_calib, CV_32FC1, 1.0/255.0);
+-    } else if (photometric_calib.type() == CV_16S) {
++    } else if (photometric_calib.type() == CV_16U) {
+         photometric_calib.convertTo(photometric_calib, CV_32FC1, 1.0/65535.0);
+     }
+     cv::divide(avg_brightness, photometric_calib, photometric_inv);
+@@ -50,6 +53,43 @@ QuadcamDepthEstTrt::QuadcamDepthEstTrt(ros::NodeHandle & nh):nh_(nh){
+   this->inference_rate_ = std::make_unique<ros::Rate>(ros::Rate(this->fps_));
+   this->publish_rate_ = std::make_unique<ros::Rate>(ros::Rate(this->fps_));
+   this->cnn_input_rgb_ = config["cnn_input_rgb"].as<bool>();
++  if (config["enable_photometric_calib"].IsDefined()) {
++    this->enable_photometric_calib_ =
++        config["enable_photometric_calib"].as<bool>();
++  }
++  if (config["enable_disparity_filter"].IsDefined()) {
++    this->enable_disparity_filter_ =
++        config["enable_disparity_filter"].as<bool>();
++  }
++  if (config["publish_debug_clouds"].IsDefined()) {
++    this->publish_debug_clouds_ =
++        config["publish_debug_clouds"].as<bool>();
++  }
++  if (config["min_disparity"].IsDefined()) {
++    this->min_disparity_ = config["min_disparity"].as<double>();
++  }
++  if (config["max_disparity"].IsDefined()) {
++    this->max_disparity_ = config["max_disparity"].as<double>();
++  }
++  if (config["max_median_deviation"].IsDefined()) {
++    this->max_median_deviation_ =
++        config["max_median_deviation"].as<double>();
++  }
++  if (config["max_photometric_error"].IsDefined()) {
++    this->max_photometric_error_ =
++        config["max_photometric_error"].as<double>();
++  }
++  if (config["min_texture_gradient"].IsDefined()) {
++    this->min_texture_gradient_ =
++        config["min_texture_gradient"].as<double>();
++  }
++  if (config["valid_roi_margin"].IsDefined()) {
++    this->valid_roi_margin_ = config["valid_roi_margin"].as<int>();
++  }
++  if (config["min_valid_component_size"].IsDefined()) {
++    this->min_valid_component_size_ =
++        config["min_valid_component_size"].as<int>();
++  }
+   
+   this->loadVirtualCameras(config,config_dir);
+   if(config["image_topic"].IsDefined()){
+@@ -58,15 +98,16 @@ QuadcamDepthEstTrt::QuadcamDepthEstTrt(ros::NodeHandle & nh):nh_(nh){
+   if(config["image_format"].IsDefined()){
+     this->image_format_ = config["image_format"].as<std::string>();
+   }
+-  //hitnet
+-  for(int i = 0 ; i<kCamerasNum; i++){
+-    this->output_tensors_[i] = cv::Mat(this->height_,this->width_,CV_32F);
+-  }
++  // HITNet is the production disparity backend.
+   this->onnx_path_ = config["onnx_path"].as<std::string>();
+   this->trt_engine_path_ = config["trt_engine_path"].as<std::string>();
+-
+   this->hitnet_ = std::make_unique<TensorRTHitnet::HitnetTrt>(true);
+-  this->hitnet_->init(onnx_path_,trt_engine_path_, 4);
++  const int hitnet_status =
++      this->hitnet_->init(onnx_path_, trt_engine_path_, 4);
++  if (hitnet_status != 0) {
++    throw std::runtime_error("HITNet initialization failed: " +
++                             std::to_string(hitnet_status));
++  }
+ 
+   //subscribe
+   image_transport::TransportHints hints(this->image_format_, ros::TransportHints().tcpNoDelay(true));
+@@ -79,9 +120,44 @@ QuadcamDepthEstTrt::QuadcamDepthEstTrt(ros::NodeHandle & nh):nh_(nh){
+     pcl_ = new PointCloud();
+     pcl_->points.reserve(virtual_stereos_.size() * width_ * height_);
+   }
++  if (publish_debug_clouds_) {
++    pcl_debug_color_ = new PointCloudRGB();
++    pcl_debug_color_->points.reserve(
++        virtual_stereos_.size() * width_ * height_);
++  }
+ 
+   //publisher
+   this->pub_pcl_ = nh_.advertise<sensor_msgs::PointCloud2>(kPointCloudTopic_, 1);
++  for (int i = 0; i < kCamerasNum; ++i) {
++    const std::string prefix =
++        "/depth_estimation/stereo_" + std::to_string(i);
++    this->pub_rect_left_[i] =
++        image_transport_->advertise(prefix + "/left", 1);
++    this->pub_rect_right_[i] =
++        image_transport_->advertise(prefix + "/right", 1);
++    this->pub_disparity_[i] =
++        image_transport_->advertise(prefix + "/disparity", 1);
++    this->pub_depth_[i] =
++        image_transport_->advertise(prefix + "/depth", 1);
++  }
++  if (publish_debug_clouds_) {
++    this->pub_pcl_colored_ =
++        nh_.advertise<sensor_msgs::PointCloud2>(
++            "/depth_estimation/pointcloud_sectors", 1);
++    for (int i = 0; i < kCamerasNum; ++i) {
++      this->pub_sector_pcl_[i] =
++          nh_.advertise<sensor_msgs::PointCloud2>(
++              "/depth_estimation/pointcloud_sector_" + std::to_string(i), 1);
++    }
++  }
++  ROS_INFO(
++      "Disparity filter: enabled=%d disp=[%.2f, %.2f] "
++      "median_dev=%.2f photo_error=%.1f texture=%.1f roi_margin=%d "
++      "min_component=%d photometric_calib=%d",
++      enable_disparity_filter_, min_disparity_, max_disparity_,
++      max_median_deviation_, max_photometric_error_,
++      min_texture_gradient_, valid_roi_margin_,
++      min_valid_component_size_, enable_photometric_calib_);
+   printf("QuadcamDepthEtsTrt constructed\n");
+ };
+ 
+@@ -94,6 +170,10 @@ QuadcamDepthEstTrt::~QuadcamDepthEstTrt(){
+     delete pcl_color_;
+     pcl_color_ = nullptr;
+   }
++  if(pcl_debug_color_ != nullptr){
++    delete pcl_debug_color_;
++    pcl_debug_color_ = nullptr;
++  }
+   if (this->hitnet_ != nullptr){
+     this->hitnet_ = nullptr;
+   }
+@@ -101,9 +181,20 @@ QuadcamDepthEstTrt::~QuadcamDepthEstTrt(){
+ 
+ void QuadcamDepthEstTrt::loadVirtualCameras(YAML::Node & config, std::string configPath){
+   float avg_brightness = config["avg_brightness"].as<float>();
++  const int32_t extrinsic_parameter_type =
++      config["extrinsic_parameter_type"].IsDefined()
++          ? config["extrinsic_parameter_type"].as<int32_t>()
++          : 0;
++  if (extrinsic_parameter_type != 0 && extrinsic_parameter_type != 1) {
++    throw std::runtime_error(
++        "extrinsic_parameter_type must be 0 (Kalibr/OmniNxt) or 1");
++  }
++  printf("[QuadcamDepthEstTrt]: extrinsic_parameter_type=%d\n",
++         extrinsic_parameter_type);
+   std::string photometric_calib_path = config["photometric_calib_path"].as<std::string>();
+   //Read photometric calibration masks
+-  if (access(photometric_calib_path.c_str(),F_OK) == 0){
++  if (enable_photometric_calib_ &&
++      access(photometric_calib_path.c_str(),F_OK) == 0){
+     printf("[QuadcamDepthEstTrt]: loadVirtualCameras from %s\n",photometric_calib_path.c_str());
+     for(int i=0 ; i < kCamerasNum ; i++){
+       std::string mask_file = photometric_calib_path + "/" + std::string("cam_") + std::to_string(i) + std::string("_vig_mask.png");//search image "cam_i_vig_mask.png"
+@@ -111,12 +202,15 @@ void QuadcamDepthEstTrt::loadVirtualCameras(YAML::Node & config, std::string con
+         photometric_inv_vingette_[i] = quadReadVingette(mask_file, avg_brightness);
+         printf("[QuadcamDepthEstTrt]: read vignette mask from %s\n",mask_file.c_str());
+       } else {
+-        photometric_inv_vingette_[i] = cv::Mat (1280, 720, CV_8UC3, cv::Scalar(255, 255, 255));
++        photometric_inv_vingette_[i] = cv::Mat();
+       }
+     }
+   } else {
++    if (!enable_photometric_calib_) {
++      printf("[QuadcamDepthEstTrt]: photometric calibration disabled\n");
++    }
+     for(int i=0 ; i < kCamerasNum ; i++){
+-      photometric_inv_vingette_[i] = cv::Mat (1280, 720, CV_8UC3, cv::Scalar(255, 255, 255));
++      photometric_inv_vingette_[i] = cv::Mat();
+     }
+   }
+   //Read fisheye cameras intrinsic and extrinsic parameters
+@@ -130,7 +224,8 @@ void QuadcamDepthEstTrt::loadVirtualCameras(YAML::Node & config, std::string con
+       printf("[QuadcamDepthEstTrt] Load camera %s\n", camera_name.c_str());
+       //fisheye camera parameters
+       const YAML::Node & camera_parameters = cam_para.second;
+-      auto cam_model = D2FrontEnd::D2FrontendParams::readCameraConfig(camera_name,camera_parameters);
++      auto cam_model = readCameraConfig(
++          camera_name, camera_parameters, extrinsic_parameter_type);
+       this->raw_cameras_.push_back(cam_model.first); 
+       //load distotors and photometric calibration
+       double fov = config["fov"].as<double>();
+@@ -172,9 +267,35 @@ void QuadcamDepthEstTrt::loadVirtualCameras(YAML::Node & config, std::string con
+       auto stereo = new VirtualStereo(cam_idx_l, cam_idx_r, baseline, 
+           undistortors_[cam_idx_l], undistortors_[cam_idx_r], idx_l, idx_r);
+       auto att = undistortors_[cam_idx_l]->t[idx_l];
+-      stereo->extrinsic = raw_cam_extrinsics_[cam_idx_l] * Swarm::Pose(att, Vector3d(0, 0, 0));
+       stereo->enable_texture = enable_texture_;
+       stereo->initRecitfy(baseline, KD0.first, KD0.second, KD1.first, KD1.second);
++      // reprojectImageTo3D returns points in the rectified-left frame.
++      // R1 maps the original virtual-left frame into that rectified frame,
++      // hence R1^T is required before virtual-left -> fisheye -> IMU.
++      const cv::Mat & rectification = stereo->getLeftRectificationRotation();
++      if (rectification.rows != 3 || rectification.cols != 3 ||
++          rectification.type() != CV_64FC1) {
++        delete stereo;
++        throw std::runtime_error("Invalid left rectification rotation R1");
++      }
++      Matrix3d rectified_to_virtual;
++      for (int row = 0; row < 3; ++row) {
++        for (int col = 0; col < 3; ++col) {
++          rectified_to_virtual(row, col) =
++              rectification.at<double>(col, row);
++        }
++      }
++      stereo->extrinsic =
++          raw_cam_extrinsics_[cam_idx_l] *
++          Swarm::Pose(att, Vector3d(0, 0, 0)) *
++          Swarm::Pose(rectified_to_virtual, Vector3d(0, 0, 0));
++      const Vector3d optical_axis =
++          stereo->extrinsic.R() * Vector3d(0, 0, 1);
++      printf(
++          "[QuadCamDepthEst] Stereo %d optical axis in imu: "
++          "[%+.6f, %+.6f, %+.6f]\n",
++          stereo->stereo_id, optical_axis.x(), optical_axis.y(),
++          optical_axis.z());
+       virtual_stereos_.emplace_back(stereo);
+     }
+     printf("[QuadCamDepthEst] Init virtual cameras successfully\n");
+@@ -239,6 +360,7 @@ void QuadcamDepthEstTrt::quadcamImageCb(const sensor_msgs::ImageConstPtr & image
+ void QuadcamDepthEstTrt::rawImageProcessThread(){
+   while(raw_image_process_thread_running_){
+     static cv::Mat raw_image;
++    static std_msgs::Header raw_header;
+     /* Because raw_image_ always get new memory addr, 
+       so here we handle the memory and release raw_image_ for cb */
+     if (raw_image_mutex_.try_lock()){
+@@ -248,6 +370,7 @@ void QuadcamDepthEstTrt::rawImageProcessThread(){
+         continue;
+       } else {
+         raw_image = raw_image_;
++        raw_header = raw_image_header_;
+         this->raw_image_mutex_.unlock();
+       }
+     } else {
+@@ -255,8 +378,17 @@ void QuadcamDepthEstTrt::rawImageProcessThread(){
+       continue;
+     }
+ 
++    if (raw_image.cols != 5120 || raw_image.rows != 720 ||
++        raw_image.type() != CV_8UC3) {
++      ROS_ERROR_THROTTLE(
++          1.0, "Expected assembled bgr8 image 5120x720, got %dx%d type=%d",
++          raw_image.cols, raw_image.rows, raw_image.type());
++      this->raw_image_process_rate_->sleep();
++      continue;
++    }
++
+     for(int32_t i = 0; i< kCamerasNum; i++){
+-      cv::Mat splited_image = raw_image(cv::Rect(i * raw_image_.cols /kCamerasNum, 0, 
++      cv::Mat splited_image = raw_image(cv::Rect(i * raw_image.cols /kCamerasNum, 0,
+         raw_image.cols /kCamerasNum, raw_image.rows));
+       if(!this->cnn_input_rgb_){
+         
+@@ -296,8 +428,10 @@ void QuadcamDepthEstTrt::rawImageProcessThread(){
+     for(auto && stereo: this->virtual_stereos_){
+       char window_name[20];
+       cv::Mat show_image;
+-      cv::Mat left(rectified_images_[stereo->cam_idx_a][stereo->cam_idx_a_right_half_id]);
+-      cv::Mat right(rectified_images_[stereo->cam_idx_b][stereo->cam_idx_b_left_half_id]);
++      cv::Mat left;
++      cv::Mat right;
++      rectified_images_[stereo->cam_idx_a][stereo->cam_idx_a_right_half_id].download(left);
++      rectified_images_[stereo->cam_idx_b][stereo->cam_idx_b_left_half_id].download(right);
+       cv::hconcat(left,right,show_image);
+       sprintf(window_name,"rectified_image_%d_%d",stereo->cam_idx_a,stereo->cam_idx_b);
+       cv::imshow(window_name,show_image);
+@@ -309,10 +443,10 @@ void QuadcamDepthEstTrt::rawImageProcessThread(){
+     cv::Mat temp_left , temp_right, input_image[4];
+ 
+     for (auto && stereo : this->virtual_stereos_){
+-      temp_left = cv::Mat(rectified_images_[stereo->cam_idx_a][stereo->cam_idx_a_right_half_id]);
+-      temp_right = cv::Mat(rectified_images_[stereo->cam_idx_b][stereo->cam_idx_b_left_half_id]);
+-      recity_images_for_show_and_texture_[stereo->cam_idx_a][stereo->cam_idx_a_right_half_id] = temp_left;
+-      recity_images_for_show_and_texture_[stereo->cam_idx_b][stereo->cam_idx_b_left_half_id] = temp_right;
++      rectified_images_[stereo->cam_idx_a][stereo->cam_idx_a_right_half_id].download(temp_left);
++      rectified_images_[stereo->cam_idx_b][stereo->cam_idx_b_left_half_id].download(temp_right);
++      recity_images_for_show_and_texture_[stereo->cam_idx_a][stereo->cam_idx_a_right_half_id] = temp_left.clone();
++      recity_images_for_show_and_texture_[stereo->cam_idx_b][stereo->cam_idx_b_left_half_id] = temp_right.clone();
+       // redundant undistort image is already in size
+       // cv::resize(temp_left,temp_left,cv::Size(this->width_,this->height_));
+       // cv::resize(temp_right,temp_right,cv::Size(this->width_,this->height_));
+@@ -326,7 +460,14 @@ void QuadcamDepthEstTrt::rawImageProcessThread(){
+     } else {
+       for (auto && stereo : this->virtual_stereos_){
+         input_image[stereo->stereo_id].convertTo(input_tensors_[stereo->stereo_id],CV_32FC1,1.0/255.0);
++        input_rect_left_[stereo->stereo_id] =
++            recity_images_for_show_and_texture_[stereo->cam_idx_a]
++                                                [stereo->cam_idx_a_right_half_id].clone();
++        input_rect_right_[stereo->stereo_id] =
++            recity_images_for_show_and_texture_[stereo->cam_idx_b]
++                                                [stereo->cam_idx_b_left_half_id].clone();
+       }
++      input_header_ = raw_header;
+       input_tensors_mutex_.unlock();
+     }
+     this->raw_image_process_rate_->sleep();
+@@ -336,6 +477,9 @@ void QuadcamDepthEstTrt::rawImageProcessThread(){
+ 
+ void QuadcamDepthEstTrt::inferrenceThread(){
+   static cv::Mat input_tensors[4];
++  static cv::Mat input_left[4];
++  static cv::Mat input_right[4];
++  static std_msgs::Header input_header;
+   while(inference_thread_running_){
+     if(input_tensors_mutex_.try_lock()){
+       //if input_tensors_ is empty, wait for next loop
+@@ -346,17 +490,39 @@ void QuadcamDepthEstTrt::inferrenceThread(){
+       }
+ 
+       for (auto stereo : this->virtual_stereos_){
+-        input_tensors[stereo->stereo_id] = input_tensors_[stereo->stereo_id];
++        input_tensors[stereo->stereo_id] = input_tensors_[stereo->stereo_id].clone();
++        input_left[stereo->stereo_id] =
++            input_rect_left_[stereo->stereo_id].clone();
++        input_right[stereo->stereo_id] =
++            input_rect_right_[stereo->stereo_id].clone();
+       }
++      input_header = input_header_;
+       input_tensors_mutex_.unlock();
+     } else {
+       this->inference_rate_->sleep();
+       continue;
+     }
+-    this->hitnet_->doInference(input_tensors);
++    if (this->hitnet_->doInference(input_tensors) != 0) {
++      ROS_ERROR_THROTTLE(1.0, "HITNet inference failed");
++      this->inference_rate_->sleep();
++      continue;
++    }
+ 
+     if (output_tensors_mutex_.try_lock()){
+-      this->hitnet_->getOutput(output_tensors_);
++      if (this->hitnet_->getOutput(output_tensors_) != 0) {
++        output_tensors_mutex_.unlock();
++        ROS_ERROR_THROTTLE(1.0, "Failed to copy HITNet output");
++        this->inference_rate_->sleep();
++        continue;
++      }
++      for (auto stereo : this->virtual_stereos_) {
++        output_rect_left_[stereo->stereo_id] =
++            input_left[stereo->stereo_id].clone();
++        output_rect_right_[stereo->stereo_id] =
++            input_right[stereo->stereo_id].clone();
++      }
++      output_header_ = input_header;
++      output_ready_.store(true, std::memory_order_release);
+       output_tensors_mutex_.unlock();
+     } else {
+       this->inference_rate_->sleep();
+@@ -367,11 +533,97 @@ void QuadcamDepthEstTrt::inferrenceThread(){
+   return ;
+ }
+ 
++cv::Mat QuadcamDepthEstTrt::buildDisparityValidityMask(
++    const cv::Mat & disparity, const cv::Mat & left, const cv::Mat & right,
++    const cv::Rect & stereo_roi) const {
++  CV_Assert(disparity.type() == CV_32FC1);
++  CV_Assert(left.type() == CV_8UC1 && right.type() == CV_8UC1);
++  CV_Assert(disparity.size() == left.size() && left.size() == right.size());
++
++  cv::Mat valid = cv::Mat::zeros(disparity.size(), CV_8UC1);
++  const cv::Rect bounds(0, 0, disparity.cols, disparity.rows);
++  cv::Rect roi = stereo_roi.empty() ? bounds : (stereo_roi & bounds);
++  if (valid_roi_margin_ > 0 && roi.width > 2 * valid_roi_margin_ &&
++      roi.height > 2 * valid_roi_margin_) {
++    roi.x += valid_roi_margin_;
++    roi.y += valid_roi_margin_;
++    roi.width -= 2 * valid_roi_margin_;
++    roi.height -= 2 * valid_roi_margin_;
++  }
++
++  cv::Mat median;
++  cv::medianBlur(disparity, median, 5);
++
++  // Separate histogram equalization makes this consistency test less
++  // sensitive to the four cameras' remaining gain/exposure differences.
++  cv::Mat left_equalized;
++  cv::Mat right_equalized;
++  cv::equalizeHist(left, left_equalized);
++  cv::equalizeHist(right, right_equalized);
++
++  cv::Mat grad_x;
++  cv::Mat grad_y;
++  cv::Sobel(left_equalized, grad_x, CV_32F, 1, 0, 3);
++  cv::Sobel(left_equalized, grad_y, CV_32F, 0, 1, 3);
++
++  for (int y = roi.y; y < roi.y + roi.height; ++y) {
++    const float *disp_row = disparity.ptr<float>(y);
++    const float *median_row = median.ptr<float>(y);
++    const float *gx_row = grad_x.ptr<float>(y);
++    const float *gy_row = grad_y.ptr<float>(y);
++    const uchar *left_row = left_equalized.ptr<uchar>(y);
++    uchar *valid_row = valid.ptr<uchar>(y);
++    for (int x = roi.x; x < roi.x + roi.width; ++x) {
++      const float d = disp_row[x];
++      if (!std::isfinite(d) || d < min_disparity_ ||
++          d > max_disparity_) {
++        continue;
++      }
++      if (std::abs(d - median_row[x]) > max_median_deviation_) {
++        continue;
++      }
++      const int right_x = cvRound(static_cast<float>(x) - d);
++      if (right_x < roi.x || right_x >= roi.x + roi.width) {
++        continue;
++      }
++      const float gradient =
++          std::abs(gx_row[x]) + std::abs(gy_row[x]);
++      if (gradient < min_texture_gradient_) {
++        continue;
++      }
++      const int photo_error =
++          std::abs(static_cast<int>(left_row[x]) -
++                   static_cast<int>(right_equalized.at<uchar>(y, right_x)));
++      if (photo_error > max_photometric_error_) {
++        continue;
++      }
++      valid_row[x] = 255;
++    }
++  }
++
++  if (min_valid_component_size_ > 1) {
++    cv::Mat labels;
++    cv::Mat stats;
++    cv::Mat centroids;
++    const int count = cv::connectedComponentsWithStats(
++        valid, labels, stats, centroids, 8, CV_32S);
++    cv::Mat filtered = cv::Mat::zeros(valid.size(), CV_8UC1);
++    for (int label = 1; label < count; ++label) {
++      if (stats.at<int>(label, cv::CC_STAT_AREA) >=
++          min_valid_component_size_) {
++        filtered.setTo(255, labels == label);
++      }
++    }
++    valid = filtered;
++  }
++  return valid;
++}
++
+ void QuadcamDepthEstTrt::publishThread(){
+   //TODO: publish pointcloud and do visualization
+   while(publish_thread_running_){
+     //if output_tensors_ is empty, wait for next loop
+-    if (this->output_tensors_[0].empty()){
++    if (!output_ready_.load(std::memory_order_acquire)){
+       this->publish_rate_->sleep();
+       continue;
+     }
+@@ -379,8 +631,13 @@ void QuadcamDepthEstTrt::publishThread(){
+     //copy data to local
+     if (output_tensors_mutex_.try_lock()){
+       for (auto stereo : this->virtual_stereos_){
+-        publish_disparity_[stereo->stereo_id] = output_tensors_[stereo->stereo_id];
++        publish_disparity_[stereo->stereo_id] = output_tensors_[stereo->stereo_id].clone();
++        publish_rect_left_[stereo->stereo_id] =
++            output_rect_left_[stereo->stereo_id].clone();
++        publish_rect_right_[stereo->stereo_id] =
++            output_rect_right_[stereo->stereo_id].clone();
+       }
++      publish_header_ = output_header_;
+       output_tensors_mutex_.unlock();
+     } else {
+       this->publish_rate_->sleep();
+@@ -404,18 +661,106 @@ void QuadcamDepthEstTrt::publishThread(){
+       this->publish_rate_->sleep();
+       continue;
+     }
+-    pcl_conversions::toPCL(raw_image_header_.stamp, pcl_->header.stamp);
++    pcl_conversions::toPCL(publish_header_.stamp, pcl_->header.stamp);
+     pcl_->header.frame_id = "imu";
+     pcl_->points.clear();
++    const bool colored_subscriber =
++        pub_pcl_colored_.getNumSubscribers() > 0;
++    if (pcl_debug_color_ != nullptr && colored_subscriber) {
++      pcl_conversions::toPCL(publish_header_.stamp,
++                             pcl_debug_color_->header.stamp);
++      pcl_debug_color_->header.frame_id = "imu";
++      pcl_debug_color_->points.clear();
++    }
+     //TODO: if enable texture 
+     for (auto stereo : this->virtual_stereos_){
++      const int id = stereo->stereo_id;
++      const cv::Mat &left = publish_rect_left_[id];
++      const cv::Mat &right = publish_rect_right_[id];
++      if (enable_disparity_filter_) {
++        publish_validity_mask_[id] = buildDisparityValidityMask(
++            publish_disparity_[id], left, right, stereo->getValidRoi());
++      } else {
++        publish_validity_mask_[id] =
++            cv::Mat(publish_disparity_[id].size(), CV_8UC1,
++                    cv::Scalar(255));
++      }
+       cv::Mat points;
+-      cv::reprojectImageTo3D(publish_disparity_[stereo->stereo_id], 
+-        points, stereo->getStereoPose(), 3);
+-      addPointsToPCL(points,recity_images_for_show_and_texture_[stereo->cam_idx_a][stereo->cam_idx_a_right_half_id], 
+-        stereo->extrinsic, *this->pcl_, this->pixel_step_, this->min_z_, this->max_z_);  
++      cv::reprojectImageTo3D(publish_disparity_[id],
++        points, stereo->getStereoPose(), false, CV_32F);
++      if (pub_rect_left_[id].getNumSubscribers() > 0 ||
++          pub_rect_right_[id].getNumSubscribers() > 0 ||
++          pub_disparity_[id].getNumSubscribers() > 0 ||
++          pub_depth_[id].getNumSubscribers() > 0) {
++        std_msgs::Header image_header = publish_header_;
++        image_header.frame_id =
++            "virtual_stereo_" + std::to_string(id);
++        if (pub_rect_left_[id].getNumSubscribers() > 0) {
++          pub_rect_left_[id].publish(
++              cv_bridge::CvImage(
++                  image_header, sensor_msgs::image_encodings::MONO8, left)
++                  .toImageMsg());
++        }
++        if (pub_rect_right_[id].getNumSubscribers() > 0) {
++          pub_rect_right_[id].publish(
++              cv_bridge::CvImage(
++                  image_header, sensor_msgs::image_encodings::MONO8, right)
++                  .toImageMsg());
++        }
++        if (pub_disparity_[id].getNumSubscribers() > 0) {
++          pub_disparity_[id].publish(
++              cv_bridge::CvImage(
++                  image_header, sensor_msgs::image_encodings::TYPE_32FC1,
++                  publish_disparity_[id])
++                  .toImageMsg());
++        }
++        if (pub_depth_[id].getNumSubscribers() > 0) {
++          cv::Mat depth;
++          cv::extractChannel(points, depth, 2);
++          pub_depth_[id].publish(
++              cv_bridge::CvImage(
++                  image_header, sensor_msgs::image_encodings::TYPE_32FC1,
++                  depth)
++                  .toImageMsg());
++        }
++      }
++      const std::size_t before = pcl_->points.size();
++      addPointsToPCL(points, left, stereo->extrinsic, *this->pcl_,
++        this->pixel_step_, this->min_z_, this->max_z_,
++        publish_validity_mask_[id]);
++
++      if (publish_debug_clouds_ &&
++          pub_sector_pcl_[id].getNumSubscribers() > 0) {
++        PointCloud sector;
++        pcl_conversions::toPCL(publish_header_.stamp,
++                               sector.header.stamp);
++        sector.header.frame_id = "imu";
++        addPointsToPCL(points, cv::Mat(), stereo->extrinsic, sector,
++            this->pixel_step_, this->min_z_, this->max_z_,
++            publish_validity_mask_[id]);
++        pub_sector_pcl_[id].publish(sector);
++      }
++
++      if (publish_debug_clouds_ && colored_subscriber) {
++        static const cv::Vec3b colors[kCamerasNum] = {
++          cv::Vec3b(0, 0, 255), cv::Vec3b(0, 255, 0),
++          cv::Vec3b(255, 0, 0), cv::Vec3b(0, 255, 255)
++        };
++        cv::Mat sector_color(left.size(), CV_8UC3, colors[id]);
++        addPointsToPCL(points, sector_color, stereo->extrinsic,
++            *pcl_debug_color_, this->pixel_step_, this->min_z_,
++            this->max_z_, publish_validity_mask_[id]);
++      }
++      ROS_INFO_THROTTLE(
++          2.0, "Stereo %d retained %zu/%d sampled points", id,
++          pcl_->points.size() - before,
++          ((width_ + pixel_step_ - 1) / pixel_step_) *
++          ((height_ + pixel_step_ - 1) / pixel_step_));
+     }
+     pub_pcl_.publish(*pcl_);
++    if (pcl_debug_color_ != nullptr && colored_subscriber) {
++      pub_pcl_colored_.publish(*pcl_debug_color_);
++    }
+     this->publish_rate_->sleep();
+   }
+   return ;
+diff --git a/quadcam_depth_est/src/virtual_stereo.cpp b/quadcam_depth_est/src/virtual_stereo.cpp
+index d6fd415..3d55047 100644
+--- a/quadcam_depth_est/src/virtual_stereo.cpp
++++ b/quadcam_depth_est/src/virtual_stereo.cpp
+@@ -4,7 +4,6 @@
+ #include <opencv2/core/eigen.hpp>
+ #include <opencv2/cudaarithm.hpp>
+ #include <opencv2/cudastereo.hpp>
+-#include <opencv2/calib3d.hpp>
+ #include <camodocal/camera_models/CataCamera.h>
+ #include <opencv2/ccalib/omnidir.hpp>
+ 
+@@ -155,7 +154,9 @@ std::pair<cv::Mat, cv::Mat> VirtualStereo::estimatePointsViaRaw(const cv::Mat &
+ std::pair<cv::Mat, cv::Mat>VirtualStereo::estimateDisparityViaRaw(const cv::Mat & left, const cv::Mat & right, const cv::Mat & left_color, bool show) {
+     // printf("[Debug] debug ouput\n");
+     auto ret = rectifyImage(left, right);
+-    cv::Mat limg_rect(ret[0]), rimg_rect(ret[1]);
++    cv::Mat limg_rect, rimg_rect;
++    ret[0].download(limg_rect);
++    ret[1].download(rimg_rect);
+ 
+     // cv::imshow("raw",left);
+     // cv::imshow("rectify",limg_rect);
+@@ -200,7 +201,8 @@ std::pair<cv::Mat, cv::Mat>VirtualStereo::estimateDisparityViaRaw(const cv::Mat
+             cv::cuda::GpuMat lcolor_gpu;
+             lcolor_gpu = undist_left->undist_id_cuda(left_color, undist_id_l, false);
+             lcolor_gpu.convertTo(lcolor_gpu, CV_8UC3);
+-            cv::Mat lcolor_rect(lcolor_gpu);
++            cv::Mat lcolor_rect;
++            lcolor_gpu.download(lcolor_rect);
+             return std::make_pair(disp, lcolor_rect);
+         } else {
+             return std::make_pair(disp, limg_rect);
+@@ -228,14 +230,20 @@ std::vector<cv::cuda::GpuMat> VirtualStereo::rectifyImage(const cv::Mat & left,
+     }
+     //Bug Here lamp_1 and lmap_2 generation faield
+ 
+-    cv::Mat undist_left(img_cuda_l);
+-    cv::imshow("undist_left",undist_left);
+-    printf("[Debug]undist_left size %d %d\n",undist_left.cols,undist_left.rows);
++#ifdef DEBUG
++    cv::Mat undist_left_cpu;
++    img_cuda_l.download(undist_left_cpu);
++    cv::imshow("undist_left", undist_left_cpu);
++    printf("[Debug]undist_left size %d %d\n", undist_left_cpu.cols,
++           undist_left_cpu.rows);
++#endif
+ 
+     cv::cuda::remap(img_cuda_l, leftRectify, cuda_lmap_1, cuda_lmap_2, cv::INTER_LINEAR);
+     cv::cuda::remap(img_cuda_r, rightRectify, cuda_rmap_1, cuda_rmap_2, cv::INTER_LINEAR);
+-    cv::Mat rectify_l(leftRectify);
+-    printf("[Debug]rectify image size:%d %d\n",rectify_l.cols,rectify_l.rows);
++#ifdef DEBUG
++    printf("[Debug]rectify image size:%d %d\n", leftRectify.cols,
++           leftRectify.rows);
++#endif
+ 
+     return {leftRectify, rightRectify};
+ }
+@@ -261,11 +269,13 @@ int32_t VirtualStereo::rectifyImage(const cv::Mat & left, const cv::Mat & right,
+     }
+     //Bug Here lamp_1 and lmap_2 generation faield
+ 
+-    #ifdef DEBUG
+-    cv::Mat undist_left(img_cuda_l);
+-    cv::imshow("undist_left",undist_left);
+-    printf("[Debug]undist_left size %d %d\n",undist_left.cols,undist_left.rows);
+-    #endif
++#ifdef DEBUG
++    cv::Mat undist_left_cpu;
++    img_cuda_l.download(undist_left_cpu);
++    cv::imshow("undist_left", undist_left_cpu);
++    printf("[Debug]undist_left size %d %d\n", undist_left_cpu.cols,
++           undist_left_cpu.rows);
++#endif
+ 
+     cv::cuda::remap(img_cuda_l, rect_left, cuda_lmap_1, cuda_lmap_2, cv::INTER_LINEAR);
+     cv::cuda::remap(img_cuda_r, rect_right, cuda_rmap_1, cuda_rmap_2, cv::INTER_LINEAR);
+@@ -300,18 +310,19 @@ int32_t VirtualStereo::showDispartiy(const cv::Mat & disparity,
+ 
+ cv::Mat VirtualStereo::estimateDisparityOCV(const cv::Mat & left, const cv::Mat & right) {
+     auto sgbm = cv::StereoSGBM::create(config.minDisparity, config.numDisparities, config.blockSize,
+-        config.P1, config.P2, config.disp12MaxDiff, config.preFilterCap, config.uniquenessRatio, 
++        config.P1, config.P2, config.disp12MaxDiff, config.preFilterCap, config.uniquenessRatio,
+         config.speckleWindowSize, config.speckleRange, config.mode);
+-    cv::Mat disparity;
++    cv::Mat disparity_fixed;
+     if (left.type() == CV_32FC1) {
+         cv::Mat left_show, right_show;
+         left.convertTo(left_show, CV_8U);
+         right.convertTo(right_show, CV_8U);
+-        sgbm->compute(left_show, right_show, disparity);
++        sgbm->compute(left_show, right_show, disparity_fixed);
+     } else {
+-        sgbm->compute(left, right, disparity);
++        sgbm->compute(left, right, disparity_fixed);
+     }
+-    disparity = disparity / 16.0;
++    cv::Mat disparity;
++    disparity_fixed.convertTo(disparity, CV_32FC1, 1.0 / 16.0);
+     return disparity;
+ }
+ 
+@@ -320,4 +331,3 @@ cv::Mat VirtualStereo::estimateDisparity(const cv::Mat & left, const cv::Mat & r
+ }
+ 
+ }
+-
