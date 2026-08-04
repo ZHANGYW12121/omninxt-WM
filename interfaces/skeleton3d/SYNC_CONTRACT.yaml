@@ -48,9 +48,20 @@ skeleton:
   topology: COCO17
   output_schema: omninxt.skeleton3d.v1
   network_transport: newline_delimited_JSON_over_TCP
+  network:
+    producer_role: TCP_client
+    consumer_role: TCP_server
+    default_port: 9765
+    encoding: UTF-8
+    framing: one_JSON_object_per_line
+    maximum_packet_bytes: 2097152
+    producer_backpressure: retain_latest_frame_only
+    reconnect: automatic
+    authentication: none_private_LAN_only
   stgcn_layout: [N, C, T, V, M]
   stgcn_channels: [x_m, y_m, z_m, confidence, coordinate_valid]
   joint_count: 17
+  person_id: non_negative_integer_minus_one_reserved_for_empty_consumer_slot
   default_window_frames: 30
   default_max_people: 4
   source_codes:

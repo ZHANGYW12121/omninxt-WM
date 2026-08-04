@@ -9,6 +9,14 @@ LEGACY_DATABASE="${LEGACY_DATABASE:-$ISAACSIM_ROOT/database}"
 D2SLAM_ROOT="${D2SLAM_ROOT:-$ZYW_ROOT/our_omni_depth/D2SLAM}"
 OMNINXT_DATASET_ROOT="${OMNINXT_DATASET_ROOT:-$ZYW_ROOT/database_quadcamera}"
 OMNIDEPTH_GPU="${OMNIDEPTH_GPU:-0}"
+SKELETON_RECEIVER_HOST="${SKELETON_RECEIVER_HOST:-0.0.0.0}"
+SKELETON_RECEIVER_PORT="${SKELETON_RECEIVER_PORT:-9765}"
+SKELETON_MAX_PEOPLE="${SKELETON_MAX_PEOPLE:-20}"
+SKELETON_RUNTIME_DIR="${SKELETON_RUNTIME_DIR:-$REPO_ROOT/.local/run/skeleton_receiver}"
+PERCEPTION_RECEIVER_HOST="${PERCEPTION_RECEIVER_HOST:-0.0.0.0}"
+PERCEPTION_RECEIVER_PORT="${PERCEPTION_RECEIVER_PORT:-9766}"
+PERCEPTION_RUNTIME_DIR="${PERCEPTION_RUNTIME_DIR:-$REPO_ROOT/.local/run/perception_receiver}"
+PERCEPTION_MATCH_TOLERANCE_MS="${PERCEPTION_MATCH_TOLERANCE_MS:-120}"
 
 usage() {
   cat <<'EOF'
@@ -21,6 +29,14 @@ Usage: tools/configure_machine.sh [options]
   --d2slam-root PATH       Patched D2SLAM checkout containing config and models
   --dataset-root PATH      Dataset/output location
   --omnidepth-gpu INDEX    Docker GPU index (server normally 1, laptop normally 0)
+  --skeleton-host ADDRESS  Nano skeleton listen address (default: 0.0.0.0)
+  --skeleton-port PORT     Nano skeleton TCP port (default: 9765)
+  --skeleton-max-people N  Online Human slots (default: 20)
+  --skeleton-runtime PATH  Machine-local latest-frame/status directory
+  --perception-host ADDR   Nano image/depth listen address (default: 0.0.0.0)
+  --perception-port PORT   Nano OPB1 TCP port (default: 9766)
+  --perception-runtime P   Machine-local image/depth snapshot directory
+  --perception-match-ms N  Maximum image/depth timestamp delta (default: 120)
 
 This writes only .local/machine.env, which is ignored by Git.
 EOF
@@ -35,6 +51,14 @@ while [[ $# -gt 0 ]]; do
     --d2slam-root) D2SLAM_ROOT="$2"; shift 2 ;;
     --dataset-root) OMNINXT_DATASET_ROOT="$2"; shift 2 ;;
     --omnidepth-gpu) OMNIDEPTH_GPU="$2"; shift 2 ;;
+    --skeleton-host) SKELETON_RECEIVER_HOST="$2"; shift 2 ;;
+    --skeleton-port) SKELETON_RECEIVER_PORT="$2"; shift 2 ;;
+    --skeleton-max-people) SKELETON_MAX_PEOPLE="$2"; shift 2 ;;
+    --skeleton-runtime) SKELETON_RUNTIME_DIR="$2"; shift 2 ;;
+    --perception-host) PERCEPTION_RECEIVER_HOST="$2"; shift 2 ;;
+    --perception-port) PERCEPTION_RECEIVER_PORT="$2"; shift 2 ;;
+    --perception-runtime) PERCEPTION_RUNTIME_DIR="$2"; shift 2 ;;
+    --perception-match-ms) PERCEPTION_MATCH_TOLERANCE_MS="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -46,6 +70,27 @@ PX4_DIR="$(realpath -m "$PX4_DIR")"
 LEGACY_DATABASE="$(realpath -m "$LEGACY_DATABASE")"
 D2SLAM_ROOT="$(realpath -m "$D2SLAM_ROOT")"
 OMNINXT_DATASET_ROOT="$(realpath -m "$OMNINXT_DATASET_ROOT")"
+SKELETON_RUNTIME_DIR="$(realpath -m "$SKELETON_RUNTIME_DIR")"
+PERCEPTION_RUNTIME_DIR="$(realpath -m "$PERCEPTION_RUNTIME_DIR")"
+
+[[ "$SKELETON_RECEIVER_PORT" =~ ^[0-9]+$ ]] && \
+  (( SKELETON_RECEIVER_PORT >= 1 && SKELETON_RECEIVER_PORT <= 65535 )) || {
+  echo "Invalid skeleton receiver port: $SKELETON_RECEIVER_PORT" >&2
+  exit 2
+}
+[[ "$SKELETON_MAX_PEOPLE" =~ ^[0-9]+$ ]] && (( SKELETON_MAX_PEOPLE >= 1 )) || {
+  echo "Invalid skeleton max people: $SKELETON_MAX_PEOPLE" >&2
+  exit 2
+}
+[[ "$PERCEPTION_RECEIVER_PORT" =~ ^[0-9]+$ ]] && \
+  (( PERCEPTION_RECEIVER_PORT >= 1 && PERCEPTION_RECEIVER_PORT <= 65535 )) || {
+  echo "Invalid perception receiver port: $PERCEPTION_RECEIVER_PORT" >&2
+  exit 2
+}
+[[ "$PERCEPTION_MATCH_TOLERANCE_MS" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+  echo "Invalid perception match tolerance: $PERCEPTION_MATCH_TOLERANCE_MS" >&2
+  exit 2
+}
 
 WAREHOUSE_USD="$LEGACY_DATABASE/warehouse/warehouse.usd"
 OMNINXT_VISUAL_ASSET_DIR="$LEGACY_DATABASE/usd"
@@ -68,7 +113,7 @@ for path in "${required[@]}"; do
   [[ -e "$path" ]] || { echo "Missing required path: $path" >&2; exit 1; }
 done
 
-mkdir -p "$REPO_ROOT/.local"
+mkdir -p "$REPO_ROOT/.local" "$SKELETON_RUNTIME_DIR" "$PERCEPTION_RUNTIME_DIR"
 tmp="$REPO_ROOT/.local/machine.env.tmp.$$"
 umask 077
 {
@@ -83,6 +128,14 @@ umask 077
   printf 'export OMNINXT_DATASET_ROOT=%q\n' "$OMNINXT_DATASET_ROOT"
   printf 'export OMNINXT_DEPTH_EXPORT_ROOT=%q\n' "$REPO_ROOT/simulation/omnidepth/shared"
   printf 'export OMNIDEPTH_GPU=%q\n' "$OMNIDEPTH_GPU"
+  printf 'export SKELETON_RECEIVER_HOST=%q\n' "$SKELETON_RECEIVER_HOST"
+  printf 'export SKELETON_RECEIVER_PORT=%q\n' "$SKELETON_RECEIVER_PORT"
+  printf 'export SKELETON_MAX_PEOPLE=%q\n' "$SKELETON_MAX_PEOPLE"
+  printf 'export SKELETON_RUNTIME_DIR=%q\n' "$SKELETON_RUNTIME_DIR"
+  printf 'export PERCEPTION_RECEIVER_HOST=%q\n' "$PERCEPTION_RECEIVER_HOST"
+  printf 'export PERCEPTION_RECEIVER_PORT=%q\n' "$PERCEPTION_RECEIVER_PORT"
+  printf 'export PERCEPTION_RUNTIME_DIR=%q\n' "$PERCEPTION_RUNTIME_DIR"
+  printf 'export PERCEPTION_MATCH_TOLERANCE_MS=%q\n' "$PERCEPTION_MATCH_TOLERANCE_MS"
 } > "$tmp"
 mv "$tmp" "$REPO_ROOT/.local/machine.env"
 chmod 600 "$REPO_ROOT/.local/machine.env"

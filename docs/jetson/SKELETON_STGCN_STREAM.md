@@ -49,24 +49,18 @@ Source codes:
 
 No bone-length completion is inserted into this formal stream.
 
-## Start the backend receiver
+## Start the Alienware receiver
 
-Copy these two files to the backend while retaining the same directory:
-
-```text
-scripts/104_skeleton_backend_receiver.py
-scripts/skeleton_stream.py
-```
-
-On the backend computer:
+The old `scripts/104_skeleton_backend_receiver.py` remains a minimal ST-GCN
+demonstrator. The production receiver is versioned in the shared repository
+under `backend/skeleton_receiver/`; do not copy Nano implementation files into
+the backend. On Alienware:
 
 ```bash
-cd /path/to/OmniNxt
-python3 scripts/104_skeleton_backend_receiver.py \
-  --host 0.0.0.0 \
-  --port 9765 \
-  --window 30 \
-  --max-people 4
+cd /path/to/omninxt-WM
+./tools/configure_skeleton_receiver.sh --host 0.0.0.0 --port 9765 --max-people 20
+./tools/install_skeleton_receiver_service.sh
+journalctl --user -u omninxt-skeleton-receiver.service -f
 ```
 
 Allow TCP port 9765 only on the trusted onboard LAN.  This lightweight stream
@@ -105,8 +99,7 @@ must be trained/configured with `in_channels=5`; a clean 3-channel pretrained
 model cannot silently consume this tensor without adapting its input layer and
 training distribution.
 
-The reference receiver marks the exact location where `stgcn_model(tensor)`
-should be called.  For a production world model, keep both the absolute pelvis
-position and a pelvis-relative skeleton stream if global position and body
-motion are both important.
-
+The reference `StgcnWindow` output above remains useful for a standalone
+ST-GCN experiment. The current two-branch world model instead consumes the
+production receiver's `human_root [N,10]` together with root-relative
+`human_joints [N,17,7]`; see `backend/README.md` for the exact arrays.

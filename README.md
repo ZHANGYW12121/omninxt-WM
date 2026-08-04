@@ -16,6 +16,7 @@ Key entry points:
 - `simulation/isaacsim/database/run_navigation_benchmark.sh`
 - `navigation/README.md`
 - `world_model/README.md`
+- `backend/README.md`
 - `tools/configure_machine.sh`
 - `tools/fetch_navrl_checkpoint.sh`
 - `tools/doctor.sh`
