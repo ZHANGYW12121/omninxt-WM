@@ -102,9 +102,12 @@ docker exec \
   -e PYTHONUNBUFFERED=1 \
   -e STEREO_POSE_PORT="${port}" \
   -e STEREO_POSE_DISPLAY_HZ="${STEREO_POSE_DISPLAY_HZ:-4}" \
-  -e STEREO_POSE_DET_INTERVAL="${STEREO_POSE_DET_INTERVAL:-10}" \
+  -e STEREO_POSE_SECTOR_DET_STRIDE="${STEREO_POSE_SECTOR_DET_STRIDE:-0}" \
   -e STEREO_POSE_CENTER_DET_INTERVAL="${STEREO_POSE_CENTER_DET_INTERVAL:-10}" \
   -e STEREO_POSE_RESCUE_DET_INTERVAL="${STEREO_POSE_RESCUE_DET_INTERVAL:-3}" \
+  -e STEREO_POSE_DET_HIGH="${STEREO_POSE_DET_HIGH:-0.24}" \
+  -e STEREO_POSE_DET_LOW="${STEREO_POSE_DET_LOW:-0.12}" \
+  -e STEREO_POSE_TRACK_HOLD_FRAMES="${STEREO_POSE_TRACK_HOLD_FRAMES:-8}" \
   -e STEREO_POSE_WEB="${web}" \
   -e STEREO_POSE_BACKEND_HOST="${backend_host}" \
   -e STEREO_POSE_BACKEND_PORT="${backend_port}" \
@@ -130,9 +133,12 @@ docker exec \
       --pose-engine "${STEREO_POSE_POSE_ENGINE}" \
       --web-port "${STEREO_POSE_PORT}" \
       --display-hz "${STEREO_POSE_DISPLAY_HZ}" \
-      --det-interval "${STEREO_POSE_DET_INTERVAL}" \
+      --sector-det-stride "${STEREO_POSE_SECTOR_DET_STRIDE}" \
       --center-det-interval "${STEREO_POSE_CENTER_DET_INTERVAL}" \
       --rescue-det-interval "${STEREO_POSE_RESCUE_DET_INTERVAL}" \
+      --det-threshold "${STEREO_POSE_DET_HIGH}" \
+      --det-low-threshold "${STEREO_POSE_DET_LOW}" \
+      --track-hold-frames "${STEREO_POSE_TRACK_HOLD_FRAMES}" \
       "${backend_args[@]}" \
       "${web_args[@]}"
   '

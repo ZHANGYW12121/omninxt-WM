@@ -1,0 +1,11 @@
+<launch>
+    <arg name="show" default="false" />
+    <arg name="depth_config" default="/root/swarm_ws/src/D2SLAM/config/quadcam_drone_nxt_tmp/quadcam_depth.yaml"/>
+    <arg name="output" default="screen" />
+    <arg name="enable_pointcloud_output" default="true" />
+    <node pkg="quadcam_depth_est" type="quadcam_depth_est_node" name="quadcam_depth_est" output="$(arg output)" >
+        <param name="show" value="$(arg show)"/>
+        <param name="depth_config" value="$(arg depth_config)"/>
+        <param name="enable_pointcloud_output" value="$(arg enable_pointcloud_output)"/>
+    </node>
+</launch>

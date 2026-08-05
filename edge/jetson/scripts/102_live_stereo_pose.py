@@ -27,6 +27,7 @@ from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
 from skeleton_stream import SkeletonTcpSender, build_skeleton_packet
+from motion_skeleton_tracker import MotionSkeletonTracker
 from trt_rtmpose import TensorRTRTMPose, TensorRTYOLOX
 
 
@@ -43,6 +44,122 @@ ANCHOR_NAMES = ("CAM_A_FRONT_RIGHT", "CAM_B_REAR_RIGHT",
                 "CAM_C_REAR_LEFT", "CAM_D_FRONT_LEFT")
 ANCHOR_COLORS = ((70, 80, 255), (90, 225, 90),
                  (255, 145, 75), (50, 225, 245))
+BODY_JOINT_IDS = tuple(range(5, 17))
+
+
+def image_identity_observation(camera_id, pose_person, anchor_track_id,
+                               identity_hint, allow_new_identity,
+                               appearance, cameras, focal, width, height):
+    points = np.asarray(pose_person["points"], dtype=np.float32)
+    scores = np.asarray(pose_person["scores"], dtype=np.float32)
+    valid = scores >= .22
+    if np.count_nonzero(valid) < 3:
+        return None
+    xy = points[valid]
+    low, high = np.min(xy, axis=0), np.max(xy, axis=0)
+    span = np.maximum(high - low, [12.0, 20.0])
+    box = np.r_[low - [.18 * span[0], .14 * span[1]],
+                high + [.18 * span[0], .14 * span[1]]]
+    box[(0, 2),] = np.clip(box[(0, 2),], 0, width - 1)
+    box[(1, 3),] = np.clip(box[(1, 3),], 0, height - 1)
+    center = np.median(xy, axis=0)
+    ray_camera = np.array([
+        (center[0] - width * .5) / focal,
+        (center[1] - height * .5) / focal,
+        1.0,
+    ], dtype=np.float64)
+    transform = np.asarray(
+        cameras["cam{}".format(camera_id)]["T_cam_imu"],
+        dtype=np.float64)
+    bearing = transform[:3, :3].T.dot(ray_camera)
+    bearing /= max(1e-9, np.linalg.norm(bearing))
+    return {
+        "camera_id": int(camera_id),
+        "token": (int(camera_id), int(anchor_track_id)),
+        "identity_hint": (None if identity_hint is None else
+                          int(identity_hint)),
+        "allow_new_identity": bool(allow_new_identity),
+        "appearance": appearance,
+        "bearing": bearing,
+        "box": box.astype(np.float32),
+        "points": points,
+        "scores": scores,
+        "quality": float(np.median(scores[valid])),
+    }
+
+
+def select_predepth_pose_entries(entries, width, height):
+    """Choose the most central camera view for each pre-depth identity."""
+    groups = defaultdict(list)
+    for entry in entries:
+        groups[int(entry["track_id"])].append(entry)
+    selected = []
+    for _track_id, values in groups.items():
+        for value in values:
+            scores = np.asarray(value["pose_person"]["scores"],
+                                dtype=np.float32)
+            valid = scores >= .28
+            if np.any(valid):
+                center = np.median(np.asarray(
+                    value["pose_person"]["points"], dtype=np.float32)[valid],
+                    axis=0)
+            else:
+                box = np.asarray(value["observation"]["box"],
+                                 dtype=np.float32)
+                center = .5 * (box[:2] + box[2:])
+            normalized = np.array([
+                (center[0] - width * .5) / max(1.0, width * .5),
+                (center[1] - height * .5) / max(1.0, height * .5),
+            ])
+            value["center_distance"] = float(np.linalg.norm(normalized))
+            value["valid_joint_count"] = int(np.count_nonzero(valid))
+            value["median_pose_score"] = float(
+                np.median(scores[valid]) if np.any(valid) else 0.0)
+        selected.append(min(values, key=lambda value: (
+            value["center_distance"], -value["valid_joint_count"],
+            -value["median_pose_score"])))
+    return selected
+
+
+def deduplicate_body_poses(people):
+    """Collapse duplicate RTMPose results without creating any identity state.
+
+    During an overlap/camera-boundary transition YOLO can produce a full-body
+    box and a partial-body box for the same person.  If their body joints lie
+    on the same image skeleton, keep the more confident pose for this frame.
+    Two already-tracked people that become indistinguishable for a moment are
+    intentionally represented by one observation; the motion tracker coasts
+    the other identity until they separate again.
+    """
+    retained = []
+    removed_detection_ids = []
+    for candidate in sorted(people, key=lambda value: -float(np.mean(
+            np.asarray(value["scores"], dtype=np.float32)[5:]))):
+        candidate_points = np.asarray(candidate["points"], dtype=np.float32)
+        candidate_scores = np.asarray(candidate["scores"], dtype=np.float32)
+        duplicate = False
+        for selected in retained:
+            selected_points = np.asarray(selected["points"], dtype=np.float32)
+            selected_scores = np.asarray(selected["scores"], dtype=np.float32)
+            common = ((candidate_scores[5:] >= .22) &
+                      (selected_scores[5:] >= .22))
+            if np.count_nonzero(common) < 4:
+                continue
+            first = candidate_points[5:][common]
+            second = selected_points[5:][common]
+            all_points = np.vstack((first, second))
+            body_height = max(35.0, float(
+                np.max(all_points[:, 1]) - np.min(all_points[:, 1])))
+            median_distance = float(np.median(
+                np.linalg.norm(first - second, axis=1)))
+            if median_distance / body_height <= .18:
+                duplicate = True
+                break
+        if duplicate:
+            removed_detection_ids.append(int(candidate["detection_id"]))
+        else:
+            retained.append(candidate)
+    return retained, removed_detection_ids
 
 
 def parse_args():
@@ -53,12 +170,16 @@ def parse_args():
     parser.add_argument("--web-port", type=int, default=8766)
     parser.add_argument("--no-web", action="store_true")
     parser.add_argument("--display-hz", type=float, default=4.0)
-    # YOLOX scans the 2x2 mosaic containing every direction.  RTMPose keeps
-    # updating both stereo views on the intervening frames, so a 10-frame
-    # detector cadence does not disable any sector and leaves enough GPU time
-    # for the 10 Hz stereo-pose path alongside the 5 Hz dense HITNet path.
+    # One full-resolution physical-camera view is scanned per scheduled frame.
+    # Round-robin scheduling preserves small-person pixels while keeping the
+    # detector budget to one YOLOX invocation per pose frame.
     parser.add_argument("--det-interval", type=int, default=10)
-    parser.add_argument("--det-threshold", type=float, default=0.28)
+    parser.add_argument(
+        "--det-threshold", type=float, default=0.24,
+        help="high-confidence threshold used to create a new person track")
+    parser.add_argument(
+        "--det-low-threshold", type=float, default=0.12,
+        help="low-confidence threshold used only to refresh an existing track")
     parser.add_argument("--person-threshold", type=float, default=0.32)
     parser.add_argument("--keypoint-threshold", type=float, default=0.28)
     parser.add_argument("--min-depth", type=float, default=0.25)
@@ -74,6 +195,15 @@ def parse_args():
     parser.add_argument("--anchor-fov", type=float, default=120.0)
     parser.add_argument("--center-det-interval", type=int, default=10)
     parser.add_argument("--rescue-det-interval", type=int, default=3)
+    parser.add_argument(
+        "--sector-det-stride", type=int, default=0,
+        help="0 uses adaptive mosaic/rescue scheduling; N forces one full-resolution camera every N frames")
+    parser.add_argument("--track-hold-frames", type=int, default=8)
+    parser.add_argument("--track-confirm-hits", type=int, default=2)
+    parser.add_argument("--track-iou-threshold", type=float, default=0.12)
+    parser.add_argument("--track-center-threshold", type=float, default=0.70)
+    parser.add_argument("--min-person-width", type=float, default=10.0)
+    parser.add_argument("--min-person-height", type=float, default=18.0)
     parser.add_argument("--backend-host", default="",
                         help="Optional backend IP/hostname for skeleton TCP")
     parser.add_argument("--backend-port", type=int, default=9765)
@@ -138,6 +268,7 @@ class InputBridge:
         self.buckets = defaultdict(dict)
         self.lock = threading.Lock()
         self.frames = queue.Queue(maxsize=1)
+        self.last_complete_stamp = -1
         self.depth = [None] * 4
         self.depth_stamp = [None] * 4
         self.subscribers = []
@@ -181,6 +312,11 @@ class InputBridge:
                 images[(index, "right")] = image[y:y + 240, 320:640]
         complete = None
         with self.lock:
+            # The depth node may republish its most recent derived mosaics
+            # while no new camera image is arriving.  A repeated/stale stamp
+            # is not a new observation and must never confirm or spawn an ID.
+            if stamp <= self.last_complete_stamp:
+                return
             self.buckets[stamp][kind] = images
             if self.required.issubset(self.buckets[stamp]):
                 bundles = self.buckets.pop(stamp)
@@ -188,6 +324,7 @@ class InputBridge:
                 complete_images.update(bundles["anchors"])
                 complete_images.update(bundles["stereo"])
                 complete = (stamp, complete_images)
+                self.last_complete_stamp = stamp
             for old in sorted(self.buckets)[:-12]:
                 self.buckets.pop(old, None)
         if complete is not None:
@@ -336,10 +473,364 @@ def replace_quadrant_boxes(boxes, sector, replacement,
     return np.asarray(retained, dtype=np.float32).reshape(-1, 4)
 
 
-def deduplicate_anchor_boxes(boxes, cameras, focal, view_width, view_height):
-    """Keep the most central view of one person before expensive RTMPose."""
+def box_iou(first, second):
+    x0 = max(float(first[0]), float(second[0]))
+    y0 = max(float(first[1]), float(second[1]))
+    x1 = min(float(first[2]), float(second[2]))
+    y1 = min(float(first[3]), float(second[3]))
+    intersection = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    first_area = max(0.0, float(first[2] - first[0])) * \
+        max(0.0, float(first[3] - first[1]))
+    second_area = max(0.0, float(second[2] - second[0])) * \
+        max(0.0, float(second[3] - second[1]))
+    return intersection / max(1e-6, first_area + second_area - intersection)
+
+
+class AnchorBoxTracker:
+    """High/low-score detector association with short constant-velocity hold.
+
+    A low-score box may refresh an established track but can never create a
+    new one.  RTMPose observations confirm provisional high-score tracks and
+    update their boxes on every 10 Hz pose frame.  A single detector miss no
+    longer erases a person immediately.
+    """
+
+    def __init__(self, width, height, high_threshold, low_threshold,
+                 hold_frames, confirm_hits, iou_threshold,
+                 center_threshold):
+        self.width = int(width)
+        self.height = int(height)
+        self.high_threshold = float(high_threshold)
+        self.low_threshold = float(low_threshold)
+        self.hold_frames = max(1, int(hold_frames))
+        self.confirm_hits = max(1, int(confirm_hits))
+        self.iou_threshold = float(iou_threshold)
+        self.center_threshold = float(center_threshold)
+        self.next_id = 1
+        self.tracks = {}
+
+    def _clip(self, box):
+        result = np.asarray(box, dtype=np.float32).copy()
+        result[(0, 2),] = np.clip(result[(0, 2),], 0, self.width - 1)
+        result[(1, 3),] = np.clip(result[(1, 3),], 0, self.height - 1)
+        if result[2] <= result[0]:
+            result[2] = min(self.width - 1, result[0] + 1)
+        if result[3] <= result[1]:
+            result[3] = min(self.height - 1, result[1] + 1)
+        return result
+
+    @staticmethod
+    def _center(box):
+        return np.array([(box[0] + box[2]) * .5,
+                         (box[1] + box[3]) * .5], dtype=np.float32)
+
+    def _predicted_box(self, track, frame_index):
+        elapsed = max(0, int(frame_index) - int(track["box_frame"]))
+        box = track["box"].copy()
+        if elapsed:
+            width = max(1.0, float(box[2] - box[0]))
+            height = max(1.0, float(box[3] - box[1]))
+            shift = track["velocity"] * elapsed
+            shift[0] = np.clip(shift[0], -width * .35, width * .35)
+            shift[1] = np.clip(shift[1], -height * .35, height * .35)
+            box[(0, 2),] += shift[0]
+            box[(1, 3),] += shift[1]
+        return self._clip(box)
+
+    def _measure(self, track, box, score, frame_index, high_hit=False,
+                 detector_hit=False):
+        box = self._clip(box)
+        previous = self._predicted_box(track, frame_index)
+        elapsed = max(1, int(frame_index) - int(track["box_frame"]))
+        measured_velocity = (self._center(box) - self._center(previous)) / elapsed
+        track["velocity"] = (.65 * track["velocity"] +
+                             .35 * measured_velocity)
+        track["box"] = box
+        track["box_frame"] = int(frame_index)
+        track["last_evidence_frame"] = int(frame_index)
+        track["score"] = float(score)
+        if high_hit:
+            track["high_hits"] += 1
+            if track["high_hits"] >= self.confirm_hits:
+                track["confirmed"] = True
+        if detector_hit:
+            track["last_detector_frame"] = int(frame_index)
+            track["detector_hits"] = int(track.get("detector_hits", 0)) + 1
+
+    def expire(self, frame_index):
+        self.tracks = {
+            track_id: track for track_id, track in self.tracks.items()
+            if int(frame_index) - track["last_evidence_frame"] <=
+            self.hold_frames
+        }
+
+    def update_sector(self, camera_id, boxes, scores, frame_index):
+        """Associate one full-resolution camera scan with existing tracks."""
+        self.expire(frame_index)
+        detections = [
+            (np.asarray(box, dtype=np.float32), float(score))
+            for box, score in zip(
+                np.asarray(boxes, dtype=np.float32).reshape(-1, 4),
+                np.asarray(scores, dtype=np.float32).reshape(-1))
+            if float(score) >= self.low_threshold
+        ]
+        sector_tracks = [
+            (track_id, track) for track_id, track in self.tracks.items()
+            if track["camera_id"] == int(camera_id)
+        ]
+        candidates = []
+        for detection_index, (box, _score) in enumerate(detections):
+            detection_center = self._center(box)
+            for track_id, track in sector_tracks:
+                predicted = self._predicted_box(track, frame_index)
+                overlap = box_iou(box, predicted)
+                scale = max(
+                    20.0, float(predicted[3] - predicted[1]),
+                    float(box[3] - box[1]))
+                center_distance = float(np.linalg.norm(
+                    detection_center - self._center(predicted))) / scale
+                if (overlap >= self.iou_threshold or
+                        center_distance <= self.center_threshold):
+                    cost = (1.0 - overlap) + .35 * center_distance
+                    candidates.append(
+                        (cost, detection_index, track_id))
+        matched_detections = set()
+        matched_tracks = set()
+        for _cost, detection_index, track_id in sorted(candidates):
+            if (detection_index in matched_detections or
+                    track_id in matched_tracks):
+                continue
+            box, score = detections[detection_index]
+            self._measure(
+                self.tracks[track_id], box, score, frame_index,
+                high_hit=score >= self.high_threshold, detector_hit=True)
+            matched_detections.add(detection_index)
+            matched_tracks.add(track_id)
+
+        for detection_index, (box, score) in enumerate(detections):
+            if (detection_index in matched_detections or
+                    score < self.high_threshold):
+                continue
+            track_id = self.next_id
+            self.next_id += 1
+            self.tracks[track_id] = {
+                "id": track_id,
+                "camera_id": int(camera_id),
+                "box": self._clip(box),
+                "box_frame": int(frame_index),
+                "last_evidence_frame": int(frame_index),
+                "velocity": np.zeros(2, dtype=np.float32),
+                "score": score,
+                "high_hits": 1,
+                "confirmed": self.confirm_hits <= 1,
+                "last_detector_frame": int(frame_index),
+                "detector_hits": 1,
+            }
+        self.expire(frame_index)
+
+    def pose_observation(self, track_id, person, frame_index):
+        track = self.tracks.get(int(track_id))
+        if track is None:
+            return
+        scores = np.asarray(person["scores"], dtype=np.float32)
+        points = np.asarray(person["points"], dtype=np.float32)
+        valid = scores >= .22
+        if np.count_nonzero(valid) < 3:
+            return
+        xy = points[valid]
+        low, high = np.min(xy, axis=0), np.max(xy, axis=0)
+        width = max(10.0, float(high[0] - low[0]))
+        height = max(18.0, float(high[1] - low[1]))
+        box = [low[0] - width * .28, low[1] - height * .28,
+               high[0] + width * .28, high[1] + height * .28]
+        self._measure(
+            track, box, float(np.median(scores[valid])), frame_index,
+            high_hit=False)
+        track["confirmed"] = True
+
+    def seed_world_projection(self, camera_id, box, frame_index,
+                              world_track_id):
+        """Keep a known 3D person alive while it crosses camera boundaries."""
+        self.expire(frame_index)
+        box = self._clip(box)
+        # At most one local ROI may represent a given world track in one
+        # physical camera.  Detector refreshes used to leave an older
+        # projection ROI alive beside the refreshed ROI, allowing duplicates
+        # to accumulate and feed RTMPose repeatedly.
+        same_world_tracks = [
+            (track_id, track) for track_id, track in self.tracks.items()
+            if track["camera_id"] == int(camera_id) and
+            track.get("world_track_hint") == int(world_track_id)
+        ]
+        if len(same_world_tracks) > 1:
+            keep_id, _ = max(
+                same_world_tracks,
+                key=lambda value: (
+                    value[1]["last_evidence_frame"],
+                    value[1].get("score", 0.0)))
+            for duplicate_id, _ in same_world_tracks:
+                if duplicate_id != keep_id:
+                    self.tracks.pop(duplicate_id, None)
+        candidates = []
+        for track_id, track in self.tracks.items():
+            if track["camera_id"] != int(camera_id):
+                continue
+            existing_world = track.get("world_track_hint")
+            if (existing_world is not None and
+                    int(existing_world) != int(world_track_id)):
+                # Two projected people may overlap while crossing.  Never
+                # overwrite one known world's camera ROI with the other ID.
+                continue
+            predicted = self._predicted_box(track, frame_index)
+            overlap = box_iou(box, predicted)
+            scale = max(20.0, float(box[3] - box[1]),
+                        float(predicted[3] - predicted[1]))
+            distance = float(np.linalg.norm(
+                self._center(box) - self._center(predicted))) / scale
+            same_world = track.get("world_track_hint") == int(world_track_id)
+            if same_world or overlap >= .18 or distance <= .42:
+                cost = (1.0 - overlap) + .3 * distance - \
+                    (.5 if same_world else 0.0)
+                candidates.append((cost, track_id))
+        if candidates:
+            _, track_id = min(candidates)
+            track = self.tracks[track_id]
+            # A fresh detector/pose box is more accurate than a projection.
+            # Only pull a stale box toward the projected ROI.
+            if int(frame_index) - track["box_frame"] > 1:
+                track["box"] = self._clip(
+                    .65 * track["box"] + .35 * box)
+                track["box_frame"] = int(frame_index)
+            track["last_evidence_frame"] = int(frame_index)
+            track["world_track_hint"] = int(world_track_id)
+            track["confirmed"] = True
+            return track_id
+        track_id = self.next_id
+        self.next_id += 1
+        self.tracks[track_id] = {
+            "id": track_id, "camera_id": int(camera_id), "box": box,
+            "box_frame": int(frame_index),
+            "last_evidence_frame": int(frame_index),
+            "velocity": np.zeros(2, dtype=np.float32), "score": 0.0,
+            "high_hits": self.confirm_hits, "confirmed": True,
+            "world_track_hint": int(world_track_id),
+            "last_detector_frame": None, "detector_hits": 0,
+        }
+        return track_id
+
+    def world_hint(self, track_id):
+        track = self.tracks.get(int(track_id))
+        return None if track is None else track.get("world_track_hint")
+
+    def may_create_world_track(self, track_id, frame_index):
+        """Only a YOLO observation from this exact frame may create a person."""
+        track = self.tracks.get(int(track_id))
+        if track is None or int(track.get("detector_hits", 0)) < 1:
+            return False
+        detector_frame = track.get("last_detector_frame")
+        return (detector_frame is not None and
+                int(detector_frame) == int(frame_index))
+
+    def bind_world_track(self, camera_id, track_id, world_track_id):
+        track = self.tracks.get(int(track_id))
+        if track is None or track["camera_id"] != int(camera_id):
+            return False
+        track["world_track_hint"] = int(world_track_id)
+        return True
+
+    def merge_duplicate_tracks(self, track_ids, frame_index,
+                               preferred_world_id=None):
+        """Collapse local ROIs proven to yield the same 2D skeleton."""
+        valid = sorted({int(value) for value in track_ids
+                        if value is not None and int(value) in self.tracks})
+        if not valid:
+            return None
+        preferred = [track_id for track_id in valid
+                     if preferred_world_id is not None and
+                     self.tracks[track_id].get("world_track_hint") ==
+                     int(preferred_world_id)]
+        pool = preferred or valid
+        keep_id = max(pool, key=lambda track_id: (
+            self.tracks[track_id].get("high_hits", 0),
+            int(self.tracks[track_id].get("confirmed", False)),
+            self.tracks[track_id].get("last_evidence_frame", -1),
+            -track_id))
+        keep = self.tracks[keep_id]
+        for duplicate_id in valid:
+            if duplicate_id == keep_id:
+                continue
+            duplicate = self.tracks.pop(duplicate_id)
+            keep["high_hits"] = max(
+                keep.get("high_hits", 0), duplicate.get("high_hits", 0))
+            keep["confirmed"] = bool(
+                keep.get("confirmed", False) or
+                duplicate.get("confirmed", False))
+            keep["last_evidence_frame"] = max(
+                keep.get("last_evidence_frame", -1),
+                duplicate.get("last_evidence_frame", -1))
+            keep["score"] = max(keep.get("score", 0.0),
+                                duplicate.get("score", 0.0))
+            keep["detector_hits"] = max(
+                keep.get("detector_hits", 0),
+                duplicate.get("detector_hits", 0))
+            detector_frames = [value for value in (
+                keep.get("last_detector_frame"),
+                duplicate.get("last_detector_frame"))
+                if value is not None]
+            keep["last_detector_frame"] = (
+                max(detector_frames) if detector_frames else None)
+        if preferred_world_id is not None:
+            keep["world_track_hint"] = int(preferred_world_id)
+        keep["last_evidence_frame"] = int(frame_index)
+        return keep_id
+
+    def mosaic_boxes(self, frame_index):
+        self.expire(frame_index)
+        boxes = []
+        track_ids = []
+        for track_id, track in sorted(self.tracks.items()):
+            local = self._predicted_box(track, frame_index)
+            camera_id = track["camera_id"]
+            offset = np.array([
+                (camera_id % 2) * self.width,
+                (camera_id // 2) * self.height,
+            ] * 2, dtype=np.float32)
+            boxes.append(local + offset)
+            track_ids.append(track_id)
+        return (np.asarray(boxes, dtype=np.float32).reshape(-1, 4),
+                track_ids)
+
+    def status(self, frame_index):
+        self.expire(frame_index)
+        counts = [0] * 4
+        confirmed = 0
+        for track in self.tracks.values():
+            counts[track["camera_id"]] += 1
+            confirmed += int(track["confirmed"])
+        return {
+            "active": len(self.tracks),
+            "confirmed": confirmed,
+            "by_camera": counts,
+        }
+
+    def has_confirmed_camera(self, camera_id, frame_index):
+        self.expire(frame_index)
+        return any(
+            track["camera_id"] == int(camera_id) and track["confirmed"]
+            for track in self.tracks.values()
+        )
+
+
+def deduplicate_anchor_indices(boxes, cameras, focal,
+                               view_width, view_height,
+                               identity_hints=None):
+    """Return indices for the most central view of each physical person."""
     candidates = []
-    for box in np.asarray(boxes, dtype=np.float32).reshape(-1, 4):
+    hints = list(identity_hints or [None] * len(boxes))
+    if len(hints) != len(boxes):
+        raise ValueError("identity_hints must match boxes")
+    for box_index, box in enumerate(
+            np.asarray(boxes, dtype=np.float32).reshape(-1, 4)):
         center_x = float(box[0] + box[2]) * .5
         center_y = float(box[1] + box[3]) * .5
         sector = (int(center_y >= view_height) * 2 +
@@ -364,14 +855,29 @@ def deduplicate_anchor_boxes(boxes, cameras, focal, view_width, view_height):
         centrality = edge_margin / min(view_width, view_height)
         score = centrality + .04 * math.log(max(1.0, width * height))
         candidates.append({
-            "box": box, "ray": ray_body, "height": height,
-            "score": score,
+            "index": box_index, "box": box, "ray": ray_body, "height": height,
+            "score": score, "identity_hint": hints[box_index],
         })
     retained = []
     cosine_limit = math.cos(math.radians(16.0))
     for candidate in sorted(candidates, key=lambda value: -value["score"]):
         duplicate = False
         for selected in retained:
+            # Never discard one known person merely because another known
+            # person has a similar bearing at a camera overlap/crossing.
+            if (candidate["identity_hint"] is not None and
+                    selected["identity_hint"] is not None and
+                    candidate["identity_hint"] !=
+                    selected["identity_hint"]):
+                continue
+            if (candidate["identity_hint"] is not None and
+                    candidate["identity_hint"] ==
+                    selected["identity_hint"]):
+                # A world track projected into two adjacent cameras is still
+                # one pose job.  Keep only the more central view even when a
+                # partial boundary crop shifts its estimated bearing.
+                duplicate = True
+                break
             height_ratio = candidate["height"] / selected["height"]
             same_bearing = float(np.dot(
                 candidate["ray"], selected["ray"])) >= cosine_limit
@@ -383,25 +889,71 @@ def deduplicate_anchor_boxes(boxes, cameras, focal, view_width, view_height):
                 break
         if not duplicate:
             retained.append(candidate)
-    return np.asarray([value["box"] for value in retained],
-                      dtype=np.float32).reshape(-1, 4)
+    return [value["index"] for value in retained]
 
 
-def detect_single_view(image, detector):
+def deduplicate_anchor_boxes(boxes, cameras, focal, view_width, view_height,
+                             identity_hints=None):
+    indices = deduplicate_anchor_indices(
+        boxes, cameras, focal, view_width, view_height, identity_hints)
+    source = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+    return source[indices] if indices else np.empty((0, 4), dtype=np.float32)
+
+
+def detect_single_view(image, detector, min_width=10.0, min_height=18.0):
     bgr = image if image.ndim == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
     started = time.monotonic()
     detected, classes = detector(bgr)
     detected = np.asarray(detected, dtype=np.float32).reshape(-1, 4)
     classes = np.asarray(classes, dtype=np.int32).reshape(-1)
-    boxes = detected[classes == 0]
+    scores = np.asarray(detector.last_scores, dtype=np.float32).reshape(-1)
+    if len(scores) != len(detected):
+        raise RuntimeError("YOLOX boxes/scores length mismatch")
+    person_mask = classes == 0
+    boxes = detected[person_mask]
+    scores = scores[person_mask]
     if len(boxes):
         boxes[:, (0, 2)] = np.clip(boxes[:, (0, 2)], 0, image.shape[1] - 1)
         boxes[:, (1, 3)] = np.clip(boxes[:, (1, 3)], 0, image.shape[0] - 1)
-        boxes = np.asarray([
-            box for box in boxes
-            if box[2] - box[0] >= 18 and box[3] - box[1] >= 28
-        ], dtype=np.float32).reshape(-1, 4)
-    return boxes, (time.monotonic() - started) * 1000.0
+        keep = np.asarray([
+            box[2] - box[0] >= min_width and
+            box[3] - box[1] >= min_height
+            for box in boxes
+        ], dtype=bool)
+        boxes = boxes[keep]
+        scores = scores[keep]
+    return boxes, scores, (time.monotonic() - started) * 1000.0
+
+
+def split_mosaic_detections(boxes, scores, view_width, view_height,
+                            min_width, min_height):
+    """Convert global 2x2 mosaic detections into four local-camera lists."""
+    sector_boxes = [[] for _ in range(4)]
+    sector_scores = [[] for _ in range(4)]
+    for box, score in zip(
+            np.asarray(boxes, dtype=np.float32).reshape(-1, 4),
+            np.asarray(scores, dtype=np.float32).reshape(-1)):
+        center_x = float(box[0] + box[2]) * .5
+        center_y = float(box[1] + box[3]) * .5
+        col, row = int(center_x >= view_width), int(center_y >= view_height)
+        camera_id = row * 2 + col
+        offset_x, offset_y = col * view_width, row * view_height
+        local = np.array([
+            max(offset_x, box[0]) - offset_x,
+            max(offset_y, box[1]) - offset_y,
+            min(offset_x + view_width - 1, box[2]) - offset_x,
+            min(offset_y + view_height - 1, box[3]) - offset_y,
+        ], dtype=np.float32)
+        if (local[2] - local[0] < min_width or
+                local[3] - local[1] < min_height):
+            continue
+        sector_boxes[camera_id].append(local)
+        sector_scores[camera_id].append(float(score))
+    return [
+        (np.asarray(values, dtype=np.float32).reshape(-1, 4),
+         np.asarray(sector_scores[camera_id], dtype=np.float32))
+        for camera_id, values in enumerate(sector_boxes)
+    ]
 
 
 def association_cost(left, right, keypoint_threshold):
@@ -691,6 +1243,10 @@ def make_anchor_person(camera_id, anchor_person, geometries,
             "hitnet_age_ms": None, "hitnet_consistent": None,
             "xyz_rect_m": None, "xyz_imu_m": None,
         }
+        if joint_id not in BODY_JOINT_IDS:
+            joint["source"] = "disabled_head_joint"
+            person["joints"].append(joint)
+            continue
         best = None
         fallback = None
         if confidence >= max(.20, args.keypoint_threshold - .06):
@@ -840,6 +1396,10 @@ def make_stereo_person(sector, left_person, right_person, geometry,
             "hitnet_consistent": None, "xyz_rect_m": None,
             "xyz_imu_m": None,
         }
+        if joint_id not in BODY_JOINT_IDS:
+            joint["source"] = "disabled_head_joint"
+            person["joints"].append(joint)
+            continue
         if left_score >= args.keypoint_threshold and right_person is not None \
                 and right_score >= args.keypoint_threshold:
             semantic_right = np.asarray(
@@ -987,6 +1547,7 @@ def person_overlap_distance(first, second):
 
 
 def fuse_people(raw_people, merge_distance):
+    """Original single-frame 3D merge; it does not carry identity history."""
     clusters = []
     for person in raw_people:
         center = person_center(person)
@@ -1014,6 +1575,7 @@ def fuse_people(raw_people, merge_distance):
             best["pairs"].add(person["pair"])
             best["center"] = np.mean(
                 [person_center(member) for member in best["members"]], axis=0)
+
     fused = []
     for cluster in clusters:
         joints = []
@@ -1034,16 +1596,17 @@ def fuse_people(raw_people, merge_distance):
             xyz = np.average(np.asarray(
                 [value["xyz_imu_m"] for value in candidates]),
                 axis=0, weights=weights)
-            best = candidates[int(np.argmax(weights))]
+            strongest = candidates[int(np.argmax(weights))]
             joints.append({
                 "id": joint_id, "name": name,
                 "xyz_imu_m": xyz.round(6).tolist(),
                 "score": round(float(max(value["score"]
                                          for value in candidates)), 6),
-                "source": best["source"],
-                "measurement_sigma_m": best.get("measurement_sigma_m"),
-                "hitnet_age_ms": best.get("hitnet_age_ms"),
-                "hitnet_consistent": best.get("hitnet_consistent"),
+                "source": strongest["source"],
+                "measurement_sigma_m": strongest.get(
+                    "measurement_sigma_m"),
+                "hitnet_age_ms": strongest.get("hitnet_age_ms"),
+                "hitnet_consistent": strongest.get("hitnet_consistent"),
             })
         physical_pairs = sorted({
             pair for member in cluster["members"]
@@ -1053,171 +1616,6 @@ def fuse_people(raw_people, merge_distance):
                       "source_anchors": sorted(cluster["pairs"]),
                       "joints": joints})
     return fused
-
-
-class KalmanJoint:
-    def __init__(self, position, stamp_sec, sigma, score=0.0,
-                 source="unknown", source_age_ms=0.0):
-        self.state = np.r_[position, np.zeros(3, dtype=np.float64)]
-        self.covariance = np.diag([sigma ** 2] * 3 + [.8] * 3)
-        self.stamp = stamp_sec
-        self.last_measurement = stamp_sec
-        self.last_score = float(score)
-        self.last_sigma = float(sigma)
-        self.last_source = str(source)
-        self.last_source_age_ms = float(source_age_ms)
-
-    def predict(self, stamp_sec):
-        dt = max(0.0, min(.5, stamp_sec - self.stamp))
-        transition = np.eye(6)
-        transition[:3, 3:] = np.eye(3) * dt
-        acceleration_noise = .8
-        process = np.eye(6) * 1e-5
-        process[:3, :3] *= max(1e-4, dt ** 4 * acceleration_noise)
-        process[3:, 3:] *= max(1e-4, dt ** 2 * acceleration_noise)
-        self.state = transition.dot(self.state)
-        self.covariance = transition.dot(self.covariance).dot(
-            transition.T) + process
-        self.stamp = stamp_sec
-
-    def update(self, measurement, stamp_sec, sigma, max_innovation=None,
-               score=0.0, source="unknown", source_age_ms=0.0):
-        self.predict(stamp_sec)
-        observation = np.zeros((3, 6), dtype=np.float64)
-        observation[:, :3] = np.eye(3)
-        noise = np.eye(3) * sigma ** 2
-        innovation = measurement - observation.dot(self.state)
-        if max_innovation is not None and \
-                float(np.linalg.norm(innovation)) > max_innovation:
-            return False
-        residual_covariance = observation.dot(self.covariance).dot(
-            observation.T) + noise
-        gain = self.covariance.dot(observation.T).dot(
-            np.linalg.inv(residual_covariance))
-        self.state += gain.dot(innovation)
-        self.covariance = (np.eye(6) - gain.dot(observation)).dot(
-            self.covariance)
-        self.last_measurement = stamp_sec
-        self.last_score = float(score)
-        self.last_sigma = float(sigma)
-        self.last_source = str(source)
-        self.last_source_age_ms = float(source_age_ms)
-        return True
-
-
-class SkeletonTracker:
-    def __init__(self):
-        self.tracks = {}
-        self.next_id = 0
-
-    def update(self, people, stamp_ns):
-        stamp_sec = stamp_ns / 1e9
-        measurements = []
-        for person in people:
-            center = person_center(person)
-            if center is not None:
-                measurements.append((person, center))
-        associations = {}
-        candidates = []
-        for person_index, (_, center) in enumerate(measurements):
-            for track_id, track in self.tracks.items():
-                distance = float(np.linalg.norm(center - track["center_body"]))
-                if distance < 1.5:
-                    candidates.append((distance, person_index, track_id))
-        used_tracks = set()
-        for _, person_index, track_id in sorted(candidates):
-            if person_index not in associations and track_id not in used_tracks:
-                associations[person_index] = track_id
-                used_tracks.add(track_id)
-        for person_index in range(len(measurements)):
-            if person_index not in associations:
-                track_id = self.next_id
-                self.next_id += 1
-                self.tracks[track_id] = {
-                    "joints": {}, "center_body": measurements[person_index][1],
-                    "last_seen": stamp_sec}
-                associations[person_index] = track_id
-        output = []
-        for person_index, (person, _) in enumerate(measurements):
-            track_id = associations[person_index]
-            track = self.tracks[track_id]
-            filtered_joints = []
-            for joint in person["joints"]:
-                value = dict(joint)
-                xyz = joint["xyz_imu_m"]
-                joint_filter = track["joints"].get(joint["id"])
-                if xyz is not None:
-                    body = np.asarray(xyz, dtype=np.float64)
-                    sigma = float(joint.get("measurement_sigma_m") or .2)
-                    source = str(joint.get("source") or "unknown")
-                    source_age_ms = float(joint.get("hitnet_age_ms") or 0.0) \
-                        if str(source).startswith("hitnet_") else 0.0
-                    if joint_filter is None:
-                        joint_filter = KalmanJoint(
-                            body, stamp_sec, sigma, joint.get("score", 0.0),
-                            source, source_age_ms)
-                        track["joints"][joint["id"]] = joint_filter
-                    else:
-                        # Reject isolated HITNet fallbacks that disagree with
-                        # the motion-predicted joint by more than 0.6 m.  A
-                        # fresh stereo triangulation is allowed a wider gate
-                        # because it is the primary geometric measurement.
-                        primary_stereo = (source.startswith("stereo_") or
-                                          source == "anchor_epipolar")
-                        # At 10 Hz a real joint should not jump half a metre
-                        # between consecutive observations.  Reset to a fresh
-                        # stereo measurement beyond that bound instead of
-                        # letting an old Kalman state visibly trail the body.
-                        gate = .6 if source.startswith("hitnet_") else .5
-                        accepted = joint_filter.update(
-                            body, stamp_sec, sigma, max_innovation=gate,
-                            score=joint.get("score", 0.0),
-                            source=source, source_age_ms=source_age_ms)
-                        if not accepted and primary_stereo:
-                            joint_filter = KalmanJoint(
-                                body, stamp_sec, sigma,
-                                joint.get("score", 0.0),
-                                source, source_age_ms)
-                            track["joints"][joint["id"]] = joint_filter
-                elif joint_filter is not None:
-                    joint_filter.predict(stamp_sec)
-                if joint_filter is not None and \
-                        stamp_sec - joint_filter.last_measurement <= .35:
-                    body = joint_filter.state[:3]
-                    measurement_age_ms = max(
-                        0.0, (stamp_sec - joint_filter.last_measurement) * 1e3 +
-                        joint_filter.last_source_age_ms)
-                    value["xyz_base_link_raw_m"] = xyz
-                    value["xyz_base_link_m"] = body.round(6).tolist()
-                    # Legacy JSON aliases kept for existing consumers. They
-                    # refer to the same fixed base_link calibration origin.
-                    value["xyz_imu_raw_m"] = xyz
-                    value["xyz_imu_m"] = body.round(6).tolist()
-                    value["predicted"] = xyz is None
-                    value["measurement_age_ms"] = round(
-                        measurement_age_ms, 3)
-                    value["measurement_source"] = joint_filter.last_source
-                    value["last_measurement_score"] = round(
-                        joint_filter.last_score, 6)
-                    value["last_measurement_sigma_m"] = round(
-                        joint_filter.last_sigma, 6)
-                else:
-                    value["xyz_base_link_m"] = None
-                    value["xyz_imu_m"] = None
-                    value["predicted"] = False
-                    value["measurement_age_ms"] = None
-                filtered_joints.append(value)
-            result = dict(person)
-            result["person_id"] = track_id
-            result["joints"] = filtered_joints
-            center = person_center(result)
-            if center is not None:
-                track["center_body"] = center
-            track["last_seen"] = stamp_sec
-            output.append(result)
-        self.tracks = {track_id: track for track_id, track in self.tracks.items()
-                       if stamp_sec - track["last_seen"] <= 1.0}
-        return output
 
 
 def publish_ros(publishers, people, stamp_ns):
@@ -1327,7 +1725,12 @@ def annotate_pair(left, right, triangulated_people,
 def annotate_anchor(image, pose_people, triangulated_people, color):
     view = image.copy() if image.ndim == 3 else \
         cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    draw_pose_2d(view, pose_people, (40, 245, 80))
+    # Do not draw the raw green RTMPose skeleton underneath the yellow metric
+    # skeleton.  Their small stereo/refinement offset looked like multiple
+    # people even when the tracker correctly reported PEOPLE=1.  Keep the raw
+    # pose visible only when no 3D result exists for this camera.
+    if not triangulated_people:
+        draw_pose_2d(view, pose_people, (40, 245, 80))
     for person in triangulated_people:
         joints = person["joints"]
         for first, second in pose3d.BONES:
@@ -1386,6 +1789,7 @@ def draw_3d(people, width=640, height=960):
     colors = ((80, 90, 255), (90, 230, 100), (255, 155, 80), (220, 100, 220))
     for index, person in enumerate(people):
         color = colors[index % len(colors)]
+        label_position = None
         for first, second in pose3d.BONES:
             a, b = person["joints"][first], person["joints"][second]
             if a["xyz_imu_m"] is not None and b["xyz_imu_m"] is not None:
@@ -1393,8 +1797,16 @@ def draw_3d(people, width=640, height=960):
                          project(b["xyz_imu_m"]), color, 4, cv2.LINE_AA)
         for joint in person["joints"]:
             if joint["xyz_imu_m"] is not None:
-                cv2.circle(panel, project(joint["xyz_imu_m"]), 5,
+                screen_point = project(joint["xyz_imu_m"])
+                cv2.circle(panel, screen_point, 5,
                            (40, 235, 255), -1, cv2.LINE_AA)
+                if joint["id"] in (0, 5, 6) and label_position is None:
+                    label_position = screen_point
+        if label_position is not None:
+            cv2.putText(panel, "P{} {}".format(
+                person["person_id"], person.get("track_state", "observed")),
+                (label_position[0] + 8, label_position[1] - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, .42, color, 1, cv2.LINE_AA)
     cv2.putText(panel, "SPARSE STEREO 3D / BASE_LINK", (15, 28),
                 cv2.FONT_HERSHEY_SIMPLEX, .62, (235, 240, 250), 2,
                 cv2.LINE_AA)
@@ -1518,6 +1930,12 @@ def start_web_server(state, port):
 
 def main():
     args = parse_args()
+    if not 0.0 <= args.det_low_threshold < args.det_threshold <= 1.0:
+        raise SystemExit(
+            "Require 0 <= det-low-threshold < det-threshold <= 1")
+    if args.sector_det_stride < 0 or args.track_hold_frames < 1:
+        raise SystemExit(
+            "sector-det-stride must be >= 0 and track-hold-frames >= 1")
     rospy.init_node("omninxt_sparse_stereo_pose", anonymous=False)
     with open(os.path.join(args.config_dir, "fisheye_cams.yaml")) as stream:
         import yaml
@@ -1528,7 +1946,8 @@ def main():
         math.radians(args.anchor_fov) / 2.0))
     detector = TensorRTYOLOX(
         args.det_engine, model_input_size=(416, 416),
-        det_mode="multiclass", nms_thr=.45, score_thr=args.det_threshold)
+        det_mode="multiclass", nms_thr=.45,
+        score_thr=args.det_threshold)
     estimator = TensorRTRTMPose(
         args.pose_engine, model_input_size=(192, 256))
     bridge = InputBridge()
@@ -1542,7 +1961,9 @@ def main():
         "skeleton": rospy.Publisher(
             "/omninxt_pose/skeleton_frame", String, queue_size=1),
     }
-    tracker = SkeletonTracker()
+    tracker = MotionSkeletonTracker(
+        pose3d.JOINTS, confirmation_hits=3,
+        prediction_timeout=1.2, deletion_timeout=4.0)
     boxes_anchor = np.empty((0, 4), dtype=np.float32)
     boxes_left = np.empty((0, 4), dtype=np.float32)
     boxes_right = np.empty((0, 4), dtype=np.float32)
@@ -1584,15 +2005,26 @@ def main():
         run_detector = False
         rescue_detector = False
         rescue_camera = None
+        detector_camera = None
+        detector_boxes = 0
+        detector_high_boxes = 0
         anchor_boxes_before_dedup = 0
         anchor_boxes_after_dedup = 0
+        pose_duplicate_rois_removed = 0
+        boundary_projection_ms = 0.0
         if all((index, "anchor") in frame for index in range(4)):
+            # Original simple front end: one detector pass on the 2x2 camera
+            # mosaic, pose-derived boxes between detector frames, and only a
+            # per-frame bearing/scale duplicate suppression.  No persistent
+            # 2D IDs, appearance ReID, projected ROIs or camera token graph.
             anchor_views = [frame[(index, "anchor")] for index in range(4)]
             run_detector = (frame_index % max(
                 1, args.center_det_interval) == 0)
             if run_detector:
-                detected_boxes, detector_ms = detect_single_view(
-                    make_mosaic(anchor_views), detector)
+                detected_boxes, _detected_scores, detector_ms = \
+                    detect_single_view(
+                        make_mosaic(anchor_views), detector,
+                        args.min_person_width, args.min_person_height)
                 boxes_anchor = clip_quadrant_boxes(
                     detected_boxes, args.anchor_width, args.anchor_height)
                 det_left_ms += detector_ms
@@ -1609,8 +2041,10 @@ def main():
                               int(center_x >= args.anchor_width))
                     has_camera_track |= sector == rescue_camera
                 if not has_camera_track:
-                    rescue_boxes, rescue_ms = detect_single_view(
-                        anchor_views[rescue_camera], detector)
+                    rescue_boxes, _rescue_scores, rescue_ms = \
+                        detect_single_view(
+                            anchor_views[rescue_camera], detector,
+                            args.min_person_width, args.min_person_height)
                     boxes_anchor = replace_quadrant_boxes(
                         boxes_anchor, rescue_camera, rescue_boxes,
                         args.anchor_width, args.anchor_height)
@@ -1624,6 +2058,17 @@ def main():
             anchor_people, boxes_anchor, _, pose_left_ms = infer_view(
                 make_mosaic(anchor_views), None, estimator, boxes_anchor,
                 False, args.anchor_width, args.anchor_height)
+            removed_detection_ids = set()
+            for camera_id in range(4):
+                anchor_people[camera_id], removed = deduplicate_body_poses(
+                    anchor_people[camera_id])
+                removed_detection_ids.update(removed)
+            if removed_detection_ids:
+                boxes_anchor = np.asarray([
+                    box for detection_id, box in enumerate(boxes_anchor)
+                    if detection_id not in removed_detection_ids
+                ], dtype=np.float32).reshape(-1, 4)
+                pose_duplicate_rois_removed += len(removed_detection_ids)
             for camera_id in range(4):
                 for pose_person in anchor_people[camera_id]:
                     if not anchor_person_is_valid(
@@ -1638,6 +2083,202 @@ def main():
                         continue
                     raw_people.append(person)
                     raw_by_sector[camera_id].append(person)
+        elif False and all((index, "anchor") in frame for index in range(4)):
+            anchor_views = [frame[(index, "anchor")] for index in range(4)]
+            # Project recent 3D tracks into all physical-camera views before
+            # detector scheduling.  This creates an immediate pose ROI in the
+            # neighbouring camera when a person crosses a view boundary.
+            boundary_projection_started = time.monotonic()
+            projected_anchor_rois = image_tracker.projected_anchor_rois(
+                        frame_index, cameras, anchor_focal,
+                        args.anchor_width, args.anchor_height)
+            boundary_projection_ms = (
+                time.monotonic() - boundary_projection_started) * 1000.0
+            for camera_id, projected_box, world_track_id in \
+                    projected_anchor_rois:
+                anchor_tracker.seed_world_projection(
+                    camera_id, projected_box, frame_index, world_track_id)
+            forced_round_robin = args.sector_det_stride > 0
+            run_global_detector = (
+                not forced_round_robin and
+                frame_index % max(1, args.center_det_interval) == 0)
+            run_sector_detector = (
+                forced_round_robin and
+                frame_index % args.sector_det_stride == 0)
+            if run_global_detector:
+                detected_boxes, detected_scores, detector_ms = \
+                    detect_single_view(
+                        make_mosaic(anchor_views), detector,
+                        args.min_person_width, args.min_person_height)
+                detector_boxes = len(detected_boxes)
+                detector_high_boxes = int(np.count_nonzero(
+                    detected_scores >= args.det_threshold))
+                for camera_id, (camera_boxes, camera_scores) in enumerate(
+                        split_mosaic_detections(
+                            detected_boxes, detected_scores,
+                            args.anchor_width, args.anchor_height,
+                            args.min_person_width, args.min_person_height)):
+                    anchor_tracker.update_sector(
+                        camera_id, camera_boxes, camera_scores, frame_index)
+                det_left_ms += detector_ms
+                run_detector = True
+            elif run_sector_detector:
+                detector_camera = (
+                    frame_index // args.sector_det_stride) % 4
+                detected_boxes, detected_scores, detector_ms = \
+                    detect_single_view(
+                        anchor_views[detector_camera], detector,
+                        args.min_person_width, args.min_person_height)
+                detector_boxes = len(detected_boxes)
+                detector_high_boxes = int(np.count_nonzero(
+                    detected_scores >= args.det_threshold))
+                anchor_tracker.update_sector(
+                    detector_camera, detected_boxes, detected_scores,
+                    frame_index)
+                det_left_ms += detector_ms
+                run_detector = True
+            elif (not forced_round_robin and
+                  frame_index % max(1, args.rescue_det_interval) == 0):
+                rescue_camera = ((frame_index // max(
+                    1, args.rescue_det_interval)) % 4)
+                if not anchor_tracker.has_confirmed_camera(
+                        rescue_camera, frame_index):
+                    detected_boxes, detected_scores, detector_ms = \
+                        detect_single_view(
+                            anchor_views[rescue_camera], detector,
+                            args.min_person_width, args.min_person_height)
+                    detector_camera = rescue_camera
+                    detector_boxes = len(detected_boxes)
+                    detector_high_boxes = int(np.count_nonzero(
+                        detected_scores >= args.det_threshold))
+                    anchor_tracker.update_sector(
+                        rescue_camera, detected_boxes, detected_scores,
+                        frame_index)
+                    det_left_ms += detector_ms
+                    run_detector = True
+                    rescue_detector = True
+            anchor_tracker.expire(frame_index)
+            boxes_anchor, anchor_track_ids = \
+                anchor_tracker.mosaic_boxes(frame_index)
+            anchor_boxes_before_dedup = len(boxes_anchor)
+            anchor_identity_hints = [
+                anchor_tracker.world_hint(track_id)
+                for track_id in anchor_track_ids
+            ]
+            retained_indices = deduplicate_anchor_indices(
+                boxes_anchor, cameras, anchor_focal,
+                args.anchor_width, args.anchor_height,
+                anchor_identity_hints)
+            boxes_anchor = (boxes_anchor[retained_indices] if retained_indices
+                            else np.empty((0, 4), dtype=np.float32))
+            anchor_track_ids = [anchor_track_ids[index]
+                                for index in retained_indices]
+            anchor_boxes_after_dedup = len(boxes_anchor)
+            anchor_people, _pose_boxes, _, pose_left_ms = infer_view(
+                make_mosaic(anchor_views), None, estimator, boxes_anchor,
+                False, args.anchor_width, args.anchor_height)
+            # Projection/detector ROIs may overlap after a fast motion.  If
+            # several ROIs produce the same image-space skeleton, collapse
+            # them before stereo.  The strict keypoint test is independent of
+            # depth, so a bad triangulation cannot manufacture extra people.
+            unique_anchor_people = [[] for _ in range(4)]
+            for camera_id, camera_people in enumerate(anchor_people):
+                for group in pose_duplicate_groups(camera_people):
+                    entries = []
+                    for person_index in group:
+                        pose_person = camera_people[person_index]
+                        detection_id = int(pose_person["detection_id"])
+                        if 0 <= detection_id < len(anchor_track_ids):
+                            entries.append((pose_person,
+                                            anchor_track_ids[detection_id]))
+                    if not entries:
+                        continue
+                    world_ids = [anchor_tracker.world_hint(track_id)
+                                 for _person, track_id in entries]
+                    canonical_world = image_tracker.merge_duplicate_track_ids(
+                        world_ids)
+                    canonical_local = anchor_tracker.merge_duplicate_tracks(
+                        [track_id for _person, track_id in entries],
+                        frame_index, canonical_world)
+                    best_person, _best_track = max(
+                        entries, key=lambda value: float(np.median(
+                            np.asarray(value[0]["scores"],
+                                       dtype=np.float32))))
+                    best_person = dict(best_person)
+                    best_person["_anchor_track_id"] = canonical_local
+                    unique_anchor_people[camera_id].append(best_person)
+                    pose_duplicate_rois_removed += max(0, len(entries) - 1)
+            anchor_people = unique_anchor_people
+            identity_observations, identity_pose_refs = [], []
+            for camera_id in range(4):
+                for pose_person in anchor_people[camera_id]:
+                    if not anchor_person_is_valid(
+                            pose_person, args.person_threshold):
+                        continue
+                    anchor_track_id = pose_person.get("_anchor_track_id")
+                    if anchor_track_id is None:
+                        continue
+                    anchor_tracker.pose_observation(
+                        anchor_track_id, pose_person, frame_index)
+                    appearance = appearance_descriptor(
+                        anchor_views[camera_id], pose_person)
+                    observation = image_identity_observation(
+                        camera_id, pose_person, anchor_track_id,
+                        anchor_tracker.world_hint(anchor_track_id),
+                        anchor_tracker.may_create_world_track(
+                            anchor_track_id, frame_index),
+                        appearance, cameras, anchor_focal,
+                        args.anchor_width, args.anchor_height)
+                    if observation is not None:
+                        identity_observations.append(observation)
+                        identity_pose_refs.append(
+                            (camera_id, pose_person, anchor_track_id,
+                             appearance))
+            image_assignments = image_tracker.update(
+                identity_observations, frame_index)
+            confirmed_pose_entries = []
+            for assignment, pose_ref, observation in zip(
+                    image_assignments, identity_pose_refs,
+                    identity_observations):
+                if assignment is None:
+                    continue
+                camera_id, pose_person, anchor_track_id, appearance = pose_ref
+                predepth_track_id = int(assignment["track_id"])
+                anchor_tracker.bind_world_track(
+                    camera_id, anchor_track_id, predepth_track_id)
+                if not assignment["confirmed"]:
+                    continue
+                confirmed_pose_entries.append({
+                    "track_id": predepth_track_id,
+                    "camera_id": camera_id,
+                    "pose_person": pose_person,
+                    "anchor_track_id": anchor_track_id,
+                    "appearance": appearance,
+                    "observation": observation,
+                })
+            for entry in select_predepth_pose_entries(
+                    confirmed_pose_entries,
+                    args.anchor_width, args.anchor_height):
+                predepth_track_id = entry["track_id"]
+                camera_id = entry["camera_id"]
+                pose_person = entry["pose_person"]
+                anchor_track_id = entry["anchor_track_id"]
+                appearance = entry["appearance"]
+                person = make_anchor_person(
+                    camera_id, pose_person, geometries,
+                    left_images, right_images, depths, depth_stamps,
+                    stamp_ns, anchor_focal, args.anchor_width,
+                    args.anchor_height, args)
+                if person_center(person) is None:
+                    continue
+                person["anchor_camera_id"] = camera_id
+                person["_camera_ids"] = [camera_id]
+                person["_appearance"] = appearance
+                person["_anchor_tokens"] = [
+                    (camera_id, anchor_track_id)]
+                person["_predepth_track_id"] = predepth_track_id
+                raw_people.append(person)
+                raw_by_sector[camera_id].append(person)
         else:
             # Exact-stamp raw data should normally be present. Retain the old
             # rectified-sector path as a safe fallback during startup.
@@ -1668,8 +2309,10 @@ def main():
                         depths[sector], depth_stamps[sector], stamp_ns, args)
                     raw_people.append(person)
                     raw_by_sector[sector].append(person)
+        identity_started = time.monotonic()
         fused = fuse_people(raw_people, args.merge_distance)
         tracked = tracker.update(fused, stamp_ns)
+        identity_ms = (time.monotonic() - identity_started) * 1000.0
         publish_ros(publishers, tracked, stamp_ns)
         processing_times.append(time.monotonic())
         processing_hz = 0.0 if len(processing_times) < 2 else \
@@ -1695,6 +2338,8 @@ def main():
                                          for values in anchor_people],
             "anchor_boxes_before_dedup": anchor_boxes_before_dedup,
             "anchor_boxes_after_dedup": anchor_boxes_after_dedup,
+            "pose_duplicate_rois_removed": pose_duplicate_rois_removed,
+            "identity_ms": identity_ms,
             "left_people_by_sector": [len(values) for values in left_people],
             "right_people_by_sector": [len(values) for values in right_people],
             "stereo_matches_by_sector": match_counts,
@@ -1718,18 +2363,24 @@ def main():
             "pose_last_person_count": estimator.last_person_count,
             "total_ms": total_ms,
             "detector_ran": run_detector,
+            "detector_mode": "original_mosaic_rescue",
+            "detector_score": args.det_threshold,
+            "detector_nms": .45,
             "rescue_detector_ran": rescue_detector,
             "rescue_camera": rescue_camera,
             "output_frame": "base_link",
             "runtime_flight_controller": False,
-            "filter_mode": "body_frame_constant_velocity",
+            "filter_mode": "damped_constant_velocity",
+            "identity_mode": "postfusion_3d_motion",
+            "identity_tracker": tracker.status(stamp_ns),
         }
         if backend_sender is not None:
             status["backend_stream"] = backend_sender.status()
         else:
             status["backend_stream"] = {"enabled": False}
         skeleton_packet = build_skeleton_packet(
-            tracked, stamp_ns, frame_index, pose3d.JOINTS)
+            tracked, stamp_ns, frame_index, pose3d.JOINTS,
+            session_id=tracker.session_id)
         skeleton_json = json.dumps(
             skeleton_packet, ensure_ascii=False, separators=(",", ":"))
         publishers["skeleton"].publish(String(data=skeleton_json))
@@ -1756,10 +2407,14 @@ def main():
         if frame_index % 10 == 0:
             rospy.loginfo(
                 "stereo-pose input=%.2fHz process=%.2fHz people=%d "
-                "tri=%d hitnet_fallback=%d valid=%d total=%.1fms",
+                "tri=%d hitnet_fallback=%d valid=%d identity=%.1fms "
+                "prediction=%.1fms boxes=%d/%d total=%.1fms",
                 input_hz, processing_hz, len(tracked),
                 status["triangulated_joints"],
-                status["hitnet_fallback_joints"], len(valid_joints), total_ms)
+                status["hitnet_fallback_joints"], len(valid_joints),
+                identity_ms, 0.0,
+                anchor_boxes_before_dedup, anchor_boxes_after_dedup,
+                total_ms)
         frame_index += 1
     if server is not None:
         server.shutdown()

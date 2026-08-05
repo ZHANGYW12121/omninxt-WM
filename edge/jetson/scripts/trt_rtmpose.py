@@ -7,6 +7,7 @@ import numpy as np
 import tensorrt as trt
 
 from rtmlib import RTMPose, YOLOX
+from rtmlib.tools.object_detection.post_processings import multiclass_nms
 
 
 class CudaRuntime:
@@ -238,6 +239,7 @@ class TensorRTYOLOX(YOLOX):
         self.det_mode = det_mode
         self.nms_thr = nms_thr
         self.score_thr = score_thr
+        self.last_scores = np.empty((0,), dtype=np.float32)
         self.onnx_model = None
         self.backend = "tensorrt"
         self.device = "cuda"
@@ -246,3 +248,56 @@ class TensorRTYOLOX(YOLOX):
         tensor = np.ascontiguousarray(
             image.transpose(2, 0, 1), dtype=np.float32)[None]
         return self.runner(tensor)
+
+    def postprocess(self, outputs, ratio=1.0):
+        """Decode raw YOLOX output and retain the true detection scores.
+
+        The bundled rtmlib implementation performs multiclass NMS with
+        ``score_thr`` and then incorrectly filters the survivors again using
+        ``score > nms_thr``.  With the normal 0.28/0.45 configuration that
+        silently turns the effective person threshold into 0.45 and removes
+        many small distant people.  NMS overlap and confidence are independent
+        quantities, so no second confidence filter belongs here.
+        """
+        raw = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+        raw = np.asarray(raw)
+        if raw.ndim != 3 or raw.shape[0] != 1 or raw.shape[-1] <= 5:
+            raise ValueError("Expected raw YOLOX output [1,N,5+C], got {}"
+                             .format(raw.shape))
+
+        grids = []
+        expanded_strides = []
+        for stride in (8, 16, 32):
+            hsize = self.model_input_size[0] // stride
+            wsize = self.model_input_size[1] // stride
+            xv, yv = np.meshgrid(np.arange(wsize), np.arange(hsize))
+            grid = np.stack((xv, yv), axis=2).reshape(1, -1, 2)
+            grids.append(grid)
+            expanded_strides.append(np.full((*grid.shape[:2], 1), stride))
+        grids = np.concatenate(grids, axis=1)
+        expanded_strides = np.concatenate(expanded_strides, axis=1)
+
+        decoded = raw.copy()
+        decoded[..., :2] = (decoded[..., :2] + grids) * expanded_strides
+        decoded[..., 2:4] = np.exp(decoded[..., 2:4]) * expanded_strides
+        predictions = decoded[0]
+        boxes = predictions[:, :4]
+        scores = predictions[:, 4:5] * predictions[:, 5:]
+        boxes_xyxy = np.empty_like(boxes)
+        boxes_xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] * .5
+        boxes_xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] * .5
+        boxes_xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] * .5
+        boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] * .5
+        boxes_xyxy /= float(ratio)
+
+        detections, _ = multiclass_nms(
+            boxes_xyxy, scores, nms_thr=self.nms_thr,
+            score_thr=self.score_thr)
+        if detections is None:
+            self.last_scores = np.empty((0,), dtype=np.float32)
+            return (np.empty((0, 4), dtype=np.float32),
+                    np.empty((0,), dtype=np.int32))
+        final_boxes = detections[:, :4].astype(np.float32, copy=False)
+        self.last_scores = detections[:, 4].astype(np.float32, copy=True)
+        final_classes = detections[:, 5].astype(np.int32, copy=False)
+        return final_boxes, final_classes
