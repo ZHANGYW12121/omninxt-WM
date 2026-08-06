@@ -47,6 +47,21 @@ skeleton:
   pose: models/rtmpose_s_body17_256x192.onnx
   topology: COCO17
   output_schema: omninxt.skeleton3d.v1
+  identity_tracking:
+    association: predicted_3d_motion
+    small_frame_assignment: exact_max_cardinality_min_cost
+    small_frame_max_measurements: 12
+    dense_frame_assignment: hungarian
+    dense_frame_complexity: O(N^3)
+    numeric_id_convention: positive_per_process
+    process_identity_field: session_id
+    globally_unique_track_field: track_uid
+    optional_person_fields:
+      - track_state
+      - identity_confidence
+      - track_age_frames
+      - time_since_observation_ms
+      - id_uncertain
   network_transport: newline_delimited_JSON_over_TCP
   stgcn_layout: [N, C, T, V, M]
   stgcn_channels: [x_m, y_m, z_m, confidence, coordinate_valid]
