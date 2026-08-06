@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from modules.causal_pose_encoder import CausalMultiPersonSTGCNEncoder
+from modules.skeleton_topology import COCO12_BODY_JOINT_COUNT, hip_joint_indices
 from modules.sparse_ego_human_attention import (
     SparseEgoHumanAttention,
     SparseEgoHumanAttentionConfig,
@@ -82,10 +83,12 @@ def root_and_root_relative_joints(
     denom = weight.sum(dim=-2).clamp_min(1.0)
     mean_pos = (xyz * weight).sum(dim=-2) / denom
     mean_vel = (velocity * weight).sum(dim=-2) / denom
-    if j > 12:
-        hips_valid = valid[..., 11] & valid[..., 12]
-        hip_pos = 0.5 * (xyz[..., 11, :] + xyz[..., 12, :])
-        hip_vel = 0.5 * (velocity[..., 11, :] + velocity[..., 12, :])
+    hips = hip_joint_indices(j)
+    if hips is not None:
+        left_hip, right_hip = hips
+        hips_valid = valid[..., left_hip] & valid[..., right_hip]
+        hip_pos = 0.5 * (xyz[..., left_hip, :] + xyz[..., right_hip, :])
+        hip_vel = 0.5 * (velocity[..., left_hip, :] + velocity[..., right_hip, :])
         root_pos = torch.where(hips_valid[..., None], hip_pos, mean_pos)
         root_vel = torch.where(hips_valid[..., None], hip_vel, mean_vel)
     else:
@@ -143,7 +146,7 @@ class CausalSTGCNHumanEncoder(nn.Module):
     """Build reset-safe past-only windows and encode each person independently."""
 
     def __init__(self, feat_dim: int, hidden_dim: int, out_dim: int,
-                 num_joints: int = 17, history: int = 8) -> None:
+                 num_joints: int = COCO12_BODY_JOINT_COUNT, history: int = 8) -> None:
         super().__init__()
         self.feat_dim = int(feat_dim)
         self.num_joints = int(num_joints)

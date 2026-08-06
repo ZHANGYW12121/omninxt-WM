@@ -11,8 +11,10 @@ RSSM state.
   altitude, roll/pitch and episode-relative yaw sin/cos.
 - Human root `[B,T,N,10]`: body-frame root position/velocity, person extent and
   confidence.
-- Root-relative joints `[B,T,N,J,7]`: joint position/velocity minus that
-  person's root, plus confidence.  The axes still use the drone body frame.
+- COCO12_BODY root-relative joints `[B,T,N,12,7]`: shoulders, elbows, wrists,
+  hips, knees and ankles (COCO17 source indices 5..16), with joint
+  position/velocity minus that person's root plus confidence. The axes still
+  use the drone body frame.
 - Goal position `[B,T,3]`: fixed target in the episode-start local frame.
 - Goal feature `[B,T,8]`: current body-relative delta, distance, unit direction
   and normalized heading error.
@@ -65,13 +67,22 @@ the physical RSSM transitions.
 cd /path/to/omninxt-WM/world_model
 python scripts/train_factorized_offline.py \
   --data-root /path/to/records \
-  --pose-root /path/to/pose3d \
   --output /path/to/checkpoints/factorized.pt
 ```
 
-No LiDAR/BEV cache argument is required.  The adapter reads Ego/Goal data from
-frame JSON and strict 3-D pose caches for Humans.  Before production training,
-fill `factorized.ego_state_mean/std` using training-split data only.
+No LiDAR/BEV or separate pose-cache argument is required. The
+`CompactSkeletonV3Dataset` adapter reads chunked
+`omninxt.crowd_skeleton_state.v3` episodes directly, derives Human velocity,
+risk-selects stable model slots and constructs Ego/Human/Goal tensors. Before
+production training, fill `factorized.ego_state_mean/std` using training-split
+data only.
+
+This offline stage intentionally performs the complete Dreamer optimization:
+Ego/Human RSSM, reconstruction/prediction, Reward/Continue, Actor, Value and
+Replay Value are all trained from recorded transitions and imagined rollouts.
+"Offline" means there is no live Isaac interaction; it does not mean
+world-model-only training. Outcome labels are retained for later sampling and
+statistics but are not observation features.
 
 ## Verification
 

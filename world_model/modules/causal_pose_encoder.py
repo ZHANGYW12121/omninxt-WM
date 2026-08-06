@@ -27,7 +27,7 @@ class CausalMultiPersonSTGCNEncoder(nn.Module):
     - ``T``: sequence length
     - ``M``: max people per frame
     - ``W``: causal history window ending at current frame
-    - ``V``: joints, COCO-17 by default
+    - ``V``: joints, COCO12_BODY by default
     - ``C``: ``x, y, confidence`` or ``x, y``
 
     The module flattens ``B*T*M`` person-windows, runs a trainable ST-GCN over
@@ -39,7 +39,7 @@ class CausalMultiPersonSTGCNEncoder(nn.Module):
     def __init__(
         self,
         *,
-        num_joints: int = 17,
+        num_joints: int = 12,
         in_channels: int = 3,
         hidden_channels: int = 64,
         out_dim: int = 256,
@@ -71,7 +71,7 @@ class CausalMultiPersonSTGCNEncoder(nn.Module):
         """Return pose tokens and masks.
 
         Args:
-            pose_windows: skeleton windows shaped ``[B,T,M,W,17,2/3]``.
+            pose_windows: skeleton windows shaped ``[B,T,M,W,12,C]``.
             pose_window_mask: optional valid-frame mask ``[B,T,M,W]``.
             pose_token_mask: optional current-person mask ``[B,T,M]``.
             image_size_hw: optional per-frame image size ``[B,T,2]`` as

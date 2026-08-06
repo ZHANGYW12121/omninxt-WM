@@ -48,7 +48,7 @@ def main():
     parser.add_argument("--length", type=int, default=3)
     args = parser.parse_args()
     device = torch.device(args.device)
-    b, t, n, j, d, action_dim = args.batch, args.length, 6, 17, 32, 4
+    b, t, n, j, d, action_dim = args.batch, args.length, 6, 12, 32, 4
     encoder = FactorizedObservationEncoder(FactorizedEncoderConfig(
         model_dim=d, human_hidden_dim=16, pose_history=4,
     ))

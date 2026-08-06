@@ -15,8 +15,8 @@ from torch.utils.data import DataLoader
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from datasets.factorized_schema import FactorizedIsaacAdapter, compute_ego_state_statistics
-from datasets.isaac_crowd import IsaacCrowdSequenceDataset
+from datasets.compact_skeleton_v3 import CompactSkeletonV3Dataset
+from datasets.factorized_schema import compute_ego_state_statistics
 from factorized_agent import FactorizedDreamerAgent
 
 
@@ -33,7 +33,6 @@ def numeric_collate(items):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", required=True)
-    parser.add_argument("--pose-root", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--steps", type=int, default=100000)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -52,14 +51,9 @@ def main():
             f"model.device={args.device}", f"model.rssm.device={args.device}",
         ])
 
-    base = IsaacCrowdSequenceDataset(
-        args.data_root, sequence_length=args.sequence_length, load_lidar=False,
-        include_paths=False,
-        missing_reward_policy="error",
-    )
-    dataset = FactorizedIsaacAdapter(
-        base, args.pose_root, max_people=int(config.model.factorized.max_people),
-        require_pose_cache=True, strict_altitude=True,
+    dataset = CompactSkeletonV3Dataset(
+        args.data_root, sequence_length=args.sequence_length,
+        max_people=int(config.model.factorized.max_people),
     )
     stats_count = min(len(dataset), max(1, args.stats_sequences))
     ego_mean, ego_std = compute_ego_state_statistics(

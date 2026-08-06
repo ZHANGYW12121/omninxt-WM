@@ -1,26 +1,13 @@
 import torch
 import torch.nn as nn
 
-
-COCO17_EDGES = [
-    (0, 1), (0, 2),
-    (1, 3), (2, 4),
-    (5, 6),
-    (5, 7), (7, 9),
-    (6, 8), (8, 10),
-    (5, 11), (6, 12),
-    (11, 12),
-    (11, 13), (13, 15),
-    (12, 14), (14, 16),
-]
+from modules.skeleton_topology import COCO12_BODY_JOINT_COUNT, skeleton_edges
 
 
-def build_coco17_adjacency(num_joints=17):
+def build_skeleton_adjacency(num_joints=COCO12_BODY_JOINT_COUNT):
     A = torch.zeros(num_joints, num_joints)
 
-    for i, j in COCO17_EDGES:
-        if i >= num_joints or j >= num_joints:
-            continue
+    for i, j in skeleton_edges(num_joints):
         A[i, j] = 1.0
         A[j, i] = 1.0
 
@@ -38,7 +25,8 @@ def build_coco17_adjacency(num_joints=17):
 
 
 class GraphTemporalBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, dropout=0.0, num_joints=17):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dropout=0.0,
+                 num_joints=COCO12_BODY_JOINT_COUNT):
         super().__init__()
 
         padding = (kernel_size - 1) // 2
@@ -65,7 +53,7 @@ class GraphTemporalBlock(nn.Module):
         else:
             self.residual = nn.Identity()
 
-        A = build_coco17_adjacency(num_joints)
+        A = build_skeleton_adjacency(num_joints)
         self.register_buffer("A", A)
 
     def forward(self, x):
@@ -91,7 +79,7 @@ class GraphTemporalBlock(nn.Module):
 class STGCNLiteEncoder(nn.Module):
     def __init__(
         self,
-        num_joints=17,
+        num_joints=COCO12_BODY_JOINT_COUNT,
         in_channels=3,
         hidden_channels=64,
         out_dim=256,

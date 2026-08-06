@@ -26,6 +26,12 @@ from .factorized_schema import (
     ego14_reference_from_frame,
     validate_factorized_batch,
 )
+from .compact_skeleton_v3 import (
+    CompactEpisode,
+    CompactSkeletonV3Dataset,
+    derive_relative_joint_velocity,
+    discover_compact_episodes,
+)
 
 __all__ = [
     "ACTION_KEYS",
@@ -50,4 +56,8 @@ __all__ = [
     "ego14_from_frame",
     "ego14_reference_from_frame",
     "validate_factorized_batch",
+    "CompactEpisode",
+    "CompactSkeletonV3Dataset",
+    "derive_relative_joint_velocity",
+    "discover_compact_episodes",
 ]

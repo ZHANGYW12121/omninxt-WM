@@ -1,5 +1,8 @@
 defaults:
-  - _base_
+  # Reuse the repository's smallest complete Dreamer size preset. It already
+  # inherits _base_ and supplies deter/hidden/discrete/units/act/norm, which
+  # the factorized Agent needs during Hydra composition.
+  - size12M
   - _self_
 
 rep_loss: dreamer
@@ -11,7 +14,7 @@ factorized:
   private_dim: 128
   goal_dim: 8
   max_people: 20
-  num_joints: 17
+  num_joints: 12
   pose_history: 8
   human_feature_dim: 7
   human_root_dim: 10

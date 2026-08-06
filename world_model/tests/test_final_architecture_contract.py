@@ -25,7 +25,7 @@ class FinalArchitectureContractTest(unittest.TestCase):
 
     def test_stgcn_history_is_causal_and_reset_safe(self):
         torch.manual_seed(19)
-        b, t, n, j = 1, 6, 2, 17
+        b, t, n, j = 1, 6, 2, 12
         model = FactorizedObservationEncoder(FactorizedEncoderConfig(
             model_dim=16, human_hidden_dim=16, pose_history=4,
         )).eval()

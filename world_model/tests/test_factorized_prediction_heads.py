@@ -15,7 +15,7 @@ from modules.factorized_prediction_heads import FactorizedPredictionConfig, Fact
 class HeadTest(unittest.TestCase):
     def test_two_branch_shapes_masks_and_gradients(self):
         torch.manual_seed(4)
-        b, t, n, j, f = 2, 5, 6, 17, 40
+        b, t, n, j, f = 2, 5, 6, 12, 40
         heads = FactorizedPredictionHeads(f, f, FactorizedPredictionConfig(hidden_dim=32))
         feats = {
             "ego": torch.randn(b, t, f, requires_grad=True),

@@ -87,8 +87,8 @@ def make_batch(b=2, t=4, n=3, action=3):
     ego[..., 12:14] = yaw / yaw.norm(dim=-1, keepdim=True)
     batch = {
         "ego_state": ego, "skeleton_stub": torch.randn(b, t, n, 7),
-        "skeleton": torch.randn(b, t, n, 17, 7), "human_mask": mask,
-        "joint_mask": mask[..., None].expand(b, t, n, 17).clone(),
+        "skeleton": torch.randn(b, t, n, 12, 7), "human_mask": mask,
+        "joint_mask": mask[..., None].expand(b, t, n, 12).clone(),
         "human_is_first": torch.zeros(b, t, n, dtype=torch.bool),
         "goal": torch.randn(b, t, 8), "goal_position": torch.randn(b, t, 3),
         "action": torch.randn(b, t, action), "is_first": torch.zeros(b, t, dtype=torch.bool),
@@ -140,6 +140,11 @@ class FactorizedDreamerTest(unittest.TestCase):
             model, optimizer, imag_horizon=3, loss_scales=self.LOSS_SCALES,
         )(batch)
         self.assertIn("loss/total", metrics)
+        for component in (
+            "dyn_ego", "dyn_human", "ego_recon", "human_mpjpe",
+            "rew", "con", "policy", "value", "repval",
+        ):
+            self.assertIn(f"loss/{component}", metrics)
         self.assertTrue(all(torch.isfinite(torch.tensor(value)) for value in metrics.values()))
 
 

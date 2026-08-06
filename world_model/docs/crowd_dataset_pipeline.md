@@ -1,5 +1,10 @@
 # Isaac crowd offline dataset pipeline
 
+> 本文以下内容描述旧的逐帧 JSON/图像/LiDAR 数据兼容链路。当前 Ego–Human
+> 两分支模型的新录制入口是 `omninxt.crowd_skeleton_state.v3`，直接使用
+> `datasets.CompactSkeletonV3Dataset`；见
+> `docs/SKELETON_STATE_DATASET_V3_RECORDING.md`。
+
 这套代码把原始 `record_xxx/frames` 作为只读数据源，不会修改已经录好的数据集。
 
 ## 1. 原始数据保持不动

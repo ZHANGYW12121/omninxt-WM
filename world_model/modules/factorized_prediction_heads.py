@@ -8,12 +8,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from modules.skeleton_topology import COCO12_BODY_JOINT_COUNT, hip_joint_indices
+
 
 @dataclass(frozen=True)
 class FactorizedPredictionConfig:
     hidden_dim: int = 256
     ego_dim: int = 14
-    num_joints: int = 17
+    num_joints: int = COCO12_BODY_JOINT_COUNT
     smooth_l1_beta: float = 0.05
     yaw_sin_index: int = 12
     yaw_cos_index: int = 13
@@ -102,9 +104,8 @@ class Human3DPredictionHead(nn.Module):
             "presence_logit": self.presence(hidden).squeeze(-1),
         }
 
-    def loss(self, pred, skeleton, human_mask, joint_mask):
+    def loss(self, pred, skeleton, root_target, human_mask, joint_mask):
         xyz = skeleton[..., :3].float()
-        root_target = 0.5 * (xyz[..., 11, :] + xyz[..., 12, :])
         valid_human = human_mask[:, 1:].bool()
         root_raw = F.smooth_l1_loss(
             pred["root"][:, :-1], root_target[:, 1:], reduction="none",
@@ -135,7 +136,15 @@ class FactorizedPredictionHeads(nn.Module):
 
     def forward_loss(self, branch_feats, batch):
         skeleton = batch["skeleton"]
-        root = 0.5 * (skeleton[..., 11, :3] + skeleton[..., 12, :3])
+        if "human_root" in batch:
+            root = batch["human_root"][..., :3].float()
+        else:
+            hips = hip_joint_indices(skeleton.shape[-2])
+            if hips is None:
+                raise ValueError("human_root is required for an unsupported joint topology")
+            left_hip, right_hip = hips
+            root = 0.5 * (
+                skeleton[..., left_hip, :3] + skeleton[..., right_hip, :3])
         pred = {
             "ego": self.ego(branch_feats["ego"], batch["ego_state"]),
             "human": self.human(branch_feats["human"], root),
@@ -143,6 +152,6 @@ class FactorizedPredictionHeads(nn.Module):
         losses = {}
         losses.update(self.ego.loss(pred["ego"], batch["ego_state"]))
         losses.update(self.human.loss(
-            pred["human"], skeleton, batch["human_mask"], batch["joint_mask"],
+            pred["human"], skeleton, root, batch["human_mask"], batch["joint_mask"],
         ))
         return pred, losses

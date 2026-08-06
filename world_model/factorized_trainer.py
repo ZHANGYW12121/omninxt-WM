@@ -110,8 +110,15 @@ class FactorizedTrainStep:
                 predictions["ego"]["next_state"][:, :-1, :3] - batch["ego_state"][:, 1:, :3], dim=-1)
             metrics["prediction/ego_position_error"] = float(ego_error.mean().detach())
             human_valid = batch["human_mask"][:, 1:].bool()
-            xyz = batch["skeleton"][..., :3]
-            root_true = 0.5 * (xyz[..., 11, :] + xyz[..., 12, :])
+            if "human_root" in batch:
+                root_true = batch["human_root"][..., :3]
+            else:
+                from modules.skeleton_topology import hip_joint_indices
+                xyz = batch["skeleton"][..., :3]
+                hips = hip_joint_indices(xyz.shape[-2])
+                if hips is None:
+                    raise ValueError("human_root is required for an unsupported joint topology")
+                root_true = 0.5 * (xyz[..., hips[0], :] + xyz[..., hips[1], :])
             root_error = torch.linalg.vector_norm(
                 predictions["human"]["root"][:, :-1] - root_true[:, 1:], dim=-1)
             denom = human_valid.sum().clamp_min(1)

@@ -16,6 +16,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from modules.goal_conditioning import GOAL_FEATURE_DIM, goal_features_numpy
+from modules.skeleton_topology import hip_joint_indices
 
 try:
     from torch.utils.data import Dataset
@@ -179,10 +180,12 @@ def human_root_and_relative_joints_numpy(
     denom = np.maximum(weight.sum(axis=-2), 1.0)
     mean_pos = (xyz * weight).sum(axis=-2) / denom
     mean_vel = (velocity * weight).sum(axis=-2) / denom
-    if skel.shape[-2] > 12:
-        hips_valid = jmask[..., 11] & jmask[..., 12]
-        hip_pos = 0.5 * (xyz[..., 11, :] + xyz[..., 12, :])
-        hip_vel = 0.5 * (velocity[..., 11, :] + velocity[..., 12, :])
+    hips = hip_joint_indices(skel.shape[-2])
+    if hips is not None:
+        left_hip, right_hip = hips
+        hips_valid = jmask[..., left_hip] & jmask[..., right_hip]
+        hip_pos = 0.5 * (xyz[..., left_hip, :] + xyz[..., right_hip, :])
+        hip_vel = 0.5 * (velocity[..., left_hip, :] + velocity[..., right_hip, :])
         root_pos = np.where(hips_valid[..., None], hip_pos, mean_pos)
         root_vel = np.where(hips_valid[..., None], hip_vel, mean_vel)
     else:
@@ -401,7 +404,7 @@ class FactorizedIsaacAdapter(Dataset):  # type: ignore[misc]
     """
 
     def __init__(self, base_dataset: Any, pose_3d_cache_root: str | Path, *,
-                 max_people: int = 20, num_joints: int = 17,
+                 max_people: int = 20, num_joints: int = 12,
                  require_pose_cache: bool = True,
                  strict_altitude: bool = False,
                  ground_z_by_record: Mapping[str, float] | None = None) -> None:

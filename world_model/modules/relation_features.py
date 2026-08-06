@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from modules.skeleton_topology import hip_joint_indices
+
 
 def ego_explicit_relation(ego_state: torch.Tensor, extent=(0.8, 0.8, 0.35)) -> torch.Tensor:
     out = ego_state.new_zeros((*ego_state.shape[:-1], 1, 10))
@@ -29,10 +31,16 @@ def human_explicit_relation(skeleton: torch.Tensor, human_mask: torch.Tensor,
     xyz = skeleton[..., :3]
     vel = skeleton[..., 3:6]
     conf = skeleton[..., 6] if skeleton.shape[-1] > 6 else valid.to(skeleton.dtype)
-    # Prefer COCO hips; fall back to a masked joint mean if either hip is absent.
-    hips_valid = valid[..., 11] & valid[..., 12] if skeleton.shape[-2] > 12 else torch.zeros_like(human_mask)
-    hip_pos = 0.5 * (xyz[..., 11, :] + xyz[..., 12, :]) if skeleton.shape[-2] > 12 else xyz[..., 0, :]
-    hip_vel = 0.5 * (vel[..., 11, :] + vel[..., 12, :]) if skeleton.shape[-2] > 12 else vel[..., 0, :]
+    # Prefer topology-aware hips; fall back to a masked joint mean.
+    hips = hip_joint_indices(skeleton.shape[-2])
+    if hips is None:
+        hips_valid = torch.zeros_like(human_mask)
+        hip_pos, hip_vel = xyz[..., 0, :], vel[..., 0, :]
+    else:
+        left_hip, right_hip = hips
+        hips_valid = valid[..., left_hip] & valid[..., right_hip]
+        hip_pos = 0.5 * (xyz[..., left_hip, :] + xyz[..., right_hip, :])
+        hip_vel = 0.5 * (vel[..., left_hip, :] + vel[..., right_hip, :])
     weight = valid.to(xyz.dtype)[..., None]
     denom = weight.sum(dim=-2).clamp_min(1.0)
     mean_pos = (xyz * weight).sum(dim=-2) / denom
