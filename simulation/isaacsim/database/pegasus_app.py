@@ -5,6 +5,7 @@ import carb
 import json
 import math
 import os
+import random
 import numpy as np
 import omni.timeline
 import omni.usd
@@ -42,6 +43,11 @@ from dpmpc_controller import DpmpcController
 from navrl_controller import NavRLController
 from mavsdk_bridge import MavsdkOffboardBridge
 from navigation_benchmark import NavigationBenchmarkEvaluator
+from recording_seed_progress import (
+    mark_seed_completed,
+    resolve_seed_progress,
+    write_seed_progress,
+)
 
 from app_config import (
     ACTIVE_CROWD_SCENE,
@@ -65,6 +71,7 @@ from app_config import (
     DATA_RECORD_HZ,
     DATA_RECORD_MAX_RECORD_BYTES,
     DATA_RECORD_MAX_TRAJECTORIES,
+    DATA_RECORD_PROGRESS_PATH,
     DATA_RECORD_QUEUE_SIZE,
     DATA_RECORD_PRIVILEGED_MAX_PEOPLE,
     DATA_RECORD_SKELETON_HOST,
@@ -72,7 +79,12 @@ from app_config import (
     DATA_RECORD_STORAGE_MAX_PEOPLE,
     DATA_RECORD_SYNC_TOLERANCE_SEC,
     DATA_RECORD_SIZE_CHECK_INTERVAL_SEC,
-    DATA_RECORD_STUCK_TIMEOUT_SEC,
+    DATA_RECORD_TIME_LIMIT_SEC,
+    DATA_RECORD_GOAL_RADIUS_M,
+    DATA_RECORD_RESUME_ENABLED,
+    DATA_RECORD_RUN_ID,
+    DATA_RECORD_SEED_END,
+    DATA_RECORD_SEED_START,
     DATA_REWARD_CONFIG,
     DATASET_ROOT,
     DATASET_GOAL_X_RANGE,
@@ -128,6 +140,8 @@ from app_config import (
     MAVSDK_YAWSPEED_SIGN,
     MAVSDK_USE_TELEMETRY_STATE,
     NAVRL_STATE_SOURCE,
+    NAVRL_SAFETY_SHIELD_ENABLED,
+    NAVRL_CHECKPOINT,
     MVD35_BODY_MASS_KG,
     MVD35_CENTER_OF_MASS_M,
     MVD35_DIAGONAL_INERTIA_KGM2,
@@ -198,7 +212,7 @@ from app_config import (
     SIM_RENDERING_DT,
     sample_crowd_template,
 )
-from warehouse_crowd_v2.crowd_templates import build_crowd_scene
+from warehouse_crowd_v2.crowd_templates import build_crowd_scene, sample_warehouse_goal
 from drone_camera_utils import (
     configure_omninxt_camera,
     create_camera_viewport_window,
@@ -505,6 +519,7 @@ class PegasusApp:
         if ENABLE_PEDESTRIAN_OBSTACLE_AVOIDANCE:
             self._try_load_initial_obstacles()
         self.crowd_scene = ACTIVE_CROWD_SCENE
+        self.current_target_point = np.asarray(TARGET_POINT, dtype=float)
         self.crowd_pool_scene = self._pool_scene_for_active_scene(self.crowd_scene)
         self.inactive_person_park_origin = [1000.0, 1000.0, 0.0]
         (
@@ -531,9 +546,23 @@ class PegasusApp:
         self._frame_count = 0
         self._timeline_was_playing = False
         self._timeline_stop_seen = False
-        self.completed_trajectory_count = 0
+        self._seed_progress_state = None
+        if DATA_RECORD_ENABLED:
+            self._seed_progress_state = resolve_seed_progress(
+                DATASET_ROOT, DATA_RECORD_RUN_ID,
+                DATA_RECORD_SEED_START, DATA_RECORD_SEED_END,
+                resume=DATA_RECORD_RESUME_ENABLED,
+            )
+            write_seed_progress(DATA_RECORD_PROGRESS_PATH, self._seed_progress_state)
+        self.completed_trajectory_count = (
+            len(self._seed_progress_state["completed"])
+            if self._seed_progress_state is not None else 0
+        )
         self.discarded_trajectory_count = 0
-        self.trajectory_limit_reached = False
+        self.trajectory_limit_reached = bool(
+            self._seed_progress_state is not None
+            and int(self._seed_progress_state["current_seed"]) > DATA_RECORD_SEED_END
+        )
         self._last_record_size_check_wall = 0.0
         self._last_control_update_time = None
         self._ego_physical_collision_count = 0
@@ -541,6 +570,7 @@ class PegasusApp:
         self._ego_environment_collision_count = 0
         self._ego_collision_active_pairs = set()
         self._ego_collision_last_seen = {}
+        self._pending_recording_collision = None
         self._ego_contact_report_sub = (
             get_physx_simulation_interface().subscribe_contact_report_events(
                 self._on_ego_contact_report_event
@@ -584,7 +614,7 @@ class PegasusApp:
             )
             self.skeleton_packet_receiver.start()
             carb.log_warn(
-                "[REC][V2] Skeleton receiver listening on {}:{}".format(
+                "[REC][V3] Skeleton receiver listening on {}:{}".format(
                     DATA_RECORD_SKELETON_HOST, DATA_RECORD_SKELETON_PORT))
         self.data_recorder = SkeletonStateDatasetRecorder(
             drone=self.drone,
@@ -592,11 +622,9 @@ class PegasusApp:
             skeleton_receiver=self.skeleton_packet_receiver,
             privileged_provider=self._dataset_privileged_snapshot,
             episode_metadata_provider=self._dataset_episode_metadata,
-            target_point=TARGET_POINT,
-            goal_region={
-                "x_range": DATASET_GOAL_X_RANGE,
-                "y_min": DATASET_GOAL_Y_MIN,
-            },
+            people_count_provider=lambda: int(self.crowd_scene.num_people),
+            target_point=self.current_target_point,
+            goal_region=None,
             dataset_root=DATASET_ROOT,
             sample_rate_hz=DATA_RECORD_HZ,
             max_queue_size=DATA_RECORD_QUEUE_SIZE,
@@ -634,7 +662,7 @@ class PegasusApp:
                 shared_cmd=self.shared_cmd,
                 drone=self.drone,
                 people=self.people,
-                target_point=TARGET_POINT,
+                target_point=self.current_target_point,
                 walk_polygon=self.walk_polygon,
                 obstacle_aabbs_getter=lambda: self.obstacle_aabbs,
                 start_recording_callback=(
@@ -1463,7 +1491,7 @@ class PegasusApp:
                 "yaw_rate_rps": float(yaw_rate),
             },
             "applied": applied,
-            # Stable controller-independent convention consumed by dataset v2.
+            # Stable controller-independent convention consumed by dataset v3.
             "applied_body_flu": applied_body_flu,
             "mavsdk": mavsdk_snapshot,
             "control_update_sim_time": (
@@ -1474,23 +1502,9 @@ class PegasusApp:
 
     def _dataset_privileged_snapshot(self):
         """Return simulator truth that must never enter the policy encoder."""
-        drone_state = getattr(self.drone, "state", None)
-        drone = {}
-        if drone_state is not None:
-            drone = {
-                "position": np.asarray(drone_state.position, dtype=float).tolist(),
-                "velocity": np.asarray(
-                    drone_state.linear_velocity, dtype=float).tolist(),
-                "acceleration": np.asarray(
-                    drone_state.linear_acceleration, dtype=float).tolist(),
-                "quaternion_xyzw": np.asarray(
-                    drone_state.attitude, dtype=float).tolist(),
-            }
-        marker_positions = self.skeleton_tracker.marker_positions or {}
         people = []
         active_people = self.people[:int(self.crowd_scene.num_people)]
         for person_index, person in enumerate(active_people):
-            name = person._stage_prefix.rstrip("/").split("/")[-1]
             state = getattr(person, "state", None)
             if state is None:
                 continue
@@ -1499,31 +1513,12 @@ class PegasusApp:
                 continue
             velocity = np.asarray(
                 getattr(state, "linear_velocity", np.zeros(3)), dtype=float)
-            controller = getattr(person, "_controller", None)
-            joints_by_name = marker_positions.get(name, {}) or {}
-            collision_joints = []
-            collision_valid = []
-            for joint_name in self.skeleton_tracker.joint_names:
-                value = joints_by_name.get(joint_name)
-                valid = value is not None
-                array = np.zeros(3) if not valid else np.asarray(value, dtype=float)
-                valid = bool(valid and array.shape == (3,) and np.isfinite(array).all())
-                collision_joints.append(
-                    array.astype(float).tolist() if valid else [0.0, 0.0, 0.0])
-                collision_valid.append(valid)
-            pelvis = joints_by_name.get("Pelvis")
             people.append({
                 "id": int(person_index),
-                "name": name,
-                "group_id": getattr(controller, "crowd_group_id", None),
                 "position": position.astype(float).tolist(),
                 "velocity": velocity.astype(float).tolist(),
-                "pelvis": None if pelvis is None else
-                np.asarray(pelvis, dtype=float).tolist(),
-                "collision_joints": collision_joints,
-                "collision_joint_valid": collision_valid,
             })
-        return {"drone": drone, "people": people}
+        return {"people": people}
 
     def _dataset_episode_metadata(self):
         people = []
@@ -1545,13 +1540,40 @@ class PegasusApp:
             "scene_key": str(self.crowd_scene.key),
             "crowd_seed": int(self.crowd_scene.seed),
             "crowd_num_people": int(self.crowd_scene.num_people),
+            "recording_run_id": (
+                DATA_RECORD_RUN_ID if DATA_RECORD_ENABLED else None),
+            "seed_start": (
+                int(DATA_RECORD_SEED_START) if DATA_RECORD_ENABLED else None),
+            "seed_end": (
+                int(DATA_RECORD_SEED_END) if DATA_RECORD_ENABLED else None),
             "control_mode": str(self.control_mode),
+            "navigation_algorithm": (
+                "navrl_no_shield"
+                if self.control_mode in ("navrl", "px4_navrl")
+                and not NAVRL_SAFETY_SHIELD_ENABLED
+                else "navrl"
+                if self.control_mode in ("navrl", "px4_navrl")
+                else str(self.control_mode)
+            ),
+            "navrl_safety_shield_enabled": (
+                bool(NAVRL_SAFETY_SHIELD_ENABLED)
+                if self.control_mode in ("navrl", "px4_navrl") else None
+            ),
+            "navrl_state_source": (
+                str(NAVRL_STATE_SOURCE)
+                if self.control_mode in ("navrl", "px4_navrl") else None
+            ),
+            "navrl_checkpoint": (
+                str(NAVRL_CHECKPOINT)
+                if self.control_mode in ("navrl", "px4_navrl") else None
+            ),
             "benchmark_algorithm": (
                 None if self.benchmark_config is None else
                 self.benchmark_config.get("algorithm")
             ),
-            "drone_spawn_world": [float(value) for value in SPAWN_POS],
-            "goal_world": [float(value) for value in TARGET_POINT],
+            "drone_spawn_world": [float(value) for value in self.current_spawn_pos],
+            "goal_world": [float(value) for value in self.current_target_point],
+            "goal_radius_3d_m": float(DATA_RECORD_GOAL_RADIUS_M),
             "people": people,
         }
 
@@ -1584,6 +1606,8 @@ class PegasusApp:
         if self.data_recorder.is_recording:
             self.data_recorder.stop(reason="manual_stop")
             self._register_completed_trajectory("manual_stop")
+            if not self.trajectory_limit_reached and self._uses_classic_controller():
+                self._handle_completed_classic_episode("manual_stop")
             return
 
         self._start_dataset_recording()
@@ -1597,6 +1621,7 @@ class PegasusApp:
             return True
 
         self._last_record_size_check_wall = 0.0
+        self._pending_recording_collision = None
         self.data_recorder.start()
         return bool(self.data_recorder.is_recording)
 
@@ -1608,11 +1633,11 @@ class PegasusApp:
             )
             return
         if self.data_recorder.is_recording:
-            self.data_recorder.stop(reason="manual_stop")
-            self._register_completed_trajectory("manual_stop")
+            self.data_recorder.stop(reason="controller_error")
+            self._register_completed_trajectory("controller_error")
             if self.trajectory_limit_reached:
                 return
-        self._reset_classic_episode("manual_stop")
+        self._reset_classic_episode("controller_error")
 
     def _enable_drone_contact_reports(self):
         if PhysxSchema is None:
@@ -1736,11 +1761,22 @@ class PegasusApp:
 
         drone_position = np.array(self.drone.state.position, dtype=float)
         reached_goal = self._drone_reached_goal(drone_position)
-        collision = self._detect_drone_pedestrian_collision(drone_position)
+        collision = self._pending_recording_collision
+        self._pending_recording_collision = None
+        if collision is None:
+            collision = self._detect_drone_pedestrian_collision(drone_position)
         if collision is not None:
+            collision = dict(collision)
+            collision.setdefault("category", "human")
+            collision.setdefault("drone_position", drone_position.tolist())
             collision["reached_goal_at_collision"] = bool(reached_goal)
+            reason = (
+                "human_collision"
+                if collision.get("category") == "human"
+                else "static_collision"
+            )
             return {
-                "reason": "collision",
+                "reason": reason,
                 "collision": True,
                 "reached_goal": reached_goal,
                 "details": collision,
@@ -1763,16 +1799,16 @@ class PegasusApp:
         elapsed_sim = self.data_recorder.elapsed_time()
         elapsed_wall = self.data_recorder.elapsed_wall_time()
         if (
-            DATA_RECORD_STUCK_TIMEOUT_SEC is not None
-            and DATA_RECORD_STUCK_TIMEOUT_SEC > 0.0
-            and elapsed_sim >= DATA_RECORD_STUCK_TIMEOUT_SEC
+            DATA_RECORD_TIME_LIMIT_SEC is not None
+            and DATA_RECORD_TIME_LIMIT_SEC > 0.0
+            and elapsed_sim >= DATA_RECORD_TIME_LIMIT_SEC
         ):
             return {
-                "reason": "stuck_timeout",
+                "reason": "time_limit",
                 "details": {
                     "elapsed_sim_sec": float(elapsed_sim),
                     "elapsed_wall_sec": float(elapsed_wall),
-                    "limit_sim_sec": float(DATA_RECORD_STUCK_TIMEOUT_SEC),
+                    "limit_sim_sec": float(DATA_RECORD_TIME_LIMIT_SEC),
                 },
             }
 
@@ -1800,18 +1836,17 @@ class PegasusApp:
             },
         }
 
-    @staticmethod
-    def _drone_reached_goal(drone_position):
-        x = float(drone_position[0])
-        y = float(drone_position[1])
-        goal_x_min, goal_x_max = DATASET_GOAL_X_RANGE
-        return goal_x_min <= x <= goal_x_max and y >= DATASET_GOAL_Y_MIN
+    def _drone_reached_goal(self, drone_position):
+        return float(np.linalg.norm(
+            np.asarray(drone_position, dtype=float) - self.current_target_point
+        )) <= float(DATA_RECORD_GOAL_RADIUS_M)
 
-    @staticmethod
-    def _goal_details(drone_position):
+    def _goal_details(self, drone_position):
         return {
-            "goal_x_range": [float(DATASET_GOAL_X_RANGE[0]), float(DATASET_GOAL_X_RANGE[1])],
-            "goal_y_min": float(DATASET_GOAL_Y_MIN),
+            "goal_position": self.current_target_point.astype(float).tolist(),
+            "goal_radius_3d_m": float(DATA_RECORD_GOAL_RADIUS_M),
+            "goal_distance_3d_m": float(np.linalg.norm(
+                np.asarray(drone_position, dtype=float) - self.current_target_point)),
             "drone_position": np.array(drone_position, dtype=float).tolist(),
         }
 
@@ -1935,6 +1970,16 @@ class PegasusApp:
                 f"category={contact['category']}, "
                 f"position=({position[0]:.2f},{position[1]:.2f},{position[2]:.2f})"
             )
+            if (
+                self.data_recorder.is_recording
+                and self._pending_recording_collision is None
+            ):
+                self._pending_recording_collision = {
+                    **contact,
+                    "collider_pair": list(pair),
+                    "drone_position": position.tolist(),
+                    "source": "isaacsim_physx_contact_report_callback",
+                }
             if self.navigation_benchmark is not None:
                 self.navigation_benchmark.record_collision(
                     sim_now,
@@ -1974,17 +2019,17 @@ class PegasusApp:
             event_details=event["details"],
         )
         self.data_recorder.update(force=True)
-        if event["reason"] == "collision":
+        if event["reason"] in ("human_collision", "static_collision"):
             details = event["details"]
             carb.log_warn(
-                f"[REC] Collision detected: pedestrian={details['pedestrian_id']}, "
-                f"joint={details['joint_name']}, drone_collider={details['drone_collider']}, "
-                f"pedestrian_collider={details['pedestrian_collider']}"
+                f"[REC] Collision detected: category={details.get('category')}, "
+                f"other={details.get('other_collider') or details.get('pedestrian_collider')}, "
+                f"drone={details.get('drone_collider')}"
             )
         elif event["reason"] == "reached_goal":
             carb.log_warn(
-                f"[REC] Goal reached: {DATASET_GOAL_X_RANGE[0]:.2f} <= x <= "
-                f"{DATASET_GOAL_X_RANGE[1]:.2f}, y >= {DATASET_GOAL_Y_MIN:.2f}"
+                f"[REC] Goal reached: distance_3d <= "
+                f"{DATA_RECORD_GOAL_RADIUS_M:.2f}m"
             )
         self.data_recorder.stop(
             reason=event["reason"],
@@ -2028,7 +2073,7 @@ class PegasusApp:
             self._reset_classic_episode(reason)
             return
         if (
-            self.control_mode == "px4_classic"
+            self._uses_px4_backend()
             and PX4_LAND_BEFORE_EPISODE_RESET
             and self.mavsdk_bridge is not None
         ):
@@ -2126,12 +2171,42 @@ class PegasusApp:
 
     def _should_restart_px4_between_episodes(self):
         return (
-            self.control_mode == "px4_classic"
+            self._uses_px4_backend()
             and bool(PX4_RESTART_BETWEEN_EPISODES)
             and self.px4_backend is not None
         )
 
     def _register_completed_trajectory(self, reason):
+        if self._seed_progress_state is not None:
+            completed_seed = int(self.crowd_scene.seed)
+            self._seed_progress_state = mark_seed_completed(
+                self._seed_progress_state, completed_seed, reason)
+            write_seed_progress(DATA_RECORD_PROGRESS_PATH, self._seed_progress_state)
+            self.completed_trajectory_count = len(
+                self._seed_progress_state["completed"])
+            next_seed = int(self._seed_progress_state["current_seed"])
+            if next_seed == completed_seed:
+                carb.log_warn(
+                    f"[REC][SEED] seed={completed_seed} ended with {reason}; "
+                    "it is incomplete/invalid and will be retried."
+                )
+            else:
+                carb.log_warn(
+                    f"[REC][SEED] completed={completed_seed}, reason={reason}, "
+                    f"progress={self.completed_trajectory_count}/"
+                    f"{DATA_RECORD_MAX_TRAJECTORIES}, "
+                    f"next={'complete' if next_seed > DATA_RECORD_SEED_END else next_seed}"
+                )
+            if next_seed > DATA_RECORD_SEED_END:
+                self.trajectory_limit_reached = True
+                if self.input_controller is not None:
+                    self.input_controller.quit = True
+                carb.log_warn(
+                    f"[REC][SEED] Seed range {DATA_RECORD_SEED_START}.."
+                    f"{DATA_RECORD_SEED_END} complete. Stopping simulation."
+                )
+            return
+
         if DATA_RECORD_MAX_TRAJECTORIES is None or DATA_RECORD_MAX_TRAJECTORIES <= 0:
             return
 
@@ -2297,7 +2372,9 @@ class PegasusApp:
 
         if is_stopped:
             if not self._timeline_stop_seen:
-                self.data_recorder.stop(reason="manual_stop")
+                if self.data_recorder.is_recording:
+                    self.data_recorder.stop(reason="manual_stop")
+                    self._register_completed_trajectory("manual_stop")
             self._timeline_stop_seen = True
             self._timeline_was_playing = False
             return
@@ -2312,28 +2389,36 @@ class PegasusApp:
         self._timeline_was_playing = is_playing
 
     def _pool_scene_for_active_scene(self, scene):
-        if not CROWD_RANDOMIZE_TEMPLATE:
-            return scene
         if CROWD_POOL_PEOPLE_COUNT <= scene.num_people:
             return scene
 
-        template = {
+        template = dict(CROWD_TEMPLATE)
+        template.update({
             "num_people": CROWD_POOL_PEOPLE_COUNT,
-            "group_spacing": scene.group_spacing,
-            "direction": scene.direction,
-            "drone_distance": scene.drone_distance,
-            "speed": scene.speed,
-            "seed": None,
-            "walk_polygon": self.walk_polygon,
-            "valid_people_counts": CROWD_TEMPLATE["valid_people_counts"],
-            "drone_x_range": CROWD_TEMPLATE["drone_x_range"],
-            "drone_y_range": CROWD_TEMPLATE["drone_y_range"],
-            "direction_start_bounds": CROWD_TEMPLATE["direction_start_bounds"],
-        }
+            "seed": scene.seed,
+        })
         return build_crowd_scene(**template)
 
     def _resample_scene_after_timeline_stop(self):
-        if CROWD_RANDOMIZE_TEMPLATE:
+        if self._seed_progress_state is not None:
+            next_seed = int(self._seed_progress_state["current_seed"])
+            if next_seed > DATA_RECORD_SEED_END:
+                return
+            template = dict(CROWD_TEMPLATE)
+            template["seed"] = next_seed
+            if str(template.get("crowd_layout", "sparse")) == "sparse":
+                template["num_people"] = random.Random(next_seed).choice(
+                    tuple(template["valid_people_counts"])
+                )
+        elif getattr(self.crowd_scene, "seed", None) is not None:
+            template = dict(CROWD_TEMPLATE)
+            next_seed = int(self.crowd_scene.seed) + 1
+            template["seed"] = next_seed
+            if str(template.get("crowd_layout", "sparse")) == "sparse":
+                template["num_people"] = random.Random(next_seed).choice(
+                    tuple(template["valid_people_counts"])
+                )
+        elif CROWD_RANDOMIZE_TEMPLATE:
             template = sample_crowd_template()
         else:
             template = dict(CROWD_TEMPLATE)
@@ -2346,6 +2431,11 @@ class PegasusApp:
             return
 
         self.crowd_scene = scene
+        if getattr(scene, "seed", None) is not None:
+            self._set_episode_target(sample_warehouse_goal(
+                int(scene.seed), DATASET_GOAL_X_RANGE,
+                (DATASET_GOAL_Y_MIN, DATASET_GOAL_Y_MIN + 2.0),
+            ))
         self.current_spawn_pos = self._drone_spawn_pos(scene.drone_spawn)
         self._move_drone_to_spawn(self.current_spawn_pos)
         self._move_hidden_ground_to_spawn(self.current_spawn_pos)
@@ -2355,6 +2445,19 @@ class PegasusApp:
         self._enforce_people_initial_positions()
         self.skeleton_tracker.update_markers(
             self._simulation_time(), force=True
+        )
+
+    def _set_episode_target(self, target_point):
+        target = np.asarray(target_point, dtype=float).reshape(3)
+        self.current_target_point = target
+        if self.classic_controller is not None:
+            self.classic_controller.target_point = target.copy()
+        self.data_recorder.target_point = target.copy()
+        self.data_recorder.reward_calculator.target = target.copy()
+        self.data_recorder.reward_calculator.goal_region = None
+        carb.log_warn(
+            f"[APP][EPISODE] seed={self.crowd_scene.seed}, "
+            f"goal=({target[0]:.2f},{target[1]:.2f},{target[2]:.2f})"
         )
 
     def _move_drone_to_spawn(self, spawn_pos):

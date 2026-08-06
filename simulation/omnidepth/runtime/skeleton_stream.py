@@ -52,7 +52,7 @@ def _source_code(source, predicted):
         return SOURCE_CODES["hitnet"]
     if source.startswith("isaac_gt_depth"):
         return SOURCE_CODES["isaac_gt_depth"]
-    if source.startswith("invalid"):
+    if source.startswith("invalid") or source == "disabled_head_joint":
         return SOURCE_CODES["invalid"]
     return SOURCE_CODES["other"]
 
@@ -102,7 +102,7 @@ def _joint_row(joint):
 
 
 def build_skeleton_packet(people, stamp_ns, sequence, joint_names,
-                          frame_id="base_link"):
+                          frame_id="base_link", session_id=None):
     """Create one self-describing packet with exactly 17 joints per person."""
     encoded_people = []
     joint_count = len(joint_names)
@@ -118,10 +118,20 @@ def build_skeleton_packet(people, stamp_ns, sequence, joint_names,
             joints.append(_joint_row(joint))
         encoded_people.append({
             "person_id": int(person["person_id"]),
+            "track_uid": str(person.get(
+                "track_uid", person["person_id"])),
+            "track_state": str(person.get("track_state", "observed")),
+            "identity_confidence": round(_finite(
+                person.get("identity_confidence", 1.0)), 6),
+            "track_age_frames": int(person.get("track_age_frames", 1)),
+            "time_since_observation_ms": round(max(0.0, _finite(
+                person.get("time_since_observation_ms", 0.0))), 3),
+            "id_uncertain": bool(person.get("id_uncertain", False)),
             "joints": joints,
         })
     return {
         "schema": SCHEMA,
+        "session_id": None if session_id is None else str(session_id),
         "sequence": int(sequence),
         "timestamp_ns": int(stamp_ns),
         "frame_id": frame_id,
@@ -238,6 +248,13 @@ class StgcnWindow:
         self.frames = deque(maxlen=self.window)
         self.slot_ids = [None] * self.max_people
         self.last_seen = {}
+        self.session_id = None
+
+    def _reset_session(self, session_id):
+        self.frames.clear()
+        self.slot_ids = [None] * self.max_people
+        self.last_seen.clear()
+        self.session_id = session_id
 
     def _slot_for(self, person_id, sequence):
         if person_id in self.slot_ids:
@@ -256,12 +273,22 @@ class StgcnWindow:
 
     def push(self, packet):
         validate_packet(packet)
+        session_id = packet.get("session_id")
+        if self.session_id is None:
+            self.session_id = session_id
+        elif session_id != self.session_id:
+            # Numeric IDs restart with the perception process; never join two
+            # sessions into one temporal ST-GCN window.
+            self._reset_session(session_id)
         sequence = int(packet["sequence"])
         frame = np.zeros((len(STGCN_FEATURES), 17, self.max_people),
                          dtype=np.float32)
         field = {name: index for index, name in enumerate(JOINT_FIELDS)}
         for person in packet.get("people", []):
-            slot = self._slot_for(int(person["person_id"]), sequence)
+            identity = str(person.get(
+                "track_uid", "{}:{}".format(
+                    session_id, int(person["person_id"]))))
+            slot = self._slot_for(identity, sequence)
             rows = np.asarray(person["joints"], dtype=np.float32)
             for channel, name in enumerate(STGCN_FEATURES):
                 frame[channel, :, slot] = rows[:, field[name]]

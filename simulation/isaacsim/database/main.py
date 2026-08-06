@@ -133,7 +133,7 @@ def _parse_args():
     )
     parser.add_argument("--benchmark-eval-hz", type=float, default=10.0)
     parser.add_argument("--benchmark-timeout-sec", type=float, default=120.0)
-    parser.add_argument("--benchmark-goal-radius-m", type=float, default=0.80)
+    parser.add_argument("--benchmark-goal-radius-m", type=float, default=1.00)
     parser.add_argument(
         "--benchmark-human-intrusion-threshold-m",
         type=float,

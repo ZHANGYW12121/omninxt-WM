@@ -3,9 +3,13 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
+CALLER_DATASET_ROOT="${OMNINXT_DATASET_ROOT:-}"
 if [[ -f "$REPO_ROOT/.local/machine.env" ]]; then
   # shellcheck disable=SC1091
   source "$REPO_ROOT/.local/machine.env"
+fi
+if [[ -n "$CALLER_DATASET_ROOT" ]]; then
+  export OMNINXT_DATASET_ROOT="$CALLER_DATASET_ROOT"
 fi
 ISAACSIM_ROOT="${ISAACSIM_ROOT:-${ISAAC_ROOT:-}}"
 [[ -x "$ISAACSIM_ROOT/python.sh" ]] || {

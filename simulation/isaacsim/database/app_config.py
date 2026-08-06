@@ -6,6 +6,12 @@ import random
 
 import numpy as np
 
+from recording_seed_progress import (
+    normalize_run_id,
+    resolve_seed_progress,
+    seed_progress_path,
+)
+
 from warehouse_crowd_v2.crowd_templates import (
     VALID_DIRECTIONS,
     VALID_DRONE_DISTANCES,
@@ -111,9 +117,9 @@ DATA_RECORD_QUEUE_SIZE = 16
 DATA_RECORD_CHUNK_FRAMES = int(os.environ.get(
     "OMNINXT_DATA_RECORD_CHUNK_FRAMES", "256"))
 DATA_RECORD_STORAGE_MAX_PEOPLE = int(os.environ.get(
-    "OMNINXT_DATA_RECORD_STORAGE_MAX_PEOPLE", "32"))
+    "OMNINXT_DATA_RECORD_STORAGE_MAX_PEOPLE", "60"))
 DATA_RECORD_PRIVILEGED_MAX_PEOPLE = int(os.environ.get(
-    "OMNINXT_DATA_RECORD_PRIVILEGED_MAX_PEOPLE", "32"))
+    "OMNINXT_DATA_RECORD_PRIVILEGED_MAX_PEOPLE", "60"))
 DATA_RECORD_SYNC_TOLERANCE_SEC = float(os.environ.get(
     "OMNINXT_DATA_RECORD_SYNC_TOLERANCE_SEC", "0.075"))
 DATA_RECORD_SKELETON_HOST = os.environ.get(
@@ -123,8 +129,44 @@ DATA_RECORD_SKELETON_PORT = int(os.environ.get(
 DATASET_ROOT = os.path.expanduser(
     os.environ.get("OMNINXT_DATASET_ROOT", os.path.join(ZYW_ROOT, "database_quadcamera"))
 )
-DATA_RECORD_MAX_TRAJECTORIES = 600
-DATA_RECORD_STUCK_TIMEOUT_SEC = 120.0
+_DATA_RECORD_DEFAULT_SEED_TEXT = os.environ.get(
+    "WAREHOUSE_CROWD_SEED", "1").strip()
+_DATA_RECORD_DEFAULT_SEED = int(_DATA_RECORD_DEFAULT_SEED_TEXT or "1")
+DATA_RECORD_SEED_START = int(os.environ.get(
+    "OMNINXT_DATA_RECORD_SEED_START", str(_DATA_RECORD_DEFAULT_SEED)))
+DATA_RECORD_SEED_END = int(os.environ.get(
+    "OMNINXT_DATA_RECORD_SEED_END", str(DATA_RECORD_SEED_START + 599)))
+if DATA_RECORD_SEED_START < 0 or DATA_RECORD_SEED_END < DATA_RECORD_SEED_START:
+    raise ValueError("OMNINXT_DATA_RECORD_SEED_START/END define an invalid seed range")
+DATA_RECORD_RUN_ID = normalize_run_id(os.environ.get(
+    "OMNINXT_DATA_RECORD_RUN_ID",
+    f"seed_{DATA_RECORD_SEED_START}_{DATA_RECORD_SEED_END}",
+))
+DATA_RECORD_RESUME_ENABLED = os.environ.get(
+    "OMNINXT_DATA_RECORD_RESUME", "1") == "1"
+DATA_RECORD_PROGRESS_PATH = seed_progress_path(
+    DATASET_ROOT, DATA_RECORD_RUN_ID,
+    DATA_RECORD_SEED_START, DATA_RECORD_SEED_END,
+)
+_DATA_RECORD_SEED_STATE = resolve_seed_progress(
+    DATASET_ROOT, DATA_RECORD_RUN_ID,
+    DATA_RECORD_SEED_START, DATA_RECORD_SEED_END,
+    resume=DATA_RECORD_ENABLED and DATA_RECORD_RESUME_ENABLED,
+)
+DATA_RECORD_NEXT_SEED = int(_DATA_RECORD_SEED_STATE["current_seed"])
+DATA_RECORD_RANGE_COMPLETE = DATA_RECORD_NEXT_SEED > DATA_RECORD_SEED_END
+DATA_RECORD_INITIAL_SEED = min(DATA_RECORD_NEXT_SEED, DATA_RECORD_SEED_END)
+DATA_RECORD_MAX_TRAJECTORIES = (
+    DATA_RECORD_SEED_END - DATA_RECORD_SEED_START + 1)
+DATA_RECORD_TIME_LIMIT_SEC = float(os.environ.get(
+    "OMNINXT_DATA_RECORD_TIME_LIMIT_SEC",
+    os.environ.get("OMNINXT_DATA_RECORD_STUCK_TIMEOUT_SEC", "120.0"),
+))
+# Backward-compatible name for external imports. The elapsed-episode watchdog
+# is a time-limit truncation; it must not be mislabeled as a stuck failure.
+DATA_RECORD_STUCK_TIMEOUT_SEC = DATA_RECORD_TIME_LIMIT_SEC
+DATA_RECORD_GOAL_RADIUS_M = float(os.environ.get(
+    "OMNINXT_DATA_RECORD_GOAL_RADIUS_M", "1.0"))
 DATA_RECORD_MAX_RECORD_BYTES = 5 * 1024**3
 DATA_RECORD_SIZE_CHECK_INTERVAL_SEC = 5.0
 DATA_CAMERA_RESOLUTION = (1280, 720)
@@ -356,10 +398,14 @@ DATA_REWARD_CONFIG = {
     "event_rewards": {
         "reached_goal": 100.0,
         "collision": -120.0,
+        "human_collision": -120.0,
+        "static_collision": -120.0,
         "out_of_bounds": -100.0,
         "crash": -100.0,
         "stuck_timeout": -20.0,
         "record_size_limit": 0.0,
+        "time_limit": 0.0,
+        "controller_error": 0.0,
         "manual_stop": 0.0,
         "shutdown": 0.0,
     },
@@ -408,6 +454,9 @@ MAVSDK_BODY_RIGHT_SIGN = -1.0
 MAVSDK_BODY_DOWN_SIGN = -1.0
 MAVSDK_YAWSPEED_SIGN = -1.0
 
+# A fresh SITL/MAVSDK stack is required after every episode for every px4_*
+# planner.  Isaac teleports the vehicle to the next spawn, so reusing an armed
+# PX4 instance can leave its estimator/arming state inconsistent with PhysX.
 PX4_RESTART_BETWEEN_EPISODES = True
 PX4_RESTART_DELAY_SEC = 1.0
 PX4_LAND_BEFORE_EPISODE_RESET = False
@@ -535,8 +584,6 @@ NAVRL_CHECKPOINT = os.path.expanduser(
 )
 NAVRL_DEVICE = os.environ.get("NAVRL_DEVICE", "cpu")
 NAVRL_STATIC_HEIGHT_M = float(os.environ.get("NAVRL_STATIC_HEIGHT_M", "2.6"))
-NAVRL_FIXED_GOAL_X = float(os.environ.get("NAVRL_FIXED_GOAL_X", "2.25"))
-NAVRL_FIXED_GOAL_Y = float(os.environ.get("NAVRL_FIXED_GOAL_Y", "27.00"))
 NAVRL_GOAL_HOLD_RADIUS_M = float(os.environ.get("NAVRL_GOAL_HOLD_RADIUS_M", "1.00"))
 NAVRL_GOAL_HOLD_MAX_SPEED_MPS = float(
     os.environ.get("NAVRL_GOAL_HOLD_MAX_SPEED_MPS", "0.50")
@@ -632,7 +679,7 @@ PEDESTRIAN_PREDICTIVE_CONFLICT_DISTANCE = 0.9
 PEDESTRIAN_PREDICTIVE_TIME_MARGIN = 0.8
 PEDESTRIAN_PREDICTIVE_SIDE_STEP = 1.0
 PEDESTRIAN_SAME_GROUP_MIN_DISTANCE = float(
-    os.environ.get("PEDESTRIAN_SAME_GROUP_MIN_DISTANCE", "0.30")
+    os.environ.get("PEDESTRIAN_SAME_GROUP_MIN_DISTANCE", "0.15")
 )
 PEDESTRIAN_INITIAL_MIN_DISTANCE = float(
     os.environ.get("PEDESTRIAN_INITIAL_MIN_DISTANCE", "1.15")
@@ -710,7 +757,10 @@ CROWD_RANDOM_DIRECTION_CHOICES = VALID_DIRECTIONS
 CROWD_RANDOM_DRONE_DISTANCE_CHOICES = VALID_DRONE_DISTANCES
 CROWD_RANDOM_SPEED_CHOICES = VALID_SPEEDS
 
-_WAREHOUSE_CROWD_SEED_TEXT = os.environ.get("WAREHOUSE_CROWD_SEED", "1").strip()
+_WAREHOUSE_CROWD_SEED_TEXT = (
+    str(DATA_RECORD_INITIAL_SEED)
+    if DATA_RECORD_ENABLED else os.environ.get("WAREHOUSE_CROWD_SEED", "1").strip()
+)
 WAREHOUSE_CROWD_SEED = (
     int(_WAREHOUSE_CROWD_SEED_TEXT) if _WAREHOUSE_CROWD_SEED_TEXT else None
 )
@@ -799,7 +849,9 @@ CROWD_TEMPLATE = {
 }
 CROWD_POOL_PEOPLE_COUNT = (
     max(CROWD_RANDOM_NUM_PEOPLE_CHOICES)
-    if CROWD_RANDOMIZE_TEMPLATE
+    if CROWD_RANDOMIZE_TEMPLATE or (
+        SCENE_PRESET == "warehouse" and WAREHOUSE_CROWD_LAYOUT == "sparse"
+    )
     else CROWD_TEMPLATE["num_people"]
 )
 

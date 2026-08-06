@@ -9,7 +9,6 @@ and never feeds perception.
 """
 
 import argparse
-import copy
 import importlib.util
 import json
 import math
@@ -28,6 +27,7 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
+from motion_skeleton_tracker import MotionSkeletonTracker
 from skeleton_stream import SkeletonTcpSender, build_skeleton_packet
 from trt_rtmpose import TensorRTRTMPose, TensorRTYOLOX
 
@@ -80,8 +80,8 @@ def parse_args():
                         help="Frames between round-robin full-resolution camera detections")
     parser.add_argument("--detector-miss-ttl", type=int, default=3,
                         help="Consecutive per-camera detector misses before dropping boxes")
-    parser.add_argument("--track-hold-sec", type=float, default=0.6,
-                        help="Keep a 3D track through short detector/pose gaps")
+    parser.add_argument("--track-hold-sec", type=float, default=1.2,
+                        help="Publish motion-predicted 3D tracks through short gaps")
     parser.add_argument("--max-person-range", type=float, default=0.0,
                         help="Maximum Euclidean base_link range in metres; <=0 disables the range gate")
     parser.add_argument(
@@ -483,6 +483,45 @@ def box_iou(first, second):
     second_area = max(0.0, second[2] - second[0]) * \
         max(0.0, second[3] - second[1])
     return intersection / max(1e-6, first_area + second_area - intersection)
+
+
+def deduplicate_body_poses(people):
+    """Collapse duplicate RTMPose bodies before 3D lifting and identity.
+
+    A full-body and partial-body detector box can cover the same person. Keep
+    the higher-confidence pose when at least four body joints describe the
+    same image skeleton. A briefly merged pair is represented by one
+    observation while the motion tracker coasts the other identity.
+    """
+    retained = []
+    removed_detection_ids = []
+    for candidate in sorted(people, key=lambda value: -float(np.mean(
+            np.asarray(value["scores"], dtype=np.float32)[5:]))):
+        candidate_points = np.asarray(candidate["points"], dtype=np.float32)
+        candidate_scores = np.asarray(candidate["scores"], dtype=np.float32)
+        duplicate = False
+        for selected in retained:
+            selected_points = np.asarray(selected["points"], dtype=np.float32)
+            selected_scores = np.asarray(selected["scores"], dtype=np.float32)
+            common = ((candidate_scores[5:] >= .22) &
+                      (selected_scores[5:] >= .22))
+            if np.count_nonzero(common) < 4:
+                continue
+            first = candidate_points[5:][common]
+            second = selected_points[5:][common]
+            all_points = np.vstack((first, second))
+            body_height = max(35.0, float(
+                np.max(all_points[:, 1]) - np.min(all_points[:, 1])))
+            median_distance = float(np.median(
+                np.linalg.norm(first - second, axis=1)))
+            if median_distance / body_height <= .18:
+                duplicate = True
+                break
+        if duplicate:
+            removed_detection_ids.append(int(candidate["detection_id"]))
+        else:
+            retained.append(candidate)
+    return retained, removed_detection_ids
 
 
 def update_detection_tracks(tracks, detections, max_misses):
@@ -1508,215 +1547,6 @@ def fuse_people(raw_people, merge_distance):
     return fused
 
 
-class KalmanJoint:
-    def __init__(self, position, stamp_sec, sigma, score=0.0,
-                 source="unknown", source_age_ms=0.0):
-        self.state = np.r_[position, np.zeros(3, dtype=np.float64)]
-        self.covariance = np.diag([sigma ** 2] * 3 + [.8] * 3)
-        self.stamp = stamp_sec
-        self.last_measurement = stamp_sec
-        self.last_score = float(score)
-        self.last_sigma = float(sigma)
-        self.last_source = str(source)
-        self.last_source_age_ms = float(source_age_ms)
-
-    def predict(self, stamp_sec):
-        dt = max(0.0, min(.5, stamp_sec - self.stamp))
-        transition = np.eye(6)
-        transition[:3, 3:] = np.eye(3) * dt
-        acceleration_noise = .8
-        process = np.eye(6) * 1e-5
-        process[:3, :3] *= max(1e-4, dt ** 4 * acceleration_noise)
-        process[3:, 3:] *= max(1e-4, dt ** 2 * acceleration_noise)
-        self.state = transition.dot(self.state)
-        self.covariance = transition.dot(self.covariance).dot(
-            transition.T) + process
-        self.stamp = stamp_sec
-
-    def update(self, measurement, stamp_sec, sigma, max_innovation=None,
-               score=0.0, source="unknown", source_age_ms=0.0):
-        self.predict(stamp_sec)
-        observation = np.zeros((3, 6), dtype=np.float64)
-        observation[:, :3] = np.eye(3)
-        noise = np.eye(3) * sigma ** 2
-        innovation = measurement - observation.dot(self.state)
-        if max_innovation is not None and \
-                float(np.linalg.norm(innovation)) > max_innovation:
-            return False
-        residual_covariance = observation.dot(self.covariance).dot(
-            observation.T) + noise
-        gain = self.covariance.dot(observation.T).dot(
-            np.linalg.inv(residual_covariance))
-        self.state += gain.dot(innovation)
-        self.covariance = (np.eye(6) - gain.dot(observation)).dot(
-            self.covariance)
-        self.last_measurement = stamp_sec
-        self.last_score = float(score)
-        self.last_sigma = float(sigma)
-        self.last_source = str(source)
-        self.last_source_age_ms = float(source_age_ms)
-        return True
-
-
-class SkeletonTracker:
-    def __init__(self, hold_sec=.6, max_person_range=5.0):
-        self.tracks = {}
-        # Positive IDs are required by the factorized world-model slot schema.
-        self.next_id = 1
-        self.hold_sec = max(0.0, float(hold_sec))
-        self.max_person_range = max(0.0, float(max_person_range))
-
-    def update(self, people, stamp_ns):
-        stamp_sec = stamp_ns / 1e9
-        measurements = []
-        for person in people:
-            center = person_tracking_center(person)
-            if center is not None:
-                measurements.append((person, center))
-        associations = {}
-        candidates = []
-        for person_index, (_, center) in enumerate(measurements):
-            for track_id, track in self.tracks.items():
-                distance = float(np.linalg.norm(center - track["center_body"]))
-                if distance < 1.5:
-                    candidates.append((distance, person_index, track_id))
-        used_tracks = set()
-        for _, person_index, track_id in sorted(candidates):
-            if person_index not in associations and track_id not in used_tracks:
-                associations[person_index] = track_id
-                used_tracks.add(track_id)
-        for person_index in range(len(measurements)):
-            if person_index not in associations:
-                track_id = self.next_id
-                self.next_id += 1
-                self.tracks[track_id] = {
-                    "joints": {}, "center_body": measurements[person_index][1],
-                    "last_seen": stamp_sec}
-                associations[person_index] = track_id
-        output = []
-        for person_index, (person, _) in enumerate(measurements):
-            track_id = associations[person_index]
-            track = self.tracks[track_id]
-            filtered_joints = []
-            for joint in person["joints"]:
-                value = dict(joint)
-                xyz = joint["xyz_imu_m"]
-                joint_filter = track["joints"].get(joint["id"])
-                if xyz is not None:
-                    body = np.asarray(xyz, dtype=np.float64)
-                    sigma = float(joint.get("measurement_sigma_m") or .2)
-                    source = str(joint.get("source") or "unknown")
-                    source_age_ms = float(
-                        joint.get("measurement_age_ms") or
-                        joint.get("hitnet_age_ms") or 0.0)
-                    if joint_filter is None:
-                        joint_filter = KalmanJoint(
-                            body, stamp_sec, sigma, joint.get("score", 0.0),
-                            source, source_age_ms)
-                        track["joints"][joint["id"]] = joint_filter
-                    else:
-                        # Reject isolated HITNet fallbacks that disagree with
-                        # the motion-predicted joint by more than 0.6 m.  A
-                        # fresh stereo triangulation is allowed a wider gate
-                        # because it is the primary geometric measurement.
-                        primary_stereo = (
-                            source.startswith("stereo_") or
-                            source == "anchor_epipolar" or
-                            source.startswith("isaac_gt_depth")
-                        )
-                        # At 10 Hz a real joint should not jump half a metre
-                        # between consecutive observations.  Reset to a fresh
-                        # stereo measurement beyond that bound instead of
-                        # letting an old Kalman state visibly trail the body.
-                        gate = .6 if source.startswith("hitnet_") else .5
-                        accepted = joint_filter.update(
-                            body, stamp_sec, sigma, max_innovation=gate,
-                            score=joint.get("score", 0.0),
-                            source=source, source_age_ms=source_age_ms)
-                        if not accepted and primary_stereo:
-                            joint_filter = KalmanJoint(
-                                body, stamp_sec, sigma,
-                                joint.get("score", 0.0),
-                                source, source_age_ms)
-                            track["joints"][joint["id"]] = joint_filter
-                elif joint_filter is not None:
-                    joint_filter.predict(stamp_sec)
-                if joint_filter is not None and \
-                        stamp_sec - joint_filter.last_measurement <= .35:
-                    body = joint_filter.state[:3]
-                    measurement_age_ms = max(
-                        0.0, (stamp_sec - joint_filter.last_measurement) * 1e3 +
-                        joint_filter.last_source_age_ms)
-                    value["xyz_base_link_raw_m"] = xyz
-                    value["xyz_base_link_m"] = body.round(6).tolist()
-                    # Legacy JSON aliases kept for existing consumers. They
-                    # refer to the same fixed base_link calibration origin.
-                    value["xyz_imu_raw_m"] = xyz
-                    value["xyz_imu_m"] = body.round(6).tolist()
-                    value["predicted"] = xyz is None
-                    value["measurement_age_ms"] = round(
-                        measurement_age_ms, 3)
-                    value["measurement_source"] = joint_filter.last_source
-                    value["last_measurement_score"] = round(
-                        joint_filter.last_score, 6)
-                    value["last_measurement_sigma_m"] = round(
-                        joint_filter.last_sigma, 6)
-                else:
-                    value["xyz_base_link_m"] = None
-                    value["xyz_imu_m"] = None
-                    value["predicted"] = False
-                    value["measurement_age_ms"] = None
-                filtered_joints.append(value)
-            result = dict(person)
-            result["person_id"] = track_id
-            result["joints"] = filtered_joints
-            result["predicted_track"] = False
-            center = person_tracking_center(result)
-            if center is not None:
-                track["center_body"] = center
-            track["last_seen"] = stamp_sec
-            track["last_output"] = copy.deepcopy(result)
-            output.append(result)
-        measured_track_ids = set(associations.values())
-        for track_id, track in self.tracks.items():
-            if track_id in measured_track_ids or "last_output" not in track:
-                continue
-            age = stamp_sec - track["last_seen"]
-            if age <= 0.0 or age > self.hold_sec:
-                continue
-            predicted = copy.deepcopy(track["last_output"])
-            predicted["predicted_track"] = True
-            valid_count = 0
-            for joint in predicted["joints"]:
-                joint_filter = track["joints"].get(joint["id"])
-                if joint_filter is None:
-                    joint["xyz_base_link_m"] = None
-                    joint["xyz_imu_m"] = None
-                    continue
-                joint_filter.predict(stamp_sec)
-                if stamp_sec - joint_filter.last_measurement > self.hold_sec:
-                    joint["xyz_base_link_m"] = None
-                    joint["xyz_imu_m"] = None
-                    continue
-                body = joint_filter.state[:3].round(6).tolist()
-                joint["xyz_base_link_m"] = body
-                joint["xyz_imu_m"] = body
-                joint["predicted"] = True
-                joint["measurement_age_ms"] = round(
-                    (stamp_sec - joint_filter.last_measurement) * 1000.0, 3)
-                valid_count += 1
-            center = person_tracking_center(predicted)
-            if valid_count < 5 or center is None:
-                continue
-            if (self.max_person_range > 0.0 and
-                    float(np.linalg.norm(center)) > self.max_person_range):
-                continue
-            output.append(predicted)
-        self.tracks = {track_id: track for track_id, track in self.tracks.items()
-                       if stamp_sec - track["last_seen"] <= 1.0}
-        return output
-
-
 def publish_ros(publishers, people, stamp_ns):
     stamp = rospy.Time.from_sec(stamp_ns / 1e9)
     poses = PoseArray()
@@ -2111,9 +1941,16 @@ def main():
         "skeleton": rospy.Publisher(
             "/omninxt_pose/skeleton_frame", String, queue_size=1),
     }
-    tracker = SkeletonTracker(
-        hold_sec=args.track_hold_sec,
+    tracker = MotionSkeletonTracker(
+        pose3d.JOINTS,
+        confirmation_hits=3,
+        prediction_timeout=args.track_hold_sec,
+        deletion_timeout=4.0,
         max_person_range=args.max_person_range,
+        # Isaac GT depth has no repeated-texture radial jumps. Disabling the
+        # wide same-ray recovery there prevents two aligned people in a dense
+        # crowd from being collapsed. Hybrid stereo retains the recovery.
+        enable_ray_recovery=args.joint_depth_source != "isaac_gt",
     )
     range_filter = PersonRangeFilter(
         max_range=args.max_person_range,
@@ -2163,6 +2000,7 @@ def main():
         rescue_camera = None
         anchor_boxes_before_dedup = 0
         anchor_boxes_after_dedup = 0
+        pose_duplicate_rois_removed = 0
         range_rejected_people = 0
         if all((index, "anchor") in frame for index in range(4)):
             anchor_views = [frame[(index, "anchor")] for index in range(4)]
@@ -2209,6 +2047,9 @@ def main():
                 make_mosaic(anchor_views), None, estimator, pose_boxes,
                 False, args.anchor_width, args.anchor_height)
             for camera_id in range(4):
+                anchor_people[camera_id], removed = deduplicate_body_poses(
+                    anchor_people[camera_id])
+                pose_duplicate_rois_removed += len(removed)
                 update_tracks_from_pose(
                     anchor_camera_tracks[camera_id],
                     anchor_people[camera_id],
@@ -2244,6 +2085,12 @@ def main():
                 make_mosaic(right_images), None, estimator,
                 boxes_right, False)
             for sector in range(4):
+                left_people[sector], removed_left = deduplicate_body_poses(
+                    left_people[sector])
+                right_people[sector], removed_right = deduplicate_body_poses(
+                    right_people[sector])
+                pose_duplicate_rois_removed += (
+                    len(removed_left) + len(removed_right))
                 matches = associate_people(
                     left_people[sector], right_people[sector],
                     args.keypoint_threshold)
@@ -2308,6 +2155,7 @@ def main():
                                          for values in anchor_people],
             "anchor_boxes_before_dedup": anchor_boxes_before_dedup,
             "anchor_boxes_after_dedup": anchor_boxes_after_dedup,
+            "pose_duplicate_rois_removed": pose_duplicate_rois_removed,
             "left_people_by_sector": [len(values) for values in left_people],
             "right_people_by_sector": [len(values) for values in right_people],
             "stereo_matches_by_sector": match_counts,
@@ -2334,14 +2182,17 @@ def main():
             "rescue_camera": rescue_camera,
             "output_frame": "base_link",
             "runtime_flight_controller": False,
-            "filter_mode": "body_frame_constant_velocity",
+            "filter_mode": "damped_constant_velocity",
+            "identity_mode": "postfusion_3d_motion",
+            "identity_tracker": tracker.status(stamp_ns),
         }
         if backend_sender is not None:
             status["backend_stream"] = backend_sender.status()
         else:
             status["backend_stream"] = {"enabled": False}
         skeleton_packet = build_skeleton_packet(
-            tracked, stamp_ns, frame_index, pose3d.JOINTS)
+            tracked, stamp_ns, frame_index, pose3d.JOINTS,
+            session_id=tracker.session_id)
         skeleton_json = json.dumps(
             skeleton_packet, ensure_ascii=False, separators=(",", ":"))
         publishers["skeleton"].publish(String(data=skeleton_json))

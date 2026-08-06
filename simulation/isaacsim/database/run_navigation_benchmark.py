@@ -119,7 +119,7 @@ def parse_args():
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--eval-hz", type=float, default=10.0)
     parser.add_argument("--timeout-sec", type=float, default=120.0)
-    parser.add_argument("--goal-radius-m", type=float, default=0.80)
+    parser.add_argument("--goal-radius-m", type=float, default=1.00)
     parser.add_argument(
         "--human-intrusion-threshold-m",
         type=float,

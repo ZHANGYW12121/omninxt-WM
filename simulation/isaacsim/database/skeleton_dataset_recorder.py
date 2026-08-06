@@ -16,22 +16,26 @@ import carb
 import numpy as np
 
 from data_recorder import DatasetRecorder
-from dataset_v2_schema import (
+from dataset_v3_schema import (
     ACTION_KEYS,
+    BODY_JOINT_INDICES,
+    BODY_JOINT_NAMES,
     EGO_STATE_KEYS,
-    JOINT_FIELDS,
     REWARD_COMPONENT_KEYS,
     SCHEMA,
     STATE_SOURCE_CODES,
     TERMINATION_CODES,
+    outcome_for_reason,
     build_ego_state,
     ego_reference,
     empty_skeleton_packet,
-    goal_relative_body,
-    normalize_action,
+    goal_position_episode_local,
+    normalized_applied_action,
     privileged_to_arrays,
+    skeleton_source_counts,
     skeleton_to_arrays,
     stack_samples,
+    transition_flags,
     write_npz_atomic,
 )
 
@@ -46,14 +50,16 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
     """
 
     def __init__(self, *args, skeleton_receiver=None, privileged_provider=None,
-                 episode_metadata_provider=None, storage_max_people=32,
-                 privileged_max_people=32, chunk_frames=256,
+                 episode_metadata_provider=None, people_count_provider=None,
+                 storage_max_people=60,
+                 privileged_max_people=60, chunk_frames=256,
                  sync_tolerance_sec=0.075, skeleton_wait_wall_sec=0.75,
                  **kwargs):
         super().__init__(*args, camera_sensor=None, **kwargs)
         self.skeleton_receiver = skeleton_receiver
         self.privileged_provider = privileged_provider
         self.episode_metadata_provider = episode_metadata_provider
+        self.people_count_provider = people_count_provider
         self.storage_max_people = int(storage_max_people)
         self.privileged_max_people = int(privileged_max_people)
         self.chunk_frames = int(chunk_frames)
@@ -63,21 +69,21 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
         self.events_path = None
         self._state_buffer = deque(maxlen=512)
         self._last_packet_arrival_index = -1
-        self._last_seen_tracks = {}
+        self._episode_people_capacity = max(1, self.storage_max_people)
         self._ego_reference = None
-        self._last_sample_sim_time = None
-        self._terminal_sample_written = False
+        self._last_sample_written = False
         self._chunk_count = 0
         self._unmatched_skeleton_count = 0
         self._missing_skeleton_count = 0
         self._capture_count = 0
+        self._skeleton_source_counts = {}
 
     def start(self):
         if self.is_recording:
             return
         now = self._now()
         if now is None:
-            carb.log_warn("[REC][V2] Cannot start without simulation time.")
+            carb.log_warn("[REC][V3] Cannot start without simulation time.")
             return
         root = self.dataset_root
         episodes_root = root / "episodes"
@@ -110,17 +116,25 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
         self.reward_calculator.reset()
         self._state_buffer.clear()
         self._last_packet_arrival_index = -1
-        self._last_seen_tracks.clear()
-        self._ego_reference = None
-        self._last_sample_sim_time = None
-        self._terminal_sample_written = False
+        actual_people = self._safe_provider(self.people_count_provider)
+        try:
+            actual_people = max(1, int(actual_people))
+        except (TypeError, ValueError):
+            actual_people = max(1, self.storage_max_people)
+        self._episode_people_capacity = min(
+            actual_people, max(1, self.storage_max_people),
+            max(1, self.privileged_max_people))
+        initial_drone_state = self._drone_state()
+        self._ego_reference = ego_reference(initial_drone_state)
+        self._last_sample_written = False
         self._chunk_count = 0
         self._unmatched_skeleton_count = 0
         self._missing_skeleton_count = 0
         self._capture_count = 0
+        self._skeleton_source_counts = {}
         self.write_queue = queue.Queue(maxsize=self.max_queue_size)
         self.writer_thread = threading.Thread(
-            target=self._writer_loop, name="SkeletonDatasetV2Writer", daemon=True)
+            target=self._writer_loop, name="SkeletonDatasetV3Writer", daemon=True)
         self.writer_thread.start()
         self.is_recording = True
 
@@ -131,12 +145,26 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
             "sample_rate_hz": self.sample_rate_hz,
             "observation": ["human_skeleton_3d_base_link", "ego_state"],
             "excluded": ["rgb", "depth", "point_cloud", "skeleton_2d"],
+            "source_joint_topology": "COCO17",
+            "recorded_joint_topology": "COCO12_BODY",
+            "recorded_joint_count": len(BODY_JOINT_INDICES),
+            "termination_codes": dict(TERMINATION_CODES),
         }
         manifest_path = root / "dataset_manifest.json"
+        if manifest_path.exists():
+            try:
+                existing_manifest = json.loads(
+                    manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                existing_manifest = {}
+            if existing_manifest.get("schema") != SCHEMA:
+                manifest_path = root / "dataset_manifest_v3.json"
         if not manifest_path.exists():
             self._write_json(manifest_path, manifest)
 
         metadata_extra = self._safe_provider(self.episode_metadata_provider) or {}
+        initial_action = self._read_action() or {}
+        action_limits = initial_action.get("normalization_limits", {})
         metadata = {
             "schema": SCHEMA,
             "episode_id": self.record_dir.name,
@@ -146,21 +174,38 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
             "control_rate_hz": self.control_rate_hz,
             "time_source": self.time_source_name,
             "chunk_frames": self.chunk_frames,
-            "storage_max_people": self.storage_max_people,
-            "privileged_max_people": self.privileged_max_people,
-            "joint_topology": "COCO17",
-            "joint_fields": list(JOINT_FIELDS),
+            "actual_people_count": int(actual_people),
+            "stored_people_count": int(self._episode_people_capacity),
+            "source_joint_topology": "COCO17",
+            "joint_topology": "COCO12_BODY",
+            "source_joint_count": 17,
+            "recorded_joint_count": len(BODY_JOINT_INDICES),
+            "recorded_source_joint_indices": list(BODY_JOINT_INDICES),
+            "joint_names": list(BODY_JOINT_NAMES),
+            "recorded_skeleton_fields": [
+                "human_xyz", "human_confidence", "human_joint_valid",
+                "human_track_id",
+            ],
             "skeleton_frame": "base_link",
             "coordinate_convention": "ROS_FLU: +X forward, +Y left, +Z up",
             "simulation_skeleton_depth_source": "isaac_gt_depth",
             "ego_state_order": list(EGO_STATE_KEYS),
             "action_order": list(ACTION_KEYS),
+            "action_representation": "normalized_applied_body_flu",
+            "action_normalization_limits": {
+                key: float(action_limits.get(key, 1.0)) for key in ACTION_KEYS
+            },
             "reward_component_order": list(REWARD_COMPONENT_KEYS),
+            "termination_codes": dict(TERMINATION_CODES),
             "transition_alignment": (
                 "row t stores observation_t, the action applied over "
                 "observation_(t-1)->observation_t, and reward_t"
             ),
             "target_point": self.target_point.tolist(),
+            "ego_reference_origin_xyz": list(self._ego_reference["origin_xyz"]),
+            "ego_reference_origin_yaw": float(self._ego_reference["origin_yaw"]),
+            "goal_position_episode_local": goal_position_episode_local(
+                self.target_point, self._ego_reference).astype(float).tolist(),
             "goal_region": self.goal_region,
             "reward_config": self.reward_config,
             "privileged_policy_visible": False,
@@ -169,7 +214,7 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
             "episode": metadata_extra,
         }
         self._write_json(self.record_dir / "metadata.json", metadata)
-        carb.log_warn("[REC][V2] Recording started: {}".format(self.record_dir))
+        carb.log_warn("[REC][V3] Recording started: {}".format(self.record_dir))
 
     def update(self, force=False):
         if not self.is_recording:
@@ -207,7 +252,7 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
         self.set_event_status(
             collision=collision, reached_goal=reached_goal,
             termination_reason=reason, event_details=event_details)
-        if reason != "recording" and not self._terminal_sample_written:
+        if reason != "recording" and not self._last_sample_written:
             self.update(force=True)
         self.is_recording = False
         duration = self._elapsed_time()
@@ -238,18 +283,28 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
             "unmatched_skeleton_count": self._unmatched_skeleton_count,
             "missing_skeleton_count": self._missing_skeleton_count,
             "collision": self.collision,
+            "collision_human": bool(
+                self.collision and self.event_details.get("category") == "human"),
+            "collision_static": bool(
+                self.collision and self.event_details.get("category") == "environment"),
             "reached_goal": self.reached_goal,
+            "success": self.termination_reason == "reached_goal",
+            "outcome_class": outcome_for_reason(self.termination_reason),
             "termination_reason": self.termination_reason,
             "event_details": self.event_details,
             "episode_return": self.episode_return,
             "reward_component_sums": self.reward_component_sums,
+            "skeleton_valid_joint_source_counts": {
+                str(key): int(value)
+                for key, value in sorted(self._skeleton_source_counts.items())
+            },
             "skeleton_receiver": (
                 None if self.skeleton_receiver is None
                 else self.skeleton_receiver.status()),
         }
         self._write_json(self.record_dir / "summary.json", summary)
         carb.log_warn(
-            "[REC][V2] Recording stopped: {}, reason={}, frames={}, chunks={}".format(
+            "[REC][V3] Recording stopped: {}, reason={}, frames={}, chunks={}".format(
                 self.record_dir, reason, self.written_frame_count, self._chunk_count))
         self._reset_paths()
 
@@ -264,7 +319,7 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
         try:
             shutil.rmtree(record_dir)
         except OSError as error:
-            carb.log_warn("[REC][V2] Failed to discard {}: {}".format(
+            carb.log_warn("[REC][V3] Failed to discard {}: {}".format(
                 record_dir, error))
         return record_dir
 
@@ -290,8 +345,6 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
         pelvis = self._pelvis_relative_positions(drone_state)
         return {
             "simulation_time_s": simulation_time,
-            "episode_time_s": simulation_time - float(self.start_time),
-            "wall_timestamp_ns": time.time_ns(),
             "capture_wall_monotonic": time.monotonic(),
             "drone_state": drone_state,
             "action": self._read_action(),
@@ -347,16 +400,12 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
         for index, name in enumerate(REWARD_COMPONENT_KEYS):
             self.reward_component_sums[name] += float(
                 sample["reward_components"][index])
-        if bool(sample["is_terminal"]):
-            self._terminal_sample_written = True
+        if bool(sample["is_last"]):
+            self._last_sample_written = True
         return True
 
     def _build_sample(self, snapshot, packet, skeleton_fresh):
         simulation_time = float(snapshot["simulation_time_s"])
-        previous_time = self._last_sample_sim_time
-        dt = 0.0 if previous_time is None else max(
-            0.0, simulation_time - previous_time)
-        self._last_sample_sim_time = simulation_time
         drone_state = snapshot["drone_state"]
         reward, components, diagnostics = self.reward_calculator.compute(
             simulation_time, drone_state,
@@ -365,49 +414,32 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
             reached_goal=snapshot["reached_goal"],
             termination_reason=snapshot["termination_reason"],
         )
-        terminal = snapshot["termination_reason"] != "recording"
+        end_flags = transition_flags(snapshot["termination_reason"])
         first = self.frame_index == 0
-        if first and not terminal:
+        if first and not bool(end_flags["is_last"]):
             reward = 0.0
             components = {name: 0.0 for name in REWARD_COMPONENT_KEYS}
-        skeleton = skeleton_to_arrays(
-            packet, self.storage_max_people, self._last_seen_tracks,
-            self.frame_index)
-        action = normalize_action(snapshot["action"])
+        skeleton = skeleton_to_arrays(packet, self._episode_people_capacity)
+        for source, count in skeleton_source_counts(packet).items():
+            self._skeleton_source_counts[source] = (
+                self._skeleton_source_counts.get(source, 0) + count)
+        action = normalized_applied_action(snapshot["action"])
         if first:
-            for key in (
-                    "prev_action_requested_norm",
-                    "prev_action_requested_physical",
-                    "prev_action_applied"):
-                action[key] = np.zeros(4, np.float32)
-            action["prev_action_applied_valid"] = np.asarray(False, np.bool_)
+            action["action"] = np.zeros(4, np.float32)
+            action["action_valid"] = np.asarray(False, np.bool_)
         privileged = privileged_to_arrays(
-            snapshot["privileged"], self.privileged_max_people,
-            len(self.skeleton_tracker.joint_names))
-        quaternion = np.asarray(
-            drone_state.get("quaternion_xyzw", (0, 0, 0, 1)), np.float32)
+            snapshot["privileged"], self._episode_people_capacity)
         source = str(drone_state.get("source", "invalid"))
         sample = {
             "frame_index": np.asarray(self.frame_index, np.int64),
             "simulation_time_s": np.asarray(simulation_time, np.float64),
-            "episode_time_s": np.asarray(snapshot["episode_time_s"], np.float64),
-            "wall_timestamp_ns": np.asarray(snapshot["wall_timestamp_ns"], np.int64),
-            "dt_s": np.asarray(dt, np.float32),
             "skeleton_timestamp_ns": np.asarray(packet["timestamp_ns"], np.int64),
-            "skeleton_sequence": np.asarray(packet["sequence"], np.int64),
-            "skeleton_time_offset_ms": np.asarray(
-                (simulation_time - float(packet["timestamp_ns"]) / 1e9) * 1e3,
-                np.float32),
             "skeleton_fresh": np.asarray(skeleton_fresh, np.bool_),
             "ego_state": build_ego_state(drone_state, self._ego_reference),
-            "ego_quaternion_xyzw": quaternion.reshape(4),
-            "ego_state_valid": np.asarray(True, np.bool_),
             "ego_altitude_valid": np.asarray(
                 drone_state.get("altitude_agl") is not None, np.bool_),
             "ego_state_source": np.asarray(
                 STATE_SOURCE_CODES.get(source, 0), np.uint8),
-            "goal_relative_body": goal_relative_body(
-                drone_state, self.target_point),
         }
         sample.update(skeleton)
         sample.update(action)
@@ -416,11 +448,8 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
             "reward_components": np.asarray(
                 [components[name] for name in REWARD_COMPONENT_KEYS], np.float32),
             "is_first": np.asarray(first, np.bool_),
-            "is_terminal": np.asarray(terminal, np.bool_),
-            "discount": np.asarray(0.0 if terminal else 1.0, np.float32),
-            "termination_code": np.asarray(
-                TERMINATION_CODES.get(snapshot["termination_reason"], 255), np.uint8),
         })
+        sample.update(end_flags)
         sample.update(privileged)
         sample.update({
             "priv_min_human_clearance_m": np.asarray(
@@ -452,7 +481,7 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
                         self._write_chunk(pending)
                         pending = []
             except Exception as error:
-                carb.log_warn("[REC][V2] Chunk write failed: {}".format(error))
+                carb.log_warn("[REC][V3] Chunk write failed: {}".format(error))
             finally:
                 self.write_queue.task_done()
             if stopping:
@@ -472,7 +501,7 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
         try:
             return provider()
         except Exception as error:
-            carb.log_warn("[REC][V2] Provider failed: {}".format(error))
+            carb.log_warn("[REC][V3] Provider failed: {}".format(error))
             return None
 
     @staticmethod

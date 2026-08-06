@@ -13,14 +13,14 @@ from omni.physx import get_physx_scene_query_interface
 
 from app_config import (
     CLASSIC_CRUISE_HEIGHT,
+    DATA_RECORD_ENABLED,
+    DATA_RECORD_GOAL_RADIUS_M,
     EGO_CLOUD_PERSON_HEIGHT_M,
     EGO_CLOUD_PERSON_RADIUS_M,
     NAVRL_CHECKPOINT,
     NAVRL_DEVICE,
     NAVRL_DIAGNOSTICS_DIR,
     NAVRL_DIAGNOSTICS_ENABLED,
-    NAVRL_FIXED_GOAL_X,
-    NAVRL_FIXED_GOAL_Y,
     NAVRL_GOAL_HOLD_RADIUS_M,
     NAVRL_LOG_INTERVAL_SEC,
     NAVRL_SAFETY_AGENT_RADIUS_M,
@@ -108,13 +108,11 @@ class NavRLController(ClassicAlgorithmController):
     def _lock_fixed_goal(self, position):
         """Select the episode goal once; never move it with the vehicle."""
         position = np.asarray(position, dtype=float)
-        if self._benchmark_mode:
-            self._fixed_goal = np.asarray(self.target_point, dtype=float).copy()
-        else:
-            goal_xy = np.array([NAVRL_FIXED_GOAL_X, NAVRL_FIXED_GOAL_Y], dtype=float)
-            self._fixed_goal = np.array(
-                [goal_xy[0], goal_xy[1], CLASSIC_CRUISE_HEIGHT], dtype=float
-            )
+        # PegasusApp owns the episode target and updates the controller and
+        # recorder together whenever the seed changes.  Always lock that
+        # shared target here so policy actions, goal features, rewards and
+        # terminal labels describe the same task.
+        self._fixed_goal = np.asarray(self.target_point, dtype=float).copy()
         direction = self._fixed_goal - position
         direction[2] = 0.0
         norm = float(np.linalg.norm(direction[:2]))
@@ -129,6 +127,17 @@ class NavRLController(ClassicAlgorithmController):
             f"goal=({self._fixed_goal[0]:.2f},{self._fixed_goal[1]:.2f},"
             f"{self._fixed_goal[2]:.2f})."
         )
+
+    def _goal_hold_radius(self):
+        if self._benchmark_mode:
+            return float(self._benchmark_goal_radius_m)
+        radius = float(NAVRL_GOAL_HOLD_RADIUS_M)
+        if DATA_RECORD_ENABLED:
+            # Do not stop outside the recorder's success sphere. Otherwise
+            # the policy can hold forever while the same episode is labelled
+            # as a time-limit truncation.
+            radius = min(radius, float(DATA_RECORD_GOAL_RADIUS_M))
+        return radius
 
     def _update_navigation(self, now):
         dt = self.control_period if self._last_control_time is None else max(
@@ -153,11 +162,7 @@ class NavRLController(ClassicAlgorithmController):
         # Match the official ROS2 navigation runner: once the 3-D distance is
         # within its configured capture radius, zero the commanded velocity
         # immediately. There is no speed-settling prerequisite.
-        goal_radius = (
-            float(self._benchmark_goal_radius_m)
-            if self._benchmark_mode
-            else float(NAVRL_GOAL_HOLD_RADIUS_M)
-        )
+        goal_radius = self._goal_hold_radius()
         if not self._mission_goal_reached and distance <= goal_radius:
             self._mission_goal_reached = True
             self._last_safe_velocity = np.zeros(2, dtype=float)

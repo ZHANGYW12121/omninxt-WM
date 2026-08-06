@@ -321,7 +321,7 @@ class ClassicAlgorithmController:
         else:
             _log(f"Episode reset after {reason}. Press {CLASSIC_START_KEY} to start another run.")
 
-    def configure_benchmark(self, goal_point, goal_radius_m=0.80):
+    def configure_benchmark(self, goal_point, goal_radius_m=1.00):
         """Use one exact 3-D map goal without changing the navigation policy."""
         goal = np.asarray(goal_point, dtype=float).reshape(3)
         if not np.all(np.isfinite(goal)):

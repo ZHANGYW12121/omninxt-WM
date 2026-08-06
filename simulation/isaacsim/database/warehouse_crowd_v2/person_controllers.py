@@ -104,7 +104,7 @@ class CrowdSeparationMixin:
         # normal social avoidance and only separate at a small body-overlap
         # radius. Unrelated walkers still see every member independently.
         self.same_group_hard_distance = max(
-            0.25, min(float(same_group_min_distance), self.person_min_distance)
+            0.15, min(float(same_group_min_distance), self.person_min_distance)
         )
 
     def _target_with_separation(self, target, speed):
@@ -1158,7 +1158,7 @@ class NaturalFormationWaypointController(WaypointPersonController):
         # leader at a waypoint/route reversal and make a close pair alternate
         # its facing direction from one control tick to the next.
         self.formation_follow_lookahead = 0.90
-        self.same_group_hard_distance = 0.30
+        self.same_group_hard_distance = 0.15
         self.start_waypoint_index = int(start_waypoint_index)
         self.route_direction = 1 if int(route_direction) >= 0 else -1
         self.target_index = self._first_target_index()

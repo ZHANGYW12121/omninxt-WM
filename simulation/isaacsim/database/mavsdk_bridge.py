@@ -298,9 +298,33 @@ class MavsdkOffboardBridge:
             for task in telemetry_tasks:
                 task.cancel()
             await asyncio.gather(*telemetry_tasks, return_exceptions=True)
+            self._stop_owned_mavsdk_server(drone)
             with self._lock:
                 self._offboard_started = False
                 self._connected = False
+
+    @staticmethod
+    def _stop_owned_mavsdk_server(drone):
+        """Stop and reap the mavsdk_server process spawned by ``System``.
+
+        MAVSDK normally relies on ``System.__del__`` for this cleanup.  The
+        plugin objects retain references long enough that an episode restart
+        can launch the next server first, leaving UDP 14540 occupied by the
+        previous process.  Explicit cleanup makes repeated SITL sessions
+        deterministic.
+        """
+        process = getattr(drone, "_server_process", None)
+        stop_server = getattr(drone, "_stop_mavsdk_server", None)
+        if process is None or not callable(stop_server):
+            return
+        try:
+            stop_server()
+            wait = getattr(process, "wait", None)
+            if callable(wait):
+                wait(timeout=2.0)
+            _log_warn("[MAVSDK] Owned mavsdk_server stopped after bridge shutdown.")
+        except Exception as exc:
+            _log_warn(f"[MAVSDK] Could not reap owned mavsdk_server: {exc}")
 
     async def _configure_telemetry_rates(self, drone):
         """Bound gRPC callback traffic before starting telemetry streams.

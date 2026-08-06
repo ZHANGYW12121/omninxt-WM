@@ -44,10 +44,14 @@ DEFAULT_REWARD_CONFIG = {
     "event_rewards": {
         "reached_goal": 100.0,
         "collision": -120.0,
+        "human_collision": -120.0,
+        "static_collision": -120.0,
         "out_of_bounds": -100.0,
         "crash": -100.0,
         "stuck_timeout": -20.0,
         "record_size_limit": 0.0,
+        "time_limit": 0.0,
+        "controller_error": 0.0,
         "manual_stop": 0.0,
         "shutdown": 0.0,
     },
@@ -215,8 +219,9 @@ class DatasetRecorder:
                 "collision": "whether an Isaac Sim physics contact has occurred between drone and pedestrian skeleton colliders",
                 "reached_goal": "whether drone has reached dataset goal",
                 "termination_reason": (
-                    "recording, manual_stop, collision, reached_goal, stuck_timeout, "
-                    "record_size_limit, or shutdown"
+                    "recording, reached_goal, human_collision, static_collision, "
+                    "out_of_bounds, crash, stuck_timeout, time_limit, controller_error, "
+                    "manual_stop, record_size_limit, or shutdown"
                 ),
                 "event_details": "collision or reached-goal details when an event has occurred",
                 "reward": "environment task reward for the transition ending at this frame",

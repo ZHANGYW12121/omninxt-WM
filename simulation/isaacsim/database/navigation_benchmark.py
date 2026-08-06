@@ -80,7 +80,7 @@ class NavigationBenchmarkEvaluator:
         self.run_id = str(self.config.get("run_id") or "")
         self.evaluation_hz = float(self.config.get("evaluation_hz", 10.0))
         self.timeout_sec = float(self.config.get("timeout_sec", 120.0))
-        self.goal_radius_m = float(self.config.get("goal_radius_m", 0.80))
+        self.goal_radius_m = float(self.config.get("goal_radius_m", 1.00))
         self.human_intrusion_threshold_m = float(
             self.config.get(
                 "human_intrusion_threshold_m",

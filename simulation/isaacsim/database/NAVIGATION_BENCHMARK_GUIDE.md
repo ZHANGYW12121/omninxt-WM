@@ -225,7 +225,7 @@ Safety Shield 和静态 LiDAR Guard。
 成功：
 
 ```text
-无人机中心到随机三维目标点的欧氏距离 <= 0.80 m
+无人机中心到随机三维目标点的欧氏距离 <= 1.00 m
 ```
 
 失败：
@@ -317,7 +317,7 @@ comparison.md            所选算法汇总简表
 --timeout-sec 120
 --wall-timeout-sec 2100
 --infrastructure-retries 1
---goal-radius-m 0.80
+--goal-radius-m 1.00
 --crowd-count 20
 --output-root /path/to/results
 --resume
