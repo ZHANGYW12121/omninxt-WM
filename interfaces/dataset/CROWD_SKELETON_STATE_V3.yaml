@@ -1,0 +1,165 @@
+schema: omninxt.crowd_skeleton_state.v3
+status: recording_candidate
+sample_rate_hz: 10.0
+transition_alignment: >-
+  Row t contains observation_t, the normalized action actually applied during
+  observation_(t-1)->observation_t, and the reward for that transition. The
+  first row has a zero invalid action, zero reward, and is_first=true.
+
+storage:
+  container: chunked_npz
+  frames_per_chunk: 256
+  atomic_chunk_commit: true
+  people_dimension: fixed_within_episode_actual_scene_count
+  source_joint_count: 17
+  recorded_joint_count: 12
+
+observation:
+  skeleton:
+    schema: omninxt.skeleton3d.v1
+    source_topology: COCO17
+    recorded_topology: COCO12_BODY
+    recorded_source_indices: [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    recorded_joint_order:
+      - left_shoulder
+      - right_shoulder
+      - left_elbow
+      - right_elbow
+      - left_wrist
+      - right_wrist
+      - left_hip
+      - right_hip
+      - left_knee
+      - right_knee
+      - left_ankle
+      - right_ankle
+    frame: base_link
+    convention: ROS_FLU
+    axes: {x: forward, y: left, z: up}
+    units: metre
+    simulation_depth_source: isaac_gt_depth
+    recorded_fields:
+      human_xyz: [T, N, 12, 3]
+      human_confidence: [T, N, 12]
+      human_joint_valid: [T, N, 12]
+      human_track_id: [T, N]
+    derived_by_training_loader:
+      skeleton_xyz_velocity_confidence: [T, 20, 12, 7]
+      human_root: [T, 20, 10]
+      human_joints: [T, 20, 12, 7]
+      human_mask: [T, 20]
+      joint_mask: [T, 20, 12]
+      human_ids: [T, 20]
+      human_is_first: [T, 20]
+      truncated_people: [T]
+  ego:
+    frame: episode_start_and_current_body_heading
+    recorded_fields:
+      ego_state: [T, 14]
+      ego_altitude_valid: [T]
+      ego_state_source: [T]
+    ego_state_order:
+      - local_x
+      - local_y
+      - local_z
+      - body_vx
+      - body_vy
+      - world_vz
+      - body_ax
+      - body_ay
+      - world_az
+      - altitude_agl
+      - roll
+      - pitch
+      - sin_relative_yaw
+      - cos_relative_yaw
+
+transition:
+  action_order: [vx_body_mps, vy_body_mps, vz_world_mps, yaw_rate_rps]
+  action_representation: normalized_applied_body_flu
+  reward_component_order: [event, progress, human_clearance, smoothness, height, time]
+  recorded_fields:
+    - action
+    - action_valid
+    - reward
+    - reward_components
+    - is_first
+    - success
+    - termination_code
+    - is_last
+    - is_terminal
+  derived_by_training_loader:
+    - discount
+  termination_codes:
+    0: recording
+    1: reached_goal
+    2: human_collision
+    3: static_collision
+    4: out_of_bounds
+    5: crash
+    6: stuck_timeout
+    7: time_limit
+    8: controller_error
+    9: manual_stop
+    10: shutdown
+    11: record_size_limit
+  semantics:
+    success: reached_goal
+    task_terminal:
+      [reached_goal, human_collision, static_collision, out_of_bounds, crash, stuck_timeout]
+    truncation: [time_limit, manual_stop, shutdown, record_size_limit]
+    invalid: [controller_error]
+
+privileged:
+  policy_visible: false
+  recorded_fields:
+    - priv_human_id
+    - priv_human_mask
+    - priv_human_position_world
+    - priv_human_velocity_world
+    - priv_min_human_clearance_m
+    - priv_min_human_clearance_valid
+    - priv_min_human_ttc_s
+    - priv_min_human_ttc_valid
+    - priv_collision
+    - priv_goal_distance_m
+  episode_metadata:
+    - human_group_id
+    - initial_position
+    - planned_waypoints
+  note: >-
+    Privileged values are reward/evaluation/debug labels only. They must never
+    enter the policy or world-model observation encoder.
+
+timing:
+  recorded_fields:
+    - frame_index
+    - simulation_time_s
+    - skeleton_timestamp_ns
+    - skeleton_fresh
+  derived_by_training_loader:
+    - episode_time_s
+    - dt_s
+
+episode_metadata:
+  required_fields:
+    - ego_reference_origin_xyz
+    - ego_reference_origin_yaw
+    - goal_position_episode_local
+    - action_normalization_limits
+    - actual_people_count
+    - stored_people_count
+    - coordinate_convention
+    - recording_run_id
+    - seed_start
+    - seed_end
+
+excluded_payloads:
+  - rgb_image
+  - depth_image
+  - point_cloud
+  - image_2d_skeleton
+  - per_frame_pose_quality_diagnostics
+  - requested_action_copy
+  - ego_quaternion_copy
+  - privileged_collision_joint_positions

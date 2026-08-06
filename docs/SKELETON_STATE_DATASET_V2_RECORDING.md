@@ -1,5 +1,9 @@
 # 三维骨架与无人机状态数据集 v2
 
+> 此文档仅用于历史 v2 数据兼容。新录制请使用
+> `docs/SKELETON_STATE_DATASET_V3_RECORDING.md` 和
+> `interfaces/dataset/CROWD_SKELETON_STATE_V3.yaml`。
+
 ## 当前状态
 
 录制代码已经接入，但默认关闭：
