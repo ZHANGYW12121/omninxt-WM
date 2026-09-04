@@ -36,6 +36,7 @@ credentials*
 *.pt
 *.pth
 *.ckpt
+!world_model/deployment_checkpoints/*.pt
 
 # Large models: add later through Git LFS or artifact storage
 *.onnx

@@ -5,12 +5,19 @@
 
 ## 模型文件
 
-checkpoint 不进入 Git，需要单独复制到外星人电脑：
+checkpoint 已通过 Git LFS 随本分支发布，克隆或拉取分支后位于：
 
 ```text
-step_00012000_v67_human_exogeneity_klt_audit_compat.pt
+world_model/deployment_checkpoints/step_00012000_v67_human_exogeneity_klt_audit_compat.pt
 size:   262157125 bytes
 sha256: 7c3cba29d55c22c5bc671a35d68d0b1fe87a53caf5be86ae498c9b92e969ad52
+```
+
+若工作区中只有很小的 LFS 指针文件，先安装 Git LFS，再执行：
+
+```bash
+git lfs install
+git lfs pull
 ```
 
 加载后应满足：
@@ -31,7 +38,7 @@ critic_input_dim=7229
 ```bash
 cd world_model
 python scripts/serve_pure_dreamer_policy.py \
-  --checkpoint /path/to/step_00012000_v67_human_exogeneity_klt_audit_compat.pt \
+  --checkpoint deployment_checkpoints/step_00012000_v67_human_exogeneity_klt_audit_compat.pt \
   --device cuda:0 \
   --host 127.0.0.1 \
   --port 9775
@@ -53,7 +60,7 @@ PURE_DREAMER_ACTOR_READY ... step=12000 ... planner=0 ... stochastic_actor=0
 ## 交接检查
 
 ```bash
-sha256sum /path/to/step_00012000_v67_human_exogeneity_klt_audit_compat.pt
+sha256sum world_model/deployment_checkpoints/step_00012000_v67_human_exogeneity_klt_audit_compat.pt
 python -m py_compile \
   world_model/scripts/serve_pure_dreamer_policy.py \
   world_model/scripts/serve_factorized_policy.py
