@@ -1,0 +1,252 @@
+schema: omninxt.factorized_policy.interface.v1
+transport:
+  type: tcp_json_lines
+  protocol_field: omninxt.factorized_policy.v1
+  maximum_message_bytes: 4194304
+
+coordinates:
+  skeleton_frame: base_link
+  convention: "ROS_FLU: +X forward, +Y left, +Z up"
+  position_unit: m
+  timestamp_unit: s
+
+requests:
+  reset:
+    required: [type]
+  status:
+    required: [type]
+  step:
+    required:
+      - type
+      - timestamp_s
+      - control_step_index
+      - previous_policy_response_step_index
+      - ego_state
+      - ego_altitude_valid
+      - goal_position
+      - human_track_id
+      - human_xyz
+      - human_confidence
+      - human_joint_valid
+      - human_joint_measured
+      - human_joint_predicted
+      - human_root_velocity
+      - human_velocity_valid
+      - human_velocity_sigma_mps
+      - human_measurement_age_s
+      - human_track_age_frames
+      - human_prediction_run_frames
+      - human_identity_confidence
+    shapes:
+      control_step_index: scalar_non_negative_integer
+      previous_policy_response_step_index: scalar_integer
+      ego_state: [14]
+      ego_altitude_valid: scalar_bool_true
+      goal_position: [3]
+      human_track_id: [people]
+      human_xyz: [people, 12, 3]
+      human_confidence: [people, 12]
+      human_joint_valid: [people, 12]
+      human_joint_measured: [people, 12]
+      human_joint_predicted: [people, 12]
+      human_root_velocity: [people, 3]
+      human_velocity_valid: [people]
+      human_velocity_sigma_mps: [people]
+      human_measurement_age_s: [people]
+      human_track_age_frames: [people]
+      human_prediction_run_frames: [people]
+      human_identity_confidence: [people]
+    optional_task_geometry:
+      fields:
+        boundary_position_world_xy: [2]
+        boundary_position_world_z: scalar
+        boundary_yaw_rad: scalar
+        boundary_flight_bounds_xy: [4]
+        goal_radius_m: scalar
+        crash_altitude_m: scalar
+        maximum_altitude_m: scalar
+        static_obstacle_aabbs_world: [obstacles, 4]
+        static_obstacle_geometry_use: enum_string
+      static_aabb_layout: [xmin_world, ymin_world, xmax_world, ymax_world]
+      static_geometry_use_values:
+        - counterfactual_censor_and_actor_proximity_cost
+        - analytic_task_terminal_and_actor_proximity_cost
+      semantics: >-
+        These fields are required by current complete-state pure Dreamer and
+        ignored by older policy services. Goal radius and crash altitude are
+        checked against the checkpoint's fixed MDP constants; bounds and the
+        recorder's conservative, pre-inflated static AABBs are converted both
+        to compact ray proximity and to the complete fixed-width Actor/Critic
+        task state. They are
+        scene metadata, not privileged future collision truth.
+
+responses:
+  common_required: [ok, protocol]
+  step:
+    required:
+      - action
+      - control_step_index
+      - policy_action
+      - people
+      - truncated_people
+      - history_frames
+      - latency_ms
+      - checkpoint_step
+    shapes:
+      control_step_index: scalar_non_negative_integer
+      action: [4]
+      policy_action: [3]
+    action_order: [vx_forward, vy_left, vz_up, yaw_rate]
+    action_representation: normalized_body_flu
+    policy_action_order: [vx_forward, vy_left, yaw_rate]
+    policy_action_semantics: >-
+      For the current pure-Dreamer objective, policy_action is the raw
+      stochastic Actor output and represents an absolute normalized body-FLU
+      horizontal-velocity/yaw-rate target. It is not a delta from the previous
+      command. A zero policy_action therefore requests zero horizontal
+      velocity and zero yaw rate and must mean-revert a nonzero previous
+      command toward zero.
+    action_smoothing_semantics: >-
+      The model-owned deterministic soft-absolute-target smoother maps the raw
+      policy_action and the explicitly carried previous applied policy target
+      to smoothed_policy_action. It applies the configured low-pass response
+      and per-step slew bound without changing the absolute-target meaning.
+      The same transformation and previous-action state are used by online
+      execution and latent imagination. Historical affine-reachable-interval
+      checkpoints retain their versioned incremental semantics and must not be
+      interpreted as current pure-Dreamer checkpoints.
+    action_adapter_semantics: >-
+      The model-owned deterministic ActionAdapter inserts vz before the action
+      enters RSSM img_step/prev_action. The top-level action is the identical
+      applied 4D command that must be sent to Isaac and recorded in replay;
+      consumers must not replace or add another altitude correction.
+    optional:
+      shadow_imagination:
+        nullable: true
+        fields:
+          origin_timestamp_s: float
+          step_duration_s: float
+          risk_horizon_s: float
+          horizon_steps: int
+          future_steps: [horizon]
+          ego_position_episode_local: [horizon, 3]
+          goal_distance_m: [horizon]
+          action: [horizon, 4]
+          collision_probability: [horizon]
+          predicted_min_human_clearance_m: [horizon]
+          reward: [horizon]
+          critic_value: [horizon]
+          continuation_probability: [horizon]
+          origin_collision_probability: float
+          origin_predicted_min_human_clearance_m: float
+          origin_critic_value: float
+          maximum_collision_probability: float
+          minimum_predicted_human_clearance_m: float
+          compute_latency_ms: float
+        semantics: >-
+          Optional deterministic RSSM/Actor rollout produced for diagnostics
+          only. It never replaces or projects the top-level action. Index zero
+          is the first future latent state after the returned action; all
+          positions use the episode-start local frame. Collision probability
+          and minimum clearance retain the action-risk head's configured
+          future-risk-horizon semantics rather than representing only an
+          instantaneous geometric check.
+      planner:
+        nullable: true
+        fields:
+          triggered: bool
+          emergency: bool
+          intervened: bool
+          best_index: int
+          score_improvement: float
+          collision_probability: float
+          predicted_clearance_m: float
+          observed_clearance_m: float
+          current_observed_clearance_m: float
+          kinematic_clearance_m: float
+          human_safety_source: string
+          event_used_for_selection: bool
+          swept_geometry_enabled: bool
+          kinematic_cpa_enabled: bool
+          planner_evaluated: bool
+          cache_age_steps: int
+          planner_interval_steps: int
+          risk_tolerance: float
+          event_collision_clearance_m: float
+          base_in_safe_band: bool
+          escape_direction_locked: bool
+          forward_cap_action: float
+          actor_action: [4]
+          planner_action: [4]
+          projected_action: [4]
+        emergency_semantics: >-
+          true when the calibrated risk estimate crosses the stronger stop
+          threshold; older clients may ignore this optional diagnostic
+        observed_clearance_semantics: >-
+          current causal skeleton surface clearance for diagnostics only. In
+          the pure Event planner it does not rank or reject candidates and is
+          not Isaac privileged ground truth
+        current_observed_clearance_semantics: >-
+          instantaneous skeleton capsule surface clearance before kinematic
+          projection
+        kinematic_clearance_semantics: >-
+          legacy optional diagnostic. The pure Event planner returns NaN and
+          sets kinematic_cpa_enabled=false
+        pure_event_planner_semantics: >-
+          human candidates are ranked only by the frozen multi-step World
+          Model Event probability. Swept-human geometry and constant-velocity
+          CPA do not participate. The full h15 candidate rollout is normally
+          evaluated every two 10 Hz control steps; the intervening step reuses
+          the selected policy offset and reapplies the current action smoother
+          Candidate zero is retained only while it is within risk_tolerance
+          of the minimum supported Event risk. Outside that band the planner
+          must switch to a candidate inside the band; goal progress only
+          breaks ties inside the band
+        event_collision_clearance_semantics: >-
+          World-Model Event's trained surface-clearance danger boundary. The
+          current contract is 0.15 m. It is not the Isaac/PhysX contactOffset,
+          does not change physical collision reporting, and is valid only when
+          present in the loaded checkpoint's Event training state
+        escape_direction_locked_semantics: >-
+          true when the emergency away direction is temporarily held in the
+          episode/world frame to prevent nearest-person switching oscillation
+        forward_cap_action_semantics: >-
+          normalized forward-speed upper bound continuously scheduled by
+          observed clearance; equal to the Actor forward action when inactive
+        action_stage_semantics:
+          actor_action: raw normalized Actor output before online planning
+          planner_action: normalized action after the learned planner and
+            before observable geometry/static-boundary projection
+          projected_action: normalized action returned to the controller after
+            goal capture and the joint human/static projection; equal to the
+            top-level action field
+        candidate_index:
+          0: actor
+          1: actor_plus_forward
+          2: actor_minus_forward
+          3: actor_plus_left
+          4: actor_plus_right
+          5: actor_plus_forward_left
+          6: actor_plus_forward_right
+          7: actor_minus_forward_left
+          8: actor_minus_forward_right
+          9: same_speed_goal_aligned
+
+compatibility:
+  pure_dreamer_control_transition_semantics: >-
+    Current pure Dreamer requires control_step_index to start at zero after
+    reset and increase on every physical control opportunity, including
+    opportunities where missing input causes a local hold and no step request.
+    previous_policy_response_step_index is -1 on the first request and then
+    identifies the last response whose command was handed to the controller.
+    The server fails closed on a skipped step, missing acknowledgement, or a
+    timestamp interval outside 0.5x--1.5x the checkpoint imagination step;
+    the recurrent policy may resume only after an episode reset.
+  ego_altitude_valid_semantics: >-
+    This field must be true. ego_state[9] is a physical height-above-ground
+    measurement used by the Actor and its model-owned ActionAdapter; a missing
+    measurement must make the controller hold and must never be encoded as 0 m.
+  planner_field_added: backward_compatible_optional_response
+  shadow_imagination_field_added: backward_compatible_optional_response
+  clients_must_ignore_unknown_response_fields: true
+  privileged_simulation_truth_visible_to_policy: false

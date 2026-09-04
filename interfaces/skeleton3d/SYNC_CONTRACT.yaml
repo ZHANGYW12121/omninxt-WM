@@ -48,7 +48,21 @@ skeleton:
   topology: COCO17
   output_schema: omninxt.skeleton3d.v1
   identity_tracking:
-    association: predicted_3d_motion
+    association: ego_motion_compensated_predicted_3d_motion
+    joint_filter: constant_velocity_kalman_with_measurement_covariance
+    covariance_frame_update: rotate_with_synced_ego_pose
+    output_kinematic_refinement: learned_symmetric_bone_length_projection
+    kinematic_projection_changes_temporal_provenance: false
+    articulated_pose_confirmation_frames: 2
+    low_geometry_confirmation_frames: 7
+    detection_only_confirmation_frames: 10
+    minimum_public_body_joints: 4
+    minimum_public_core_joints: 2
+    core_joint_indices: [5, 6, 11, 12]
+    coherent_full_body_relocalization: true
+    whole_body_plausibility_gate: conservative_when_six_or_more_bones_exist
+    tracking_frame: base_link_reexpressed_each_frame_from_synced_world_pose
+    episode_reset_source: synchronized_episode_generation
     small_frame_assignment: exact_max_cardinality_min_cost
     small_frame_max_measurements: 12
     dense_frame_assignment: hungarian
@@ -62,6 +76,29 @@ skeleton:
       - track_age_frames
       - time_since_observation_ms
       - id_uncertain
+      - root_velocity_base_link_mps
+      - velocity_valid
+      - velocity_sigma_mps
+      - consecutive_prediction_frames
+    velocity_contract: >-
+      root_velocity_base_link_mps is a causal, ego-motion-compensated robust
+      estimate built from the current and past observations of the same track.
+      velocity_valid, velocity_sigma_mps, track age, measurement age, and
+      consecutive_prediction_frames travel with the estimate. Consumers must
+      not reconstruct policy input velocity from a one-frame position
+      difference, and simulator privileged velocity is never policy input.
+    maximum_output_range_m: 6.0
+    internal_range_exit_hysteresis_m: 0.25
+    range_definition: euclidean_base_link
+  synchronized_ego_state:
+    topic: /omninxt/ego_pose
+    message: std_msgs/String
+    payload_schema: omninxt.ego_pose.v1
+    frame: world
+    child_frame: base_link
+    timestamp: exact_camera_render_timestamp
+    fields: [timestamp_ns, episode_generation, position_world_m, attitude_xyzw]
+    quaternion_order: xyzw
   network_transport: newline_delimited_JSON_over_TCP
   stgcn_layout: [N, C, T, V, M]
   stgcn_channels: [x_m, y_m, z_m, confidence, coordinate_valid]
