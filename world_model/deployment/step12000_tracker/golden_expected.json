@@ -1,0 +1,108 @@
+{
+  "schema": "omninxt.step12000.tracker-golden-output.v1",
+  "input_schema": "omninxt.step12000.tracker-golden-input.v1",
+  "frames": [
+    {"frame_index": 0, "timestamp_ns": 0, "people": [], "active_tracks": 1, "next_person_id": 1, "kalman_measurements_rejected": 0},
+    {
+      "frame_index": 1, "timestamp_ns": 100000000,
+      "people": [{
+        "person_id": 1, "track_uid": "golden-session-a:1", "track_state": "observed",
+        "range_gate_center_m": [2.0656, 0.0, 1.26],
+        "root_velocity_base_link_mps": [0.24, 0.0, 0.0],
+        "velocity_valid": false, "velocity_sigma_mps": null,
+        "identity_confidence": 1.0, "track_age_frames": 2,
+        "consecutive_prediction_frames": 0,
+        "joint_9_xyz_m": [2.068935, 0.4, 1.02],
+        "joint_9_predicted": false, "joint_9_rejected_measurements": 0
+      }],
+      "active_tracks": 1, "next_person_id": 2, "kalman_measurements_rejected": 0
+    },
+    {
+      "frame_index": 2, "timestamp_ns": 200000000,
+      "people": [{
+        "person_id": 1, "track_uid": "golden-session-a:1", "track_state": "observed",
+        "range_gate_center_m": [2.147289, 0.0, 1.26],
+        "root_velocity_base_link_mps": [0.701251, 0.0, 0.0],
+        "velocity_valid": true, "velocity_sigma_mps": 0.0,
+        "identity_confidence": 1.0, "track_age_frames": 3,
+        "consecutive_prediction_frames": 0,
+        "joint_9_xyz_m": [2.153314, 0.4, 1.02],
+        "joint_9_predicted": false, "joint_9_rejected_measurements": 0
+      }],
+      "active_tracks": 1, "next_person_id": 2, "kalman_measurements_rejected": 0
+    },
+    {
+      "frame_index": 3, "timestamp_ns": 300000000,
+      "people": [{
+        "person_id": 1, "track_uid": "golden-session-a:1", "track_state": "observed",
+        "range_gate_center_m": [2.235822, 0.0, 1.26],
+        "root_velocity_base_link_mps": [0.78053, 0.0, 0.0],
+        "velocity_valid": true, "velocity_sigma_mps": 0.0,
+        "identity_confidence": 1.0, "track_age_frames": 4,
+        "consecutive_prediction_frames": 0,
+        "joint_9_xyz_m": [2.226438, 0.39997, 1.020126],
+        "joint_9_predicted": true, "joint_9_rejected_measurements": 1
+      }],
+      "active_tracks": 1, "next_person_id": 2, "kalman_measurements_rejected": 1
+    },
+    {
+      "frame_index": 4, "timestamp_ns": 400000000,
+      "people": [{
+        "person_id": 1, "track_uid": "golden-session-a:1", "track_state": "predicted",
+        "range_gate_center_m": [2.313176, 0.0, 1.26],
+        "root_velocity_base_link_mps": [0.766606, 0.0, 0.0],
+        "velocity_valid": true, "velocity_sigma_mps": 0.0,
+        "identity_confidence": 0.920044, "track_age_frames": 5,
+        "consecutive_prediction_frames": 0,
+        "joint_9_xyz_m": [2.298266, 0.399929, 1.020294],
+        "joint_9_predicted": true, "joint_9_rejected_measurements": 1
+      }],
+      "active_tracks": 1, "next_person_id": 2, "kalman_measurements_rejected": 1
+    },
+    {
+      "frame_index": 5, "timestamp_ns": 500000000,
+      "people": [{
+        "person_id": 1, "track_uid": "golden-session-a:1", "track_state": "predicted",
+        "range_gate_center_m": [2.384888, 0.0, 1.26],
+        "root_velocity_base_link_mps": [0.669796, 0.0, 0.0],
+        "velocity_valid": true, "velocity_sigma_mps": 0.0,
+        "identity_confidence": 0.846482, "track_age_frames": 6,
+        "consecutive_prediction_frames": 1,
+        "joint_9_xyz_m": [2.364864, 0.399877, 1.020511],
+        "joint_9_predicted": true, "joint_9_rejected_measurements": 1
+      }],
+      "active_tracks": 1, "next_person_id": 2, "kalman_measurements_rejected": 1
+    },
+    {
+      "frame_index": 6, "timestamp_ns": 600000000,
+      "people": [{
+        "person_id": 1, "track_uid": "golden-session-a:1", "track_state": "observed",
+        "range_gate_center_m": [2.474158, 0.0, 1.26],
+        "root_velocity_base_link_mps": [0.762412, 0.0, 0.0],
+        "velocity_valid": true, "velocity_sigma_mps": 0.0,
+        "identity_confidence": 1.0, "track_age_frames": 7,
+        "consecutive_prediction_frames": 0,
+        "joint_9_xyz_m": [2.477478, 0.4, 1.02],
+        "joint_9_predicted": false, "joint_9_rejected_measurements": 1
+      }],
+      "active_tracks": 1, "next_person_id": 2, "kalman_measurements_rejected": 1
+    },
+    {"frame_index": 7, "timestamp_ns": 1900000000, "people": [], "active_tracks": 1, "next_person_id": 2, "kalman_measurements_rejected": 1},
+    {"frame_index": 8, "timestamp_ns": 4700000000, "people": [], "active_tracks": 0, "next_person_id": 2, "kalman_measurements_rejected": 1},
+    {"frame_index": 9, "timestamp_ns": 100000000, "people": [], "active_tracks": 1, "next_person_id": 1, "kalman_measurements_rejected": 0},
+    {
+      "frame_index": 10, "timestamp_ns": 200000000,
+      "people": [{
+        "person_id": 1, "track_uid": "golden-session-b:1", "track_state": "observed",
+        "range_gate_center_m": [1.0656, 0.0, 1.26],
+        "root_velocity_base_link_mps": [0.24, 0.0, 0.0],
+        "velocity_valid": false, "velocity_sigma_mps": null,
+        "identity_confidence": 1.0, "track_age_frames": 2,
+        "consecutive_prediction_frames": 0,
+        "joint_9_xyz_m": [1.068935, 0.4, 1.02],
+        "joint_9_predicted": false, "joint_9_rejected_measurements": 0
+      }],
+      "active_tracks": 1, "next_person_id": 2, "kalman_measurements_rejected": 0
+    }
+  ]
+}

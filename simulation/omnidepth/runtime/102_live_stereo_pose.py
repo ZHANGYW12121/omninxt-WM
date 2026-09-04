@@ -16,7 +16,7 @@ import os
 import queue
 import threading
 import time
-from collections import defaultdict, deque
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
@@ -28,6 +28,11 @@ from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
 from motion_skeleton_tracker import MotionSkeletonTracker
+from episode_sync import EpisodeBundleSynchronizer
+from person_detection_policy import (
+    articulated_person_is_valid,
+    person_box_is_usable,
+)
 from skeleton_stream import SkeletonTcpSender, build_skeleton_packet
 from trt_rtmpose import TensorRTRTMPose, TensorRTYOLOX
 
@@ -45,6 +50,8 @@ ANCHOR_NAMES = ("CAM_A_FRONT_RIGHT", "CAM_B_REAR_RIGHT",
                 "CAM_C_REAR_LEFT", "CAM_D_FRONT_LEFT")
 ANCHOR_COLORS = ((70, 80, 255), (90, 225, 90),
                  (255, 145, 75), (50, 225, 245))
+SKELETON_DISPLAY_HALF_EXTENT_M = 7.0
+PERSON_RANGE_HYSTERESIS_M = 0.25
 
 
 def parse_args():
@@ -55,14 +62,14 @@ def parse_args():
     parser.add_argument("--web-port", type=int, default=8766)
     parser.add_argument("--no-web", action="store_true")
     parser.add_argument("--display-hz", type=float, default=4.0)
-    # YOLOX scans the 2x2 mosaic containing every direction.  RTMPose keeps
-    # updating both stereo views on the intervening frames, so a 10-frame
-    # detector cadence does not disable any sector and leaves enough GPU time
-    # for the 10 Hz stereo-pose path alongside the 5 Hz dense HITNet path.
+    # The rectified fallback still scans a 2x2 mosaic.  The normal anchor path
+    # defaults to four independent full-resolution detections; the lower-power
+    # round-robin and mosaic modes remain available for edge deployment.
     parser.add_argument("--det-interval", type=int, default=10)
-    parser.add_argument("--det-threshold", type=float, default=0.20)
-    parser.add_argument("--person-threshold", type=float, default=0.25)
-    parser.add_argument("--keypoint-threshold", type=float, default=0.22)
+    parser.add_argument("--det-threshold", type=float, default=0.30)
+    parser.add_argument("--det-input-size", type=int, default=640)
+    parser.add_argument("--person-threshold", type=float, default=0.20)
+    parser.add_argument("--keypoint-threshold", type=float, default=0.15)
     parser.add_argument("--min-depth", type=float, default=0.25)
     parser.add_argument("--max-depth", type=float, default=8.0)
     parser.add_argument("--min-disparity", type=float, default=0.75)
@@ -77,12 +84,25 @@ def parse_args():
     parser.add_argument("--center-det-interval", type=int, default=0,
                         help="Optional low-resolution four-view detector cadence; 0 disables it")
     parser.add_argument("--rescue-det-interval", type=int, default=1,
-                        help="Frames between round-robin full-resolution camera detections")
+                        help="Frames between anchor detector refreshes")
+    parser.add_argument(
+        "--anchor-detector-mode",
+        choices=("all_views", "round_robin", "mosaic"),
+        default=os.environ.get("OMNINXT_ANCHOR_DETECTOR_MODE", "all_views"),
+        help=("all_views independently detects all four native camera images; "
+              "round_robin and mosaic are lower-compute compatibility modes"),
+    )
+    parser.add_argument(
+        "--detection-only-fallback", choices=("off", "persistent"),
+        default=os.environ.get("OMNINXT_DETECTION_ONLY_FALLBACK", "off"),
+        help=("Whether unmatched detector boxes may become coarse skeletons. "
+              "High-accuracy training keeps this off to prevent false people."),
+    )
     parser.add_argument("--detector-miss-ttl", type=int, default=3,
                         help="Consecutive per-camera detector misses before dropping boxes")
     parser.add_argument("--track-hold-sec", type=float, default=1.2,
                         help="Publish motion-predicted 3D tracks through short gaps")
-    parser.add_argument("--max-person-range", type=float, default=0.0,
+    parser.add_argument("--max-person-range", type=float, default=6.0,
                         help="Maximum Euclidean base_link range in metres; <=0 disables the range gate")
     parser.add_argument(
         "--joint-depth-source", choices=("hybrid", "isaac_gt"),
@@ -156,10 +176,10 @@ class InputBridge:
 
     def __init__(self, require_exact_depth=False):
         self.require_exact_depth = bool(require_exact_depth)
-        self.required = {"anchors", "stereo"}
+        self.required = {"anchors", "stereo", "ego_pose"}
         if self.require_exact_depth:
             self.required.update("depth{}".format(index) for index in range(4))
-        self.buckets = defaultdict(dict)
+        self.synchronizer = EpisodeBundleSynchronizer(self.required)
         self.lock = threading.Lock()
         self.frames = queue.Queue(maxsize=1)
         self.depth = [None] * 4
@@ -178,6 +198,40 @@ class InputBridge:
                 "/depth_estimation/stereo_{}/depth".format(index), Image,
                 self._depth_cb, callback_args=index, queue_size=1,
                 buff_size=2 * 1024 * 1024, tcp_nodelay=True))
+        self.subscribers.append(rospy.Subscriber(
+            "/omninxt/ego_pose", String,
+            self._pose_cb, queue_size=1, tcp_nodelay=True))
+
+    @staticmethod
+    def _decode_ego_pose(message):
+        value = json.loads(message.data)
+        if value.get("schema") != "omninxt.ego_pose.v1":
+            raise ValueError("unsupported synchronized ego pose schema")
+        position = np.asarray((
+            value.get("position_world_m")), dtype=np.float64).reshape(-1)
+        attitude = np.asarray(
+            value.get("attitude_xyzw"), dtype=np.float64).reshape(-1)
+        norm = float(np.linalg.norm(attitude))
+        if (position.shape != (3,) or attitude.shape != (4,) or
+                not np.isfinite(position).all() or
+                not np.isfinite(attitude).all() or norm <= 1.0e-9):
+            raise ValueError("invalid synchronized ego pose")
+        return {
+            "timestamp_ns": int(value["timestamp_ns"]),
+            "episode_generation": int(value["episode_generation"]),
+            "position_world_m": position,
+            "attitude_xyzw": attitude / norm,
+        }
+
+    def _pose_cb(self, message):
+        try:
+            pose = self._decode_ego_pose(message)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            rospy.logwarn_throttle(2.0, "Rejected ego pose: %s", error)
+            return
+        self._store_bundle(
+            pose["timestamp_ns"], "ego_pose", pose,
+            external_generation=pose["episode_generation"])
 
     def _bundle_cb(self, message, kind):
         stamp = message.header.stamp.to_nsec()
@@ -205,12 +259,23 @@ class InputBridge:
                 images[(index, "right")] = image[y:y + 240, 320:640]
         self._store_bundle(stamp, kind, images)
 
-    def _store_bundle(self, stamp, kind, payload):
+    def _store_bundle(self, stamp, kind, payload, external_generation=None):
         complete = None
+        generation = None
+        rewound = False
         with self.lock:
-            self.buckets[stamp][kind] = payload
-            if self.required.issubset(self.buckets[stamp]):
-                bundles = self.buckets.pop(stamp)
+            generation, bundles, rewound = self.synchronizer.add(
+                stamp, kind, payload,
+                external_generation=external_generation)
+            if rewound:
+                self.depth = [None] * 4
+                self.depth_stamp = [None] * 4
+                while True:
+                    try:
+                        self.frames.get_nowait()
+                    except queue.Empty:
+                        break
+            if bundles is not None:
                 complete_images = {}
                 complete_images.update(bundles["anchors"])
                 complete_images.update(bundles["stereo"])
@@ -226,10 +291,14 @@ class InputBridge:
                     ]
                     complete_stamps = list(self.depth_stamp)
                 complete = (
-                    stamp, complete_images, complete_depths, complete_stamps,
+                    generation, stamp, complete_images, complete_depths,
+                    complete_stamps, bundles["ego_pose"],
                 )
-            for old in sorted(self.buckets)[:-12]:
-                self.buckets.pop(old, None)
+        if rewound:
+            rospy.logwarn(
+                "Perception episode boundary detected; input reset "
+                "to generation %d at %.3fs",
+                generation, float(stamp) / 1e9)
         if complete is not None:
             try:
                 self.frames.get_nowait()
@@ -243,11 +312,26 @@ class InputBridge:
     def _depth_cb(self, message, index):
         stamp = message.header.stamp.to_nsec()
         depth = decode_image(message)
-        with self.lock:
-            self.depth[index] = depth
-            self.depth_stamp[index] = stamp
         if self.require_exact_depth:
             self._store_bundle(stamp, "depth{}".format(index), depth)
+        else:
+            with self.lock:
+                rewound = self.synchronizer.observe(stamp)
+                if rewound:
+                    self.depth = [None] * 4
+                    self.depth_stamp = [None] * 4
+                    while True:
+                        try:
+                            self.frames.get_nowait()
+                        except queue.Empty:
+                            break
+                self.depth[index] = depth
+                self.depth_stamp[index] = stamp
+            if rewound:
+                rospy.logwarn(
+                    "Isaac timestamp rewind detected; perception input "
+                    "reset to generation %d at %.3fs",
+                    self.synchronizer.generation, float(stamp) / 1e9)
 
     def depth_snapshot(self):
         with self.lock:
@@ -268,15 +352,55 @@ def clip_quadrant_boxes(boxes, view_width=320, view_height=240):
         clipped = [max(qx, x0), max(qy, y0),
                    min(qx + view_width - 1, x1),
                    min(qy + view_height - 1, y1)]
-        if clipped[2] - clipped[0] >= 18 and clipped[3] - clipped[1] >= 28:
+        if person_box_is_usable(clipped):
             result.append(clipped)
     return np.asarray(result, dtype=np.float32).reshape(-1, 4)
 
 
-def boxes_from_pose(keypoints, scores, view_width=320, view_height=240):
+def expand_quadrant_boxes(boxes, view_width=320, view_height=240,
+                          horizontal_fraction=.18,
+                          vertical_fraction=.16):
+    """Expand top-down pose ROIs without crossing a camera quadrant.
+
+    The retry is only used when a detector box failed the articulated-pose
+    contract. Keeping it inside the source camera avoids feeding pixels from a
+    neighbouring fisheye view into RTMPose.
+    """
+    expanded = []
+    for box in np.asarray(boxes, dtype=np.float32).reshape(-1, 4):
+        x0, y0, x1, y1 = (float(value) for value in box)
+        center_x, center_y = (x0 + x1) * .5, (y0 + y1) * .5
+        col, row = int(center_x >= view_width), int(center_y >= view_height)
+        qx, qy = col * view_width, row * view_height
+        width, height = max(1.0, x1 - x0), max(1.0, y1 - y0)
+        expanded.append([
+            max(qx, x0 - horizontal_fraction * width),
+            max(qy, y0 - vertical_fraction * height),
+            min(qx + view_width - 1, x1 + horizontal_fraction * width),
+            min(qy + view_height - 1, y1 + vertical_fraction * height),
+        ])
+    return np.asarray(expanded, dtype=np.float32).reshape(-1, 4)
+
+
+def mosaic_box_camera_local(box, view_width, view_height):
+    """Return physical camera index and local coordinates for a mosaic ROI."""
+    value = np.asarray(box, dtype=np.float32).reshape(4)
+    center_x = float(value[0] + value[2]) * .5
+    center_y = float(value[1] + value[3]) * .5
+    camera_id = (int(center_y >= view_height) * 2 +
+                 int(center_x >= view_width))
+    offset = np.asarray([
+        (camera_id % 2) * view_width,
+        (camera_id // 2) * view_height,
+    ] * 2, dtype=np.float32)
+    return camera_id, value - offset
+
+
+def boxes_from_pose(keypoints, scores, view_width=320, view_height=240,
+                    keypoint_threshold=.22):
     boxes = []
     for points, confidence in zip(keypoints, scores):
-        valid = confidence >= .22
+        valid = confidence >= float(keypoint_threshold)
         if np.count_nonzero(valid) < 3:
             continue
         xy = points[valid]
@@ -317,7 +441,7 @@ def seed_right_boxes(left_boxes, nominal_disparity=10.0):
 
 
 def infer_view(mosaic, detector, estimator, boxes, run_detector,
-               view_width=320, view_height=240):
+               view_width=320, view_height=240, keypoint_threshold=.22):
     bgr = (mosaic if mosaic.ndim == 3 else
            cv2.cvtColor(mosaic, cv2.COLOR_GRAY2BGR))
     detection_ms = 0.0
@@ -337,7 +461,7 @@ def infer_view(mosaic, detector, estimator, boxes, run_detector,
         scores = np.empty((0, 17), dtype=np.float32)
     pose_ms = (time.monotonic() - started) * 1000.0
     next_boxes = boxes_from_pose(
-        keypoints, scores, view_width, view_height)
+        keypoints, scores, view_width, view_height, keypoint_threshold)
     # A single low-confidence pose frame must not discard the detector box.
     # The next scheduled all-sector YOLOX pass will still refresh/remove it.
     if not len(next_boxes) and len(boxes):
@@ -345,7 +469,7 @@ def infer_view(mosaic, detector, estimator, boxes, run_detector,
     people = [[] for _ in range(4)]
     for detection_id, (points, confidence) in enumerate(
             zip(keypoints, scores)):
-        valid = confidence >= .22
+        valid = confidence >= float(keypoint_threshold)
         if np.count_nonzero(valid) < 3:
             continue
         center = np.median(points[valid], axis=0)
@@ -464,14 +588,15 @@ def detect_single_view(image, detector):
     detected = np.asarray(detected, dtype=np.float32).reshape(-1, 4)
     classes = np.asarray(classes, dtype=np.int32).reshape(-1)
     boxes = detected[classes == 0]
+    small_boxes_rejected = 0
     if len(boxes):
         boxes[:, (0, 2)] = np.clip(boxes[:, (0, 2)], 0, image.shape[1] - 1)
         boxes[:, (1, 3)] = np.clip(boxes[:, (1, 3)], 0, image.shape[0] - 1)
-        boxes = np.asarray([
-            box for box in boxes
-            if box[2] - box[0] >= 18 and box[3] - box[1] >= 28
-        ], dtype=np.float32).reshape(-1, 4)
-    return boxes, (time.monotonic() - started) * 1000.0
+        accepted = [box for box in boxes if person_box_is_usable(box)]
+        small_boxes_rejected = len(boxes) - len(accepted)
+        boxes = np.asarray(accepted, dtype=np.float32).reshape(-1, 4)
+    return (boxes, (time.monotonic() - started) * 1000.0,
+            small_boxes_rejected)
 
 
 def box_iou(first, second):
@@ -784,13 +909,9 @@ def match_anchor_epipolar(left, right, anchor_side, anchor_point,
     return target_point, anchor_point, float(maximum)
 
 
-def anchor_person_is_valid(person, threshold):
-    scores = np.asarray(person["scores"], dtype=np.float64)
-    visible = scores >= .22
-    if np.count_nonzero(visible) < 3:
-        return False
-    strongest = np.sort(scores)[-min(8, scores.size):]
-    return float(np.mean(strongest)) >= max(.24, threshold - .05)
+def anchor_person_is_valid(person, threshold, detector_box=None):
+    return articulated_person_is_valid(
+        person["points"], person["scores"], threshold, detector_box)
 
 
 def guard_anchor_skeleton(person):
@@ -874,7 +995,7 @@ def anchor_monocular_depth(points, scores, focal, detector_box=None):
         pixel_height = float(box[3] - box[1])
         if pixel_height >= 28.0:
             # A clipped box underestimates image height and therefore only
-            # overestimates range, which is conservative for a 5 m gate.
+            # overestimates range, which is conservative for the output gate.
             estimates.append(float(focal) * 1.70 / pixel_height)
     valid = [value for value in estimates if .35 <= value <= 9.0]
     return None if len(valid) < 2 else float(np.median(valid))
@@ -1190,6 +1311,143 @@ def make_anchor_person(camera_id, anchor_person, anchor_box,
     return person
 
 
+# A close pedestrian can remain a valid YOLOX person box while RTMPose loses
+# enough joints to reject the pose (cropping, fisheye distortion, or mutual
+# occlusion).  Dropping that box entirely creates a particularly dangerous
+# failure mode: the downstream planner sees a clear corridor even though the
+# detector still reports an occupied image region.  In Isaac GT-depth mode we
+# can lift the box itself into a deliberately coarse body capsule.  Normal
+# pose skeletons always take precedence; this fallback is used only for a box
+# that did not produce a usable 3-D pose in the same frame.
+_DETECTION_ONLY_BODY_OFFSETS = (
+    (0.00, 0.00, 0.55),   # nose
+    (0.00, 0.07, 0.52),   # left eye
+    (0.00, -0.07, 0.52),  # right eye
+    (0.00, 0.12, 0.48),   # left ear
+    (0.00, -0.12, 0.48),  # right ear
+    (0.00, 0.20, 0.25),   # left shoulder
+    (0.00, -0.20, 0.25),  # right shoulder
+    (0.00, 0.30, 0.00),   # left elbow
+    (0.00, -0.30, 0.00),  # right elbow
+    (0.00, 0.35, -0.20),  # left wrist
+    (0.00, -0.35, -0.20), # right wrist
+    (0.00, 0.15, -0.20),  # left hip
+    (0.00, -0.15, -0.20), # right hip
+    (0.00, 0.14, -0.65),  # left knee
+    (0.00, -0.14, -0.65), # right knee
+    (0.00, 0.14, -1.00),  # left ankle
+    (0.00, -0.14, -1.00), # right ankle
+)
+
+
+def make_detection_only_obstacle(camera_id, anchor_box, geometries,
+                                 depths, depth_stamps, frame_stamp,
+                                 anchor_focal, anchor_width, anchor_height,
+                                 args):
+    """Lift an unmatched detector box into a coarse COCO-17 body.
+
+    The helper is intentionally restricted to exact-timestamp Isaac depth.
+    Hybrid/real operation must not silently treat a noisy stereo background
+    sample as a person.  Several central box samples are lifted and the
+    nearest plausible one is used, which is conservative when a close body
+    partially occludes a more distant pedestrian or wall.
+    """
+    if args.joint_depth_source != "isaac_gt":
+        return None
+    box = np.asarray(anchor_box, dtype=np.float64).reshape(4)
+    width = float(box[2] - box[0])
+    height = float(box[3] - box[1])
+    if width < 18.0 or height < 28.0:
+        return None
+    candidates_for_camera = [
+        (pair_id, geometry)
+        for pair_id, geometry in enumerate(geometries)
+        if camera_id in (geometry["left_camera_id"],
+                         geometry["right_camera_id"])
+    ]
+    # A clipped close-person box underestimates image height, so this estimate
+    # only widens the admissible range.  The hard 4 m cap keeps the fallback a
+    # local collision sensor rather than a replacement for pose tracking.
+    monocular_range = float(anchor_focal) * 1.70 / max(1.0, height)
+    maximum_range = min(4.0, max(1.0, 2.5 * monocular_range))
+    lifted_candidates = []
+    for x_fraction, y_fraction in (
+            (0.50, 0.50), (0.40, 0.45), (0.60, 0.45),
+            (0.50, 0.35), (0.50, 0.62)):
+        anchor_point = np.asarray([
+            box[0] + width * x_fraction,
+            box[1] + height * y_fraction,
+        ], dtype=np.float64)
+        for pair_id, geometry in candidates_for_camera:
+            projection = project_anchor_point(
+                geometry, camera_id, anchor_point, anchor_focal,
+                anchor_width, anchor_height)
+            if projection is None:
+                continue
+            anchor_side, rectified_point = projection
+            if anchor_side != "left" or not (
+                    0 <= rectified_point[0] < 320 and
+                    0 <= rectified_point[1] < 240):
+                continue
+            lifted = lift_isaac_gt_joint(
+                geometry, rectified_point, depths[pair_id],
+                depth_stamps[pair_id], frame_stamp, args)
+            if lifted is None:
+                continue
+            xyz_body = np.asarray(lifted["xyz_imu_m"], dtype=np.float64)
+            range_m = float(np.linalg.norm(xyz_body))
+            if range_m <= maximum_range:
+                lifted_candidates.append((range_m, xyz_body, lifted))
+    if not lifted_candidates:
+        return None
+    _, center, lifted = min(lifted_candidates, key=lambda item: item[0])
+    person = {
+        "pair": "DETECTION_ONLY_CAM_{}".format(chr(65 + camera_id)),
+        "anchor_camera": "CAM_{}".format(chr(65 + camera_id)),
+        "detection_id": -1,
+        "detector_box": box.round(3).tolist(),
+        "color": "#ff9b42",
+        "detection_only_obstacle": True,
+        "range_gate_center_m": center.round(6).tolist(),
+        "joints": [],
+    }
+    for joint_id, (name, offset) in enumerate(zip(
+            pose3d.JOINTS, _DETECTION_ONLY_BODY_OFFSETS)):
+        xyz_body = center + np.asarray(offset, dtype=np.float64)
+        joint = {
+            "id": joint_id,
+            "name": name,
+            "anchor_camera": person["anchor_camera"],
+            "anchor_pixel": None,
+            "pixel": None,
+            "pixel_int": None,
+            "right_pixel": None,
+            # Keep the obstacle valid, but below normal pose confidence so
+            # diagnostics and later learning can distinguish the fallback.
+            "score": 0.30,
+            "right_score": None,
+            "source": "detection_only_isaac_gt_depth",
+            "source_pair": lifted.get("source_pair"),
+            "depth_m": lifted.get("depth_m"),
+            "depth_mad_m": lifted.get("depth_mad_m"),
+            "measurement_sigma_m": max(
+                0.20, float(lifted.get("measurement_sigma_m") or 0.20)),
+            "measurement_age_ms": 0.0,
+            "ncc": None,
+            "disparity_px": lifted.get("disparity_px"),
+            "reprojection_error_px": None,
+            "hitnet_depth_m": None,
+            "hitnet_age_ms": None,
+            "hitnet_consistent": None,
+            "xyz_rect_m": None,
+            "xyz_imu_m": xyz_body.round(6).tolist(),
+        }
+        person["joints"].append(joint)
+    person["source_pairs"] = [lifted["source_pair"]]
+    person["detection_only_range_m"] = round(float(np.linalg.norm(center)), 4)
+    return person
+
+
 def make_stereo_person(sector, left_person, right_person, geometry,
                        left_image, right_image, depth, depth_stamp,
                        frame_stamp, args):
@@ -1388,6 +1646,11 @@ class PersonRangeFilter:
         self.states = {}
         self.next_id = 0
 
+    def reset(self):
+        """Discard temporal range-gate state at an episode boundary."""
+        self.states = {}
+        self.next_id = 0
+
     def filter(self, people, frame_index):
         if self.max_range <= 0.0:
             ranges = []
@@ -1437,8 +1700,7 @@ class PersonRangeFilter:
                 self.states[state_id] = {
                     "center": center.copy(),
                     "range": measured_range,
-                    "accepted": measured_range <=
-                    self.max_range - self.hysteresis,
+                    "accepted": measured_range <= self.max_range,
                     "last_frame": frame_index,
                 }
             state = self.states[state_id]
@@ -1446,10 +1708,10 @@ class PersonRangeFilter:
             state["range"] = ((1.0 - self.smoothing) * state["range"] +
                               self.smoothing * measured_range)
             if state["accepted"]:
-                state["accepted"] = state["range"] <= self.max_range
-            else:
                 state["accepted"] = state["range"] <= \
-                    self.max_range - self.hysteresis
+                    self.max_range + self.hysteresis
+            else:
+                state["accepted"] = state["range"] <= self.max_range
             state["last_frame"] = frame_index
             person = people[person_index]
             person["range_m"] = round(float(state["range"]), 4)
@@ -1532,8 +1794,18 @@ def fuse_people(raw_people, merge_distance):
             pair for member in cluster["members"]
             for pair in member.get("source_pairs", [])
         })
+        detection_only_members = sum(bool(
+            member.get("detection_only_obstacle", False))
+            for member in cluster["members"])
         fused.append({"source_pairs": physical_pairs,
                       "source_anchors": sorted(cluster["pairs"]),
+                      # A cluster containing any genuine pose measurement is a
+                      # pose skeleton. Only an all-fallback cluster receives
+                      # the stricter detector-only confirmation policy.
+                      "detection_only_obstacle": (
+                          detection_only_members == len(cluster["members"])),
+                      "contains_detection_only_obstacle": bool(
+                          detection_only_members),
                       "range_gate_center_m": np.mean([
                           person_tracking_center(member)
                           for member in cluster["members"]
@@ -1617,10 +1889,12 @@ def draw_pose_2d(view, people, color):
 
 def annotate_pair(left, right, triangulated_people,
                   left_people, right_people, color):
+    del left_people, right_people
     left_view = cv2.cvtColor(left, cv2.COLOR_GRAY2BGR)
     right_view = cv2.cvtColor(right, cv2.COLOR_GRAY2BGR)
-    draw_pose_2d(left_view, left_people, (40, 245, 80))
-    draw_pose_2d(right_view, right_people, (40, 220, 255))
+    # Only range-gated 3-D people are drawn. Raw 2-D pose proposals may still
+    # be useful inside perception, but drawing them made distant/invalid poses
+    # look as if they had entered the published skeleton stream.
     for person in triangulated_people:
         for first, second in pose3d.BONES:
             joint_a, joint_b = person["joints"][first], person["joints"][second]
@@ -1651,25 +1925,40 @@ def annotate_pair(left, right, triangulated_people,
     return np.hstack((left_view, right_view))
 
 
+def _anchor_point_or_none(joint):
+    pixel = joint.get("anchor_pixel")
+    if pixel is None:
+        return None
+    value = np.asarray(pixel, dtype=np.float64).reshape(-1)
+    if value.shape != (2,) or not np.isfinite(value).all():
+        return None
+    return tuple(np.rint(value).astype(int))
+
+
 def annotate_anchor(image, pose_people, triangulated_people, color):
+    del pose_people
     view = image.copy() if image.ndim == 3 else \
         cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    draw_pose_2d(view, pose_people, (40, 245, 80))
     for person in triangulated_people:
         joints = person["joints"]
         for first, second in pose3d.BONES:
             first_joint, second_joint = joints[first], joints[second]
             if first_joint["score"] < .22 or second_joint["score"] < .22:
                 continue
-            first_point = tuple(np.rint(
-                first_joint["anchor_pixel"]).astype(int))
-            second_point = tuple(np.rint(
-                second_joint["anchor_pixel"]).astype(int))
+            # Detection-only fallback people intentionally have valid 3-D
+            # obstacle joints but no 2-D anchor projection.  They must remain
+            # in the perception stream without killing the optional viewer.
+            first_point = _anchor_point_or_none(first_joint)
+            second_point = _anchor_point_or_none(second_joint)
+            if first_point is None or second_point is None:
+                continue
             cv2.line(view, first_point, second_point, color, 2, cv2.LINE_AA)
         for joint in joints:
             if joint["score"] < .22:
                 continue
-            point = tuple(np.rint(joint["anchor_pixel"]).astype(int))
+            point = _anchor_point_or_none(joint)
+            if point is None:
+                continue
             valid = joint["xyz_imu_m"] is not None
             cv2.circle(view, point, 4,
                        (40, 240, 255) if valid else (80, 80, 255),
@@ -1694,7 +1983,9 @@ def draw_3d(people, width=640, height=960):
         for person in people for joint in person["joints"]
         if joint["xyz_imu_m"] is not None
     ]
-    horizontal_extent = 3.0
+    # Default to a +/-7 m ground-plane view. Perception remains gated at 6 m,
+    # leaving one metre of visual margin around the accepted skeleton region.
+    horizontal_extent = SKELETON_DISPLAY_HALF_EXTENT_M
     if visible_points:
         horizontal_extent = max(
             horizontal_extent,
@@ -1751,6 +2042,45 @@ def draw_3d(people, width=640, height=960):
     return panel
 
 
+def display_eligible_people(people, max_range, *, observed_only):
+    """Return human skeletons eligible for optional visual annotation.
+
+    This affects only the web viewer. It mirrors the published range contract
+    and deliberately hides detection-only obstacles and short-gap predicted
+    tracks so a drawn skeleton always means a currently observed, accepted
+    human when ``observed_only`` is true.
+    """
+    maximum = float(max_range)
+    accepted = []
+    for person in people:
+        if bool(person.get("detection_only_obstacle", False)):
+            continue
+        if observed_only and bool(person.get("predicted_track", False)):
+            continue
+        valid_joint_ids = {
+            int(joint["id"]) for joint in person.get("joints", [])
+            if joint.get("xyz_imu_m") is not None
+        }
+        if (sum(index >= 5 for index in valid_joint_ids) < 4 or
+                sum(index in (5, 6, 11, 12)
+                    for index in valid_joint_ids) < 2):
+            continue
+        distance = person.get("range_m")
+        try:
+            distance = float(distance)
+        except (TypeError, ValueError):
+            distance = math.nan
+        if not math.isfinite(distance):
+            center = person_tracking_center(person)
+            if center is None:
+                continue
+            distance = float(np.linalg.norm(center))
+        if maximum > 0.0 and distance > maximum:
+            continue
+        accepted.append(person)
+    return accepted
+
+
 def colorize_depth_panel(depth, pair_id, min_depth=.25, max_depth=8.0):
     """Render rectified-left optical-Z depth without changing perception data."""
     labels = ("RIGHT / AB", "REAR / BC", "LEFT / CD", "FRONT / DA")
@@ -1797,7 +2127,7 @@ class WebState:
 HTML = """<!doctype html><html lang=zh-CN><head><meta charset=utf-8>
 <meta name=viewport content='width=device-width,initial-scale=1'><title>OmniNxt 深度与三维骨架</title>
 <style>body{margin:0;background:#080c12;color:#eef4ff;font-family:system-ui;text-align:center}header{position:sticky;top:0;z-index:2;background:#101722ee;padding:9px}h1{font-size:18px;margin:0 0 4px}#s{font-size:13px;color:#b8c6d9}img{display:block;margin:auto;max-width:100%;height:auto}</style></head><body><header><h1>OmniNxt 四向 Z 深度 + COCO-17 三维骨架</h1><div id=s>等待数据</div></header><img id=v><script>
-const v=document.querySelector('#v'),s=document.querySelector('#s');async function tick(){let t=Date.now();v.src='/frame.jpg?t='+t;try{let d=await(await fetch('/status.json?t='+t)).json();let gate=d.max_person_range_m>0?`距离上限 ${d.max_person_range_m.toFixed(1)}m`:'距离不限';s.textContent=`输入 ${d.input_hz.toFixed(2)} Hz · 处理 ${d.processing_hz.toFixed(2)} Hz · 人体 ${d.people} · 短时保持 ${d.predicted_people||0} · ${gate} · 距离过滤 ${d.range_rejected_people||0} · 三角化 ${d.triangulated_joints} · 三维关节 ${d.valid_3d_joints} · ${d.total_ms.toFixed(0)} ms`;}catch(e){}setTimeout(tick,150)}tick();</script></body></html>"""
+const v=document.querySelector('#v'),s=document.querySelector('#s');async function tick(){let t=Date.now();v.src='/frame.jpg?t='+t;try{let d=await(await fetch('/status.json?t='+t)).json();let gate=d.max_person_range_m>0?`距离上限 ${d.max_person_range_m.toFixed(1)}m`:'距离不限';s.textContent=`输入 ${d.input_hz.toFixed(2)} Hz · 处理 ${d.processing_hz.toFixed(2)} Hz · 实测人体 ${d.observed_people||0} · 校正视图救援 ${d.rectified_rescue_people||0} · 短时预测 ${d.predicted_people||0} · 图中标注 ${d.displayed_people||0} · 总输出 ${d.people} · ${gate} · 距离过滤 ${d.range_rejected_people||0} · 姿态重试 ${d.pose_retry_successes||0}/${d.pose_retry_attempts||0} · 无效姿态 ${d.invalid_anchor_poses||0} · 三角化 ${d.triangulated_joints} · 三维关节 ${d.valid_3d_joints} · ${d.total_ms.toFixed(0)} ms`;}catch(e){}setTimeout(tick,150)}tick();</script></body></html>"""
 
 
 class DisplayWorker:
@@ -1828,6 +2158,22 @@ class DisplayWorker:
             remaining = self.period - (time.monotonic() - last)
             if remaining > 0:
                 time.sleep(remaining)
+            try:
+                self._render(payload)
+            except Exception as error:  # display must never stop perception
+                rospy.logerr_throttle(
+                    5.0,
+                    "Skeleton web display dropped one frame but remains "
+                    "alive: %s",
+                    error,
+                )
+                with self.state.lock:
+                    status = dict(payload.get("status", {}))
+                    status["display_error"] = str(error)
+                    self.state.status = status
+            last = time.monotonic()
+
+    def _render(self, payload):
             if payload.get("anchor_mode", False):
                 anchor_views = [annotate_anchor(
                     payload["anchors"][index],
@@ -1873,7 +2219,6 @@ class DisplayWorker:
                 with self.state.lock:
                     self.state.jpeg = encoded.tobytes()
                     self.state.status = dict(payload["status"])
-            last = time.monotonic()
 
 
 def start_web_server(state, port):
@@ -1925,7 +2270,8 @@ def main():
     anchor_focal = args.anchor_width / (2.0 * math.tan(
         math.radians(args.anchor_fov) / 2.0))
     detector = TensorRTYOLOX(
-        args.det_engine, model_input_size=(416, 416),
+        args.det_engine,
+        model_input_size=(args.det_input_size, args.det_input_size),
         det_mode="multiclass", nms_thr=.45, score_thr=args.det_threshold)
     estimator = TensorRTRTMPose(
         args.pose_engine, model_input_size=(192, 256))
@@ -1943,7 +2289,7 @@ def main():
     }
     tracker = MotionSkeletonTracker(
         pose3d.JOINTS,
-        confirmation_hits=3,
+        confirmation_hits=2,
         prediction_timeout=args.track_hold_sec,
         deletion_timeout=4.0,
         max_person_range=args.max_person_range,
@@ -1954,7 +2300,7 @@ def main():
     )
     range_filter = PersonRangeFilter(
         max_range=args.max_person_range,
-        hysteresis=.25,
+        hysteresis=PERSON_RANGE_HYSTERESIS_M,
         smoothing=.25,
     )
     anchor_camera_tracks = [[] for _ in range(4)]
@@ -1962,6 +2308,7 @@ def main():
     boxes_left = np.empty((0, 4), dtype=np.float32)
     boxes_right = np.empty((0, 4), dtype=np.float32)
     frame_index = 0
+    active_generation = 0
     processing_times = deque(maxlen=30)
     input_times = deque(maxlen=30)
     web_state = WebState()
@@ -1980,9 +2327,27 @@ def main():
               flush=True)
     while not rospy.is_shutdown():
         try:
-            stamp_ns, frame, depths, depth_stamps = bridge.frames.get(timeout=.5)
+            generation, stamp_ns, frame, depths, depth_stamps, ego_pose = \
+                bridge.frames.get(timeout=.5)
         except queue.Empty:
             continue
+        if generation != active_generation:
+            old_session = tracker.session_id
+            tracker.reset_session()
+            range_filter.reset()
+            anchor_camera_tracks = [[] for _ in range(4)]
+            boxes_anchor = np.empty((0, 4), dtype=np.float32)
+            boxes_left = np.empty((0, 4), dtype=np.float32)
+            boxes_right = np.empty((0, 4), dtype=np.float32)
+            frame_index = 0
+            processing_times.clear()
+            input_times.clear()
+            active_generation = generation
+            rospy.logwarn(
+                "Perception episode reset: generation=%d, old_session=%s, "
+                "new_session=%s, stamp=%.3fs",
+                generation, old_session, tracker.session_id,
+                float(stamp_ns) / 1e9)
         started = time.monotonic()
         left_images = [frame[(index, "left")] for index in range(4)]
         right_images = [frame[(index, "right")] for index in range(4)]
@@ -1998,27 +2363,77 @@ def main():
         run_detector = False
         rescue_detector = False
         rescue_camera = None
+        anchor_detector_cameras = []
+        anchor_detector_calls = 0
         anchor_boxes_before_dedup = 0
         anchor_boxes_after_dedup = 0
+        rectified_rescue_detector_calls = 0
+        rectified_rescue_people = 0
         pose_duplicate_rois_removed = 0
+        invalid_anchor_poses = 0
+        unmatched_detector_boxes = 0
+        pose_retry_attempts = 0
+        pose_retry_successes = 0
+        small_detector_boxes_rejected = 0
         range_rejected_people = 0
         if all((index, "anchor") in frame for index in range(4)):
             anchor_views = [frame[(index, "anchor")] for index in range(4)]
             detector_interval = max(1, args.rescue_det_interval)
             run_detector = frame_index % detector_interval == 0
             if run_detector:
-                rescue_camera = ((frame_index // detector_interval) % 4)
-                rescue_boxes, rescue_ms = detect_single_view(
-                    anchor_views[rescue_camera], detector)
-                update_detection_tracks(
-                    anchor_camera_tracks[rescue_camera], rescue_boxes,
-                    args.detector_miss_ttl)
-                det_left_ms += rescue_ms
+                if args.anchor_detector_mode == "all_views":
+                    anchor_detector_cameras = list(range(4))
+                    for camera_id in anchor_detector_cameras:
+                        detected_boxes, detector_ms, small_rejected = detect_single_view(
+                            anchor_views[camera_id], detector)
+                        small_detector_boxes_rejected += small_rejected
+                        update_detection_tracks(
+                            anchor_camera_tracks[camera_id], detected_boxes,
+                            args.detector_miss_ttl)
+                        det_left_ms += detector_ms
+                        anchor_detector_calls += 1
+                elif args.anchor_detector_mode == "round_robin":
+                    rescue_camera = (
+                        (frame_index // detector_interval) % 4)
+                    anchor_detector_cameras = [rescue_camera]
+                    detected_boxes, detector_ms, small_rejected = detect_single_view(
+                        anchor_views[rescue_camera], detector)
+                    small_detector_boxes_rejected += small_rejected
+                    update_detection_tracks(
+                        anchor_camera_tracks[rescue_camera], detected_boxes,
+                        args.detector_miss_ttl)
+                    det_left_ms += detector_ms
+                    anchor_detector_calls = 1
+                else:
+                    detected_boxes, detector_ms, small_rejected = detect_single_view(
+                        make_mosaic(anchor_views), detector)
+                    small_detector_boxes_rejected += small_rejected
+                    detected_boxes = clip_quadrant_boxes(
+                        detected_boxes,
+                        args.anchor_width, args.anchor_height)
+                    anchor_detector_cameras = list(range(4))
+                    for sector in range(4):
+                        sector_boxes = boxes_in_sector(
+                            detected_boxes, sector,
+                            args.anchor_width, args.anchor_height)
+                        offset = np.array([
+                            (sector % 2) * args.anchor_width,
+                            (sector // 2) * args.anchor_height,
+                        ] * 2, dtype=np.float32)
+                        update_detection_tracks(
+                            anchor_camera_tracks[sector],
+                            sector_boxes - offset if len(sector_boxes)
+                            else sector_boxes,
+                            args.detector_miss_ttl)
+                    det_left_ms += detector_ms
+                    anchor_detector_calls = 1
                 rescue_detector = True
-            if args.center_det_interval > 0 and \
+            if args.anchor_detector_mode != "mosaic" and \
+                    args.center_det_interval > 0 and \
                     frame_index % args.center_det_interval == 0:
-                detected_boxes, detector_ms = detect_single_view(
+                detected_boxes, detector_ms, small_rejected = detect_single_view(
                     make_mosaic(anchor_views), detector)
+                small_detector_boxes_rejected += small_rejected
                 detected_boxes = clip_quadrant_boxes(
                     detected_boxes, args.anchor_width, args.anchor_height)
                 for sector in range(4):
@@ -2035,6 +2450,7 @@ def main():
                         else sector_boxes,
                         args.detector_miss_ttl)
                 det_left_ms += detector_ms
+                anchor_detector_calls += 1
             boxes_anchor = tracks_to_anchor_mosaic(
                 anchor_camera_tracks,
                 args.anchor_width, args.anchor_height)
@@ -2043,9 +2459,67 @@ def main():
                 boxes_anchor, cameras, anchor_focal,
                 args.anchor_width, args.anchor_height)
             anchor_boxes_after_dedup = len(pose_boxes)
-            anchor_people, _, _, pose_left_ms = infer_view(
-                make_mosaic(anchor_views), None, estimator, pose_boxes,
-                False, args.anchor_width, args.anchor_height)
+            anchor_mosaic = make_mosaic(anchor_views)
+            initial_anchor_people, _, _, pose_left_ms = infer_view(
+                anchor_mosaic, None, estimator, pose_boxes, False,
+                args.anchor_width, args.anchor_height,
+                args.keypoint_threshold)
+            accepted_pose_by_id = {}
+            for camera_people in initial_anchor_people:
+                for pose_person in camera_people:
+                    detection_id = int(pose_person["detection_id"])
+                    if not 0 <= detection_id < len(pose_boxes):
+                        continue
+                    camera_id, local_box = mosaic_box_camera_local(
+                        pose_boxes[detection_id], args.anchor_width,
+                        args.anchor_height)
+                    if anchor_person_is_valid(
+                            pose_person, args.person_threshold, local_box):
+                        accepted_pose_by_id[detection_id] = (
+                            camera_id, pose_person, local_box)
+
+            retry_ids = [
+                detection_id for detection_id in range(len(pose_boxes))
+                if detection_id not in accepted_pose_by_id
+            ]
+            pose_retry_attempts = len(retry_ids)
+            if retry_ids:
+                retry_boxes = expand_quadrant_boxes(
+                    pose_boxes[retry_ids], args.anchor_width,
+                    args.anchor_height)
+                retry_people, _, _, retry_pose_ms = infer_view(
+                    anchor_mosaic, None, estimator, retry_boxes, False,
+                    args.anchor_width, args.anchor_height,
+                    args.keypoint_threshold)
+                pose_left_ms += retry_pose_ms
+                for camera_people in retry_people:
+                    for retry_person in camera_people:
+                        retry_detection_id = int(
+                            retry_person["detection_id"])
+                        if not 0 <= retry_detection_id < len(retry_ids):
+                            continue
+                        detection_id = retry_ids[retry_detection_id]
+                        camera_id, local_box = mosaic_box_camera_local(
+                            retry_boxes[retry_detection_id],
+                            args.anchor_width, args.anchor_height)
+                        if not anchor_person_is_valid(
+                                retry_person, args.person_threshold,
+                                local_box):
+                            continue
+                        retry_person["detection_id"] = detection_id
+                        accepted_pose_by_id[detection_id] = (
+                            camera_id, retry_person, local_box)
+                        pose_retry_successes += 1
+
+            invalid_anchor_poses = max(
+                0, len(pose_boxes) - len(accepted_pose_by_id))
+            anchor_people = [[] for _ in range(4)]
+            anchor_local_boxes = {}
+            for detection_id, (camera_id, pose_person, local_box) in \
+                    accepted_pose_by_id.items():
+                anchor_people[camera_id].append(pose_person)
+                anchor_local_boxes[detection_id] = local_box
+            usable_anchor_detection_ids = set()
             for camera_id in range(4):
                 anchor_people[camera_id], removed = deduplicate_body_poses(
                     anchor_people[camera_id])
@@ -2055,35 +2529,104 @@ def main():
                     anchor_people[camera_id],
                     args.anchor_width, args.anchor_height)
                 for pose_person in anchor_people[camera_id]:
-                    if not anchor_person_is_valid(
-                            pose_person, args.person_threshold):
-                        continue
+                    local_box = anchor_local_boxes[
+                        int(pose_person["detection_id"])]
                     person = make_anchor_person(
                         camera_id, pose_person,
-                        pose_boxes[pose_person["detection_id"]] - np.array([
-                            (camera_id % 2) * args.anchor_width,
-                            (camera_id // 2) * args.anchor_height,
-                        ] * 2, dtype=np.float32),
+                        local_box,
                         geometries, cameras,
                         left_images, right_images, depths, depth_stamps,
                         stamp_ns, anchor_focal, args.anchor_width,
                         args.anchor_height, args)
                     if person_center(person) is None:
                         continue
+                    usable_anchor_detection_ids.add(
+                        int(pose_person["detection_id"]))
                     raw_people.append(person)
                     raw_by_sector[camera_id].append(person)
+            unmatched_detector_boxes = max(
+                0, len(pose_boxes) - len(usable_anchor_detection_ids))
+            # Optional low-power/safety compatibility mode.  It is disabled
+            # for high-accuracy world-model data because a persistent false
+            # YOLO box must never be converted into a synthetic human slot.
+            if args.detection_only_fallback == "persistent" and \
+                    args.joint_depth_source == "isaac_gt":
+                for detection_id, mosaic_box in enumerate(pose_boxes):
+                    if detection_id in usable_anchor_detection_ids:
+                        continue
+                    center_x = float(mosaic_box[0] + mosaic_box[2]) * .5
+                    center_y = float(mosaic_box[1] + mosaic_box[3]) * .5
+                    camera_id = (
+                        int(center_y >= args.anchor_height) * 2
+                        + int(center_x >= args.anchor_width)
+                    )
+                    offset = np.asarray([
+                        (camera_id % 2) * args.anchor_width,
+                        (camera_id // 2) * args.anchor_height,
+                    ] * 2, dtype=np.float64)
+                    fallback = make_detection_only_obstacle(
+                        camera_id,
+                        np.asarray(mosaic_box, dtype=np.float64) - offset,
+                        geometries, depths, depth_stamps, stamp_ns,
+                        anchor_focal, args.anchor_width,
+                        args.anchor_height, args)
+                    if fallback is None:
+                        continue
+                    raw_people.append(fallback)
+                    raw_by_sector[camera_id].append(fallback)
+
+            # The centre anchor is efficient for normal standing people, but
+            # a close side/back-facing body can be strongly stretched or
+            # cropped by the fisheye-to-anchor projection.  The four
+            # rectified left views already exist for depth and often retain a
+            # clean articulated silhouette.  Detect them independently (not
+            # as a stitched mosaic), lift their real RTMPose joints with the
+            # same exact-time depth, then let 3-D fusion remove duplicates.
+            # This is a second observation path, not a synthetic box skeleton
+            # and not privileged person truth.
+            for sector in range(4):
+                rectified_boxes, detector_ms, small_rejected = \
+                    detect_single_view(left_images[sector], detector)
+                det_left_ms += detector_ms
+                small_detector_boxes_rejected += small_rejected
+                rectified_rescue_detector_calls += 1
+                sector_people, _, _, sector_pose_ms = infer_view(
+                    left_images[sector], None, estimator,
+                    rectified_boxes, False,
+                    view_width=320, view_height=240,
+                    keypoint_threshold=args.keypoint_threshold)
+                pose_left_ms += sector_pose_ms
+                left_people[sector] = sector_people[0]
+                for pose_person in left_people[sector]:
+                    detection_id = int(pose_person["detection_id"])
+                    if not 0 <= detection_id < len(rectified_boxes):
+                        continue
+                    local_box = rectified_boxes[detection_id]
+                    if not anchor_person_is_valid(
+                            pose_person, args.person_threshold, local_box):
+                        continue
+                    person = make_stereo_person(
+                        sector, pose_person, None, geometries[sector],
+                        left_images[sector], right_images[sector],
+                        depths[sector], depth_stamps[sector], stamp_ns, args)
+                    if person_center(person) is None:
+                        continue
+                    raw_people.append(person)
+                    raw_by_sector[sector].append(person)
+                    rectified_rescue_people += 1
         else:
             # Exact-stamp raw data should normally be present. Retain the old
             # rectified-sector path as a safe fallback during startup.
             run_detector = frame_index % max(1, args.det_interval) == 0
             left_people, boxes_left, det_left_ms, pose_left_ms = infer_view(
                 make_mosaic(left_images), detector, estimator, boxes_left,
-                run_detector)
+                run_detector, keypoint_threshold=args.keypoint_threshold)
             if run_detector or len(boxes_right) == 0:
                 boxes_right = seed_right_boxes(boxes_left)
             right_people, boxes_right, det_right_ms, pose_right_ms = infer_view(
                 make_mosaic(right_images), None, estimator,
-                boxes_right, False)
+                boxes_right, False,
+                keypoint_threshold=args.keypoint_threshold)
             for sector in range(4):
                 left_people[sector], removed_left = deduplicate_body_poses(
                     left_people[sector])
@@ -2114,6 +2657,9 @@ def main():
         monocular_filled_joints = sum(
             int(person.get("monocular_filled_joints", 0))
             for person in raw_people)
+        detection_only_people = sum(
+            bool(person.get("detection_only_obstacle"))
+            for person in raw_people)
         raw_people, range_rejected_people, observed_person_ranges = \
             range_filter.filter(raw_people, frame_index)
         accepted_ids = {id(person) for person in raw_people}
@@ -2121,7 +2667,15 @@ def main():
                           if id(person) in accepted_ids]
                          for sector_people in raw_by_sector]
         fused = fuse_people(raw_people, args.merge_distance)
-        tracked = tracker.update(fused, stamp_ns)
+        tracked = tracker.update(fused, stamp_ns, ego_pose=ego_pose)
+        display_raw_by_sector = [
+            display_eligible_people(
+                sector_people, args.max_person_range,
+                observed_only=False)
+            for sector_people in raw_by_sector
+        ]
+        display_people = display_eligible_people(
+            tracked, args.max_person_range, observed_only=True)
         publish_ros(publishers, tracked, stamp_ns)
         processing_times.append(time.monotonic())
         processing_hz = 0.0 if len(processing_times) < 2 else \
@@ -2135,13 +2689,18 @@ def main():
                         for joint in person["joints"]
                         if joint["xyz_imu_m"] is not None]
         total_ms = (time.monotonic() - started) * 1000.0
+        tracker_status = tracker.status(stamp_ns)
         status = {
             "stamp_ns": stamp_ns,
             "input_hz": input_hz,
             "processing_hz": processing_hz,
             "people": len(tracked),
+            "observed_people": sum(
+                not person.get("predicted_track", False)
+                for person in tracked),
             "predicted_people": sum(
                 person.get("predicted_track", False) for person in tracked),
+            "displayed_people": len(display_people),
             "raw_sector_people": len(raw_people),
             "range_rejected_people": range_rejected_people,
             "max_person_range_m": args.max_person_range,
@@ -2149,13 +2708,26 @@ def main():
             "observed_person_ranges_m": observed_person_ranges,
             "monocular_raw_people": monocular_raw_people,
             "monocular_filled_joints": monocular_filled_joints,
+            "detection_only_people": detection_only_people,
+            "detection_only_fallback": args.detection_only_fallback,
             "front_end": ("camera_center_anchor" if anchor_views is not None
                           else "rectified_sector_fallback"),
+            "anchor_detector_mode": args.anchor_detector_mode,
+            "anchor_detector_cameras": anchor_detector_cameras,
+            "anchor_detector_calls": anchor_detector_calls,
             "anchor_people_by_camera": [len(values)
                                          for values in anchor_people],
             "anchor_boxes_before_dedup": anchor_boxes_before_dedup,
             "anchor_boxes_after_dedup": anchor_boxes_after_dedup,
+            "rectified_rescue_detector_calls":
+                rectified_rescue_detector_calls,
+            "rectified_rescue_people": rectified_rescue_people,
             "pose_duplicate_rois_removed": pose_duplicate_rois_removed,
+            "invalid_anchor_poses": invalid_anchor_poses,
+            "unmatched_detector_boxes": unmatched_detector_boxes,
+            "small_detector_boxes_rejected": small_detector_boxes_rejected,
+            "pose_retry_attempts": pose_retry_attempts,
+            "pose_retry_successes": pose_retry_successes,
             "left_people_by_sector": [len(values) for values in left_people],
             "right_people_by_sector": [len(values) for values in right_people],
             "stereo_matches_by_sector": match_counts,
@@ -2182,9 +2754,17 @@ def main():
             "rescue_camera": rescue_camera,
             "output_frame": "base_link",
             "runtime_flight_controller": False,
-            "filter_mode": "damped_constant_velocity",
+            "filter_mode": "ego_compensated_kalman_kinematic",
             "identity_mode": "postfusion_3d_motion",
-            "identity_tracker": tracker.status(stamp_ns),
+            "input_generation": active_generation,
+            "input_episode_generation": int(
+                ego_pose["episode_generation"]),
+            "input_rewind_count": bridge.synchronizer.rewind_count,
+            "input_external_reset_count": (
+                bridge.synchronizer.external_reset_count),
+            "ego_motion_compensated": bool(
+                tracker_status.get("ego_motion_compensated")),
+            "identity_tracker": tracker_status,
         }
         if backend_sender is not None:
             status["backend_stream"] = backend_sender.status()
@@ -2203,14 +2783,17 @@ def main():
                             ensure_ascii=False, separators=(",", ":"))))
         if display is not None:
             banner = ("INPUT {:.2f}Hz  PROCESS {:.2f}Hz  PEOPLE {}  "
-                      "TRI {}  GT {}  HITNET {}  {:.0f}ms").format(
+                      "BOX-FALLBACK {}  TRI {}  GT {}  HITNET {}  "
+                      "{:.0f}ms").format(
                           input_hz, processing_hz, len(tracked),
+                          status["detection_only_people"],
                           status["triangulated_joints"],
                           status["isaac_gt_depth_joints"],
                           status["hitnet_fallback_joints"], total_ms)
             display.submit({
                 "left": left_images, "right": right_images,
-                "raw_by_sector": raw_by_sector, "people": tracked,
+                "raw_by_sector": display_raw_by_sector,
+                "people": display_people,
                 "left_people": left_people, "right_people": right_people,
                 "anchor_mode": anchor_views is not None,
                 "anchors": anchor_views,
@@ -2221,11 +2804,24 @@ def main():
         if frame_index % 10 == 0:
             rospy.loginfo(
                 "stereo-pose input=%.2fHz process=%.2fHz people=%d "
-                "tri=%d gt_depth=%d hitnet_fallback=%d valid=%d total=%.1fms",
+                "boxes=%d rectified_rescue=%d box_small=%d "
+                "pose_invalid=%d pose_retry=%d/%d "
+                "box_fallback=%d tri=%d gt_depth=%d hitnet_fallback=%d "
+                "valid=%d sparse_in=%d assoc_reject=%d relocalize=%d "
+                "sparse_out=%d total=%.1fms",
                 input_hz, processing_hz, len(tracked),
+                anchor_boxes_after_dedup, rectified_rescue_people,
+                small_detector_boxes_rejected,
+                invalid_anchor_poses,
+                pose_retry_successes, pose_retry_attempts,
+                status["detection_only_people"],
                 status["triangulated_joints"],
                 status["isaac_gt_depth_joints"],
-                status["hitnet_fallback_joints"], len(valid_joints), total_ms)
+                status["hitnet_fallback_joints"], len(valid_joints),
+                tracker_status["sparse_measurements_rejected"],
+                tracker_status["association_measurements_rejected"],
+                tracker_status["coherent_relocalizations"],
+                tracker_status["sparse_outputs_suppressed"], total_ms)
         frame_index += 1
     if server is not None:
         server.shutdown()

@@ -7,6 +7,7 @@ import numpy as np
 import tensorrt as trt
 
 from rtmlib import RTMPose, YOLOX
+from rtmlib.tools.object_detection.post_processings import multiclass_nms
 
 
 class CudaRuntime:
@@ -166,3 +167,37 @@ class TensorRTYOLOX(YOLOX):
         tensor = np.ascontiguousarray(
             image.transpose(2, 0, 1), dtype=np.float32)[None]
         return self.runner(tensor)
+
+    def __call__(self, image):
+        image, ratio = self.preprocess(image)
+        outputs = self.inference(image)
+        if len(outputs) == 1:
+            return self.postprocess(outputs[0], ratio)
+        if len(outputs) != 2:
+            raise ValueError(
+                "Expected raw YOLOX output or decoded boxes/scores, got {}"
+                .format(len(outputs)))
+        boxes = np.asarray(outputs[0], dtype=np.float32).reshape(-1, 4)
+        scores = np.asarray(outputs[1], dtype=np.float32).reshape(
+            len(boxes), -1)
+        boxes /= float(ratio)
+        # This runtime is exclusively a person front-end.  Applying NMS only
+        # to COCO/HumanArt class 0 is both faster and avoids retaining a shelf
+        # under a competing furniture class before the caller filters it.
+        scores = scores[:, :1]
+        detections, _ = multiclass_nms(
+            boxes, scores, nms_thr=self.nms_thr,
+            score_thr=self.score_thr)
+        if detections is None:
+            final_boxes = np.empty((0, 4), dtype=np.float32)
+            final_classes = np.empty((0,), dtype=np.int32)
+        else:
+            final_boxes = detections[:, :4].astype(np.float32, copy=False)
+            final_classes = detections[:, 5].astype(np.int32, copy=False)
+        if self.det_mode == "multiclass":
+            return final_boxes, final_classes
+        if self.det_mode == "human":
+            return final_boxes[final_classes == 0]
+        raise NotImplementedError(
+            "det_mode must be 'human' or 'multiclass': {}"
+            .format(self.det_mode))

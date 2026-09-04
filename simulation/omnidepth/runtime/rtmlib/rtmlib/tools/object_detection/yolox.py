@@ -151,14 +151,16 @@ class YOLOX(BaseTool):
                 final_boxes, final_cls_inds = np.array([]), np.array([])
 
         elif outputs.shape[-1] == 5:
-            # onnx contains nms module
+            # HumanArt ONNX contains NMS and has one implicit person class.
 
             pack_dets = (outputs[0, :, :4], outputs[0, :, 4])
             final_boxes, final_scores = pack_dets
             final_boxes /= ratio
-            isscore = final_scores > 0.3
+            isscore = final_scores > self.score_thr
             isbbox = [i for i in isscore]
             final_boxes = final_boxes[isbbox]
+            final_scores = final_scores[isbbox]
+            final_cls_inds = np.zeros(len(final_boxes), dtype=np.int32)
 
         if self.det_mode == 'multiclass':
             return final_boxes, final_cls_inds

@@ -1,0 +1,93 @@
+{
+  "schema": "omninxt.step12000.tracker-source-manifest.v1",
+  "recorded_training_head_commit": "ecb28555292fb997597f5f0760bc59958445fb1c",
+  "recorded_training_head_evidence": {
+    "run_root": "pure_dreamer_v114_preemptive_boundary_latest_seed_20260901",
+    "replay_metadata_files_checked": 1401,
+    "distinct_git_commit_values": [
+      "ecb28555292fb997597f5f0760bc59958445fb1c"
+    ],
+    "important_limitation": "Replay metadata recorded HEAD only, not working-tree cleanliness or file hashes. The tracker/preprocessing overlay was uncommitted during collection/training, so the recorded commit alone is not a byte-exact source identifier."
+  },
+  "checkpoint": {
+    "path": "world_model/deployment_checkpoints/step_00012000_v67_human_exogeneity_klt_audit_compat.pt",
+    "sha256": "7c3cba29d55c22c5bc671a35d68d0b1fe87a53caf5be86ae498c9b92e969ad52",
+    "step": 12000,
+    "agent_tensor_migration": "unchanged"
+  },
+  "frozen_sources": [
+    {
+      "path": "simulation/omnidepth/runtime/motion_skeleton_tracker.py",
+      "sha256": "8cbbe9785f6c45a02d9850b690f59c64efe70b57b87f125f6264d7d5804af9c9",
+      "role": "post-fusion identity, root velocity, uncertainty proxy, lifecycle"
+    },
+    {
+      "path": "simulation/omnidepth/runtime/skeleton_stream.py",
+      "sha256": "ab0a563cbc454442d378e352f9742cdbeee6901f55ab489021de78e790f6e6ed",
+      "role": "fixed skeleton packet and quality-field serialization"
+    },
+    {
+      "path": "simulation/omnidepth/runtime/102_live_stereo_pose.py",
+      "sha256": "506e9c7d5ae2a7ac0df4bd3f709023e4a9f0113f4351bb81fe00cfb25ec9481f",
+      "role": "timestamp-aligned perception front end and tracker construction"
+    },
+    {
+      "path": "simulation/omnidepth/runtime/episode_sync.py",
+      "sha256": "82bf6c9eb8a6df6a723e53258384913df26d7e7f124ce58501fcaa197383ffd4",
+      "role": "exact-stamp bundle and episode-rewind synchronization"
+    },
+    {
+      "path": "simulation/omnidepth/runtime/person_detection_policy.py",
+      "sha256": "cb914bc370a3fdef830854f70b2ccff567af965f164f32083079c63e1184df85",
+      "role": "articulated-person and detector-ROI validation used by the live front end"
+    },
+    {
+      "path": "simulation/omnidepth/runtime/trt_rtmpose.py",
+      "sha256": "6bf8a9eae81b9b290d3603b715674674256504b9816f465edc1753a0f844609e",
+      "role": "TensorRT RTMPose/YOLOX wrapper used to produce tracker measurements"
+    },
+    {
+      "path": "simulation/omnidepth/runtime/rtmlib/rtmlib/tools/object_detection/yolox.py",
+      "sha256": "0f685ac798431fb2d59eba1b495258990f08d657b920358b8ae0f1eb5be21a99",
+      "role": "YOLOX postprocessing for the recorded perception front end"
+    },
+    {
+      "path": "simulation/isaacsim/database/skeleton_packet_receiver.py",
+      "sha256": "5a8dbb90f83b3b2bc37100d6b144768358f7e4c8ff5c9ca400cdeca19bf3ed2f",
+      "role": "validated packet reception and session boundary observation"
+    },
+    {
+      "path": "simulation/isaacsim/database/dataset_v3_schema.py",
+      "sha256": "a720490c28db25d820d6cf4465c96fd4ceda8bc2103e5dac8bcd42d8e3cc7cfa",
+      "role": "COCO17-to-COCO12 dataset field conversion"
+    },
+    {
+      "path": "simulation/isaacsim/database/skeleton_dataset_recorder.py",
+      "sha256": "88028618d785b38d9a915f758f64f90bf587d13b599f7c28c398ded8be463665",
+      "role": "timestamp-matched Ego/skeleton replay rows"
+    },
+    {
+      "path": "world_model/datasets/compact_skeleton_v3.py",
+      "sha256": "53d03d37256bfd3cd22bc4129f4ccc541e74a79411a8ee187d278bbf9e376069",
+      "role": "slot-stable model preprocessing and quality channels"
+    },
+    {
+      "path": "world_model/datasets/factorized_schema.py",
+      "sha256": "50ce17a9df2822f07b6c5e55a05ee0ce9df32809dbeef1a7895c94337454b9b7",
+      "role": "Human root/joint factorization"
+    },
+    {
+      "path": "world_model/modules/skeleton_topology.py",
+      "sha256": "ed547e6db1b91f407e6e7b42d0561ca9d45e77449a579b3a637dd11369c8f639",
+      "role": "COCO12 topology completion and geometry sanitation"
+    }
+  ],
+  "golden_trace": {
+    "input": "world_model/deployment/step12000_tracker/golden_input.json",
+    "input_sha256": "ac51518258b266020eb4157d75b0862c9bb3f76b362756f9a37d39ebc14d6ebc",
+    "expected": "world_model/deployment/step12000_tracker/golden_expected.json",
+    "expected_sha256": "ffe5ed8fe5f8b2013b819c664ff67b839038efade5cc1dd1d2464da3644d116c",
+    "verifier": "tools/verify_step12000_tracker_golden.py",
+    "verifier_sha256": "0e4cfba7f93e433a3971b8eb59c3a8e2f7a5423d9ae60198fd8c43e81acdc32b"
+  }
+}

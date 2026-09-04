@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import shutil
 import subprocess
@@ -77,6 +78,37 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
         self._missing_skeleton_count = 0
         self._capture_count = 0
         self._skeleton_source_counts = {}
+        self._terminal_sync_timeout_count = 0
+
+    def _publish_live_replay_state(self, *, complete=False, reason="recording"):
+        """Atomically expose committed chunks to an external Dreamer learner."""
+        if self.record_dir is None:
+            return
+        path = Path(self.dataset_root) / "live_replay_state.json"
+        payload = {
+            "schema": "omninxt.live_replay.v1",
+            "episode_id": self.record_dir.name,
+            "episode_directory": str(self.record_dir),
+            "committed_frames": int(self.written_frame_count),
+            "committed_chunks": int(self._chunk_count),
+            "complete": bool(complete),
+            "termination_reason": str(reason),
+            "updated_wall_time_s": time.time(),
+        }
+        temporary = path.with_name(
+            ".{}.tmp.{}.{}".format(path.name, os.getpid(), threading.get_ident()))
+        try:
+            with temporary.open("w", encoding="utf-8") as stream:
+                json.dump(payload, stream, ensure_ascii=False, separators=(",", ":"))
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
 
     def start(self):
         if self.is_recording:
@@ -132,6 +164,7 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
         self._missing_skeleton_count = 0
         self._capture_count = 0
         self._skeleton_source_counts = {}
+        self._terminal_sync_timeout_count = 0
         self.write_queue = queue.Queue(maxsize=self.max_queue_size)
         self.writer_thread = threading.Thread(
             target=self._writer_loop, name="SkeletonDatasetV3Writer", daemon=True)
@@ -165,6 +198,10 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
         metadata_extra = self._safe_provider(self.episode_metadata_provider) or {}
         initial_action = self._read_action() or {}
         action_limits = initial_action.get("normalization_limits", {})
+        joint_contact_offset = getattr(
+            self.skeleton_tracker, "contact_offset", None)
+        joint_rest_offset = getattr(
+            self.skeleton_tracker, "rest_offset", None)
         metadata = {
             "schema": SCHEMA,
             "episode_id": self.record_dir.name,
@@ -184,13 +221,19 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
             "joint_names": list(BODY_JOINT_NAMES),
             "recorded_skeleton_fields": [
                 "human_xyz", "human_confidence", "human_joint_valid",
-                "human_track_id",
+                "human_joint_measured", "human_joint_predicted",
+                "human_track_id", "human_root_velocity",
+                "human_velocity_valid", "human_velocity_sigma_mps",
+                "human_measurement_age_s", "human_track_age_frames",
+                "human_prediction_run_frames", "human_identity_confidence",
             ],
             "skeleton_frame": "base_link",
             "coordinate_convention": "ROS_FLU: +X forward, +Y left, +Z up",
             "simulation_skeleton_depth_source": "isaac_gt_depth",
             "ego_state_order": list(EGO_STATE_KEYS),
             "action_order": list(ACTION_KEYS),
+            "policy_action_order": [
+                "vx_body_mps", "vy_body_mps", "yaw_rate_rps"],
             "action_representation": "normalized_applied_body_flu",
             "action_normalization_limits": {
                 key: float(action_limits.get(key, 1.0)) for key in ACTION_KEYS
@@ -201,6 +244,24 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
                 "row t stores observation_t, the action applied over "
                 "observation_(t-1)->observation_t, and reward_t"
             ),
+            "privileged_geometry_contract": {
+                "available": True,
+                "policy_visible": False,
+                "pelvis_source": "isaac_animation_skeleton",
+                "collision_joint_source": "isaac_animation_skeleton",
+                "joint_contact_offset_m": (
+                    None if joint_contact_offset is None
+                    else float(joint_contact_offset)
+                ),
+                "joint_rest_offset_m": (
+                    None if joint_rest_offset is None
+                    else float(joint_rest_offset)
+                ),
+                "physx_contact_event_contract": (
+                    "joint_surface_gap_m <= joint_contact_offset_m"
+                ),
+                "pedestrian_motion_exogenous_to_drone": True,
+            },
             "target_point": self.target_point.tolist(),
             "ego_reference_origin_xyz": list(self._ego_reference["origin_xyz"]),
             "ego_reference_origin_yaw": float(self._ego_reference["origin_yaw"]),
@@ -214,6 +275,7 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
             "episode": metadata_extra,
         }
         self._write_json(self.record_dir / "metadata.json", metadata)
+        self._publish_live_replay_state()
         carb.log_warn("[REC][V3] Recording started: {}".format(self.record_dir))
 
     def update(self, force=False):
@@ -221,11 +283,45 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
             return False
         episode_time = self._elapsed_time()
         capture_due = force or episode_time + 1e-9 >= self.next_sample_time
+        forced_snapshot = None
         if capture_due:
             self._advance_next_sample_time(episode_time, force=force)
-            self._state_buffer.append(self._capture_state_snapshot())
+            snapshot = self._capture_state_snapshot()
+            self._state_buffer.append(snapshot)
+            if force:
+                forced_snapshot = snapshot
             self._capture_count += 1
 
+        self._match_available_packets()
+        if (
+            force
+            and forced_snapshot is not None
+            and forced_snapshot["skeleton_packet"] is None
+            and self.skeleton_receiver is not None
+        ):
+            # A terminal PhysX event is detected after the camera bundle for
+            # this rendered step has been published.  Perception arrives on a
+            # separate process/thread, so give the packet carrying this same
+            # simulator timestamp its normal latency budget before falling
+            # back to an explicitly stale empty packet.
+            deadline = time.monotonic() + self.skeleton_wait_wall_sec
+            while (
+                forced_snapshot["skeleton_packet"] is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(min(0.005, max(0.0, deadline - time.monotonic())))
+                self._match_available_packets()
+            if forced_snapshot["skeleton_packet"] is None:
+                self._terminal_sync_timeout_count += 1
+                carb.log_warn(
+                    "[REC][V3][SYNC] Terminal skeleton packet timed out at "
+                    f"sim={forced_snapshot['simulation_time_s']:.3f}s after "
+                    f"{self.skeleton_wait_wall_sec:.3f}s."
+                )
+        return self._flush_ready_snapshots(force=force)
+
+    def _match_available_packets(self):
+        """Join newly arrived perception packets to buffered simulator rows."""
         packets = [] if self.skeleton_receiver is None else \
             self.skeleton_receiver.packets_after(self._last_packet_arrival_index)
         for item in packets:
@@ -243,7 +339,6 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
                 continue
             self._last_packet_arrival_index = arrival_index
             snapshot["skeleton_packet"] = packet
-        return self._flush_ready_snapshots(force=force)
 
     def stop(self, reason="manual_stop", collision=None, reached_goal=None,
              event_details=None):
@@ -282,6 +377,8 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
             "dropped_frame_count": self.dropped_frame_count,
             "unmatched_skeleton_count": self._unmatched_skeleton_count,
             "missing_skeleton_count": self._missing_skeleton_count,
+            "terminal_skeleton_sync_timeout_count": (
+                self._terminal_sync_timeout_count),
             "collision": self.collision,
             "collision_human": bool(
                 self.collision and self.event_details.get("category") == "human"),
@@ -303,6 +400,8 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
                 else self.skeleton_receiver.status()),
         }
         self._write_json(self.record_dir / "summary.json", summary)
+        self._publish_live_replay_state(
+            complete=True, reason=self.termination_reason)
         carb.log_warn(
             "[REC][V3] Recording stopped: {}, reason={}, frames={}, chunks={}".format(
                 self.record_dir, reason, self.written_frame_count, self._chunk_count))
@@ -315,6 +414,7 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
         self.is_recording = False
         self.write_queue.put(None)
         self.writer_thread.join()
+        self._publish_live_replay_state(complete=True, reason=reason)
         self._reset_paths()
         try:
             shutil.rmtree(record_dir)
@@ -427,6 +527,8 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
         if first:
             action["action"] = np.zeros(4, np.float32)
             action["action_valid"] = np.asarray(False, np.bool_)
+            action["policy_action"] = np.zeros(3, np.float32)
+            action["policy_action_valid"] = np.asarray(False, np.bool_)
         privileged = privileged_to_arrays(
             snapshot["privileged"], self._episode_people_capacity)
         source = str(drone_state.get("source", "invalid"))
@@ -493,6 +595,7 @@ class SkeletonStateDatasetRecorder(DatasetRecorder):
         write_npz_atomic(path, arrays)
         self._chunk_count += 1
         self.written_frame_count += len(samples)
+        self._publish_live_replay_state()
 
     @staticmethod
     def _safe_provider(provider):

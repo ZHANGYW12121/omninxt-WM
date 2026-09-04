@@ -25,6 +25,8 @@ class SkeletonPacketReceiver:
         self._received = 0
         self._rejected = 0
         self._connections = 0
+        self._session_id = None
+        self._session_resets = 0
 
     def start(self):
         if self._thread is not None and self._thread.is_alive():
@@ -69,6 +71,8 @@ class SkeletonPacketReceiver:
                 "received": self._received,
                 "rejected": self._rejected,
                 "connections": self._connections,
+                "session_id": self._session_id,
+                "session_resets": self._session_resets,
                 "buffered": len(self._packets),
                 "last_error": self._last_error,
                 "running": bool(self._thread and self._thread.is_alive()),
@@ -141,6 +145,17 @@ class SkeletonPacketReceiver:
                                     self._last_error = str(error)
                                 continue
                             with self._condition:
+                                session_id = packet.get("session_id")
+                                if (session_id is not None and
+                                        self._session_id is not None and
+                                        str(session_id) != self._session_id):
+                                    # Never let a newly started recorder or a
+                                    # temporal policy window consume packets
+                                    # from the previous hot-reset episode.
+                                    self._packets.clear()
+                                    self._session_resets += 1
+                                if session_id is not None:
+                                    self._session_id = str(session_id)
                                 self._received += 1
                                 item = {
                                     "packet": packet,

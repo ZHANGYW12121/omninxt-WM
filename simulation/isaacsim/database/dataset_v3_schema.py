@@ -27,6 +27,12 @@ BODY_JOINT_NAMES = (
     "left_wrist", "right_wrist", "left_hip", "right_hip",
     "left_knee", "right_knee", "left_ankle", "right_ankle",
 )
+PRIVILEGED_COLLISION_JOINT_NAMES = (
+    "Pelvis", "R_Hand", "L_Hand", "R_Foot", "L_Foot",
+    "R_KneeShareBone", "L_KneeShareBone",
+    "R_ElbowShareBone", "L_ElbowShareBone", "Head",
+)
+PRIVILEGED_COLLISION_JOINT_COUNT = len(PRIVILEGED_COLLISION_JOINT_NAMES)
 JOINT_FIELDS = (
     "x_m", "y_m", "z_m", "pose_score", "confidence",
     "coordinate_valid", "measured", "predicted",
@@ -181,7 +187,16 @@ def skeleton_to_arrays(packet: Mapping[str, Any], people_capacity: int) -> dict[
         "human_xyz": np.zeros(shape + (3,), np.float32),
         "human_confidence": np.zeros(shape, np.float32),
         "human_joint_valid": np.zeros(shape, np.bool_),
+        "human_joint_measured": np.zeros(shape, np.bool_),
+        "human_joint_predicted": np.zeros(shape, np.bool_),
         "human_track_id": np.full(count, -1, np.int32),
+        "human_root_velocity": np.zeros((count, 3), np.float32),
+        "human_velocity_valid": np.zeros(count, np.bool_),
+        "human_velocity_sigma_mps": np.zeros(count, np.float32),
+        "human_measurement_age_s": np.zeros(count, np.float32),
+        "human_track_age_frames": np.zeros(count, np.int32),
+        "human_prediction_run_frames": np.zeros(count, np.int32),
+        "human_identity_confidence": np.zeros(count, np.float32),
     }
     people = sorted(packet.get("people", ()), key=lambda item: int(item["person_id"]))
     for slot, person in enumerate(people[:count]):
@@ -198,7 +213,34 @@ def skeleton_to_arrays(packet: Mapping[str, Any], people_capacity: int) -> dict[
         arrays["human_confidence"][slot] = np.where(
             valid, np.clip(np.nan_to_num(rows[:, 4]), 0.0, 1.0), 0.0)
         arrays["human_joint_valid"][slot] = valid
+        arrays["human_joint_measured"][slot] = (
+            rows[:, 6].astype(bool) & valid)
+        arrays["human_joint_predicted"][slot] = (
+            rows[:, 7].astype(bool) & valid)
         arrays["human_track_id"][slot] = track_id
+        velocity = np.asarray(
+            person.get("root_velocity_base_link_mps", (0.0, 0.0, 0.0)),
+            np.float32).reshape(-1)
+        velocity_valid = bool(person.get("velocity_valid", False))
+        if velocity.shape == (3,) and np.isfinite(velocity).all():
+            arrays["human_root_velocity"][slot] = velocity
+        else:
+            velocity_valid = False
+        sigma = person.get("velocity_sigma_mps")
+        sigma = 0.0 if sigma is None else float(sigma)
+        if not np.isfinite(sigma) or sigma < 0.0:
+            sigma = 0.0
+            velocity_valid = False
+        arrays["human_velocity_valid"][slot] = velocity_valid
+        arrays["human_velocity_sigma_mps"][slot] = sigma
+        arrays["human_measurement_age_s"][slot] = max(
+            0.0, float(person.get("time_since_observation_ms", 0.0)) * 1.0e-3)
+        arrays["human_track_age_frames"][slot] = max(
+            0, int(person.get("track_age_frames", 0)))
+        arrays["human_prediction_run_frames"][slot] = max(
+            0, int(person.get("consecutive_prediction_frames", 0)))
+        arrays["human_identity_confidence"][slot] = np.clip(
+            float(person.get("identity_confidence", 0.0)), 0.0, 1.0)
     return arrays
 
 
@@ -231,9 +273,29 @@ def normalized_applied_action(action: Mapping[str, Any] | None) -> dict[str, np.
         valid = False
         values = np.zeros(4, np.float32)
         limits = np.ones(4, np.float32)
+    metadata = action.get("policy_metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    policy_action = np.asarray(
+        metadata.get("policy_action", np.zeros(3)), np.float32).reshape(-1)
+    policy_valid = bool(metadata.get("policy_action_valid", False))
+    if policy_action.shape != (3,) or not np.isfinite(policy_action).all():
+        policy_action = np.zeros(3, np.float32)
+        policy_valid = False
+    macro_index = metadata.get("exploration_macro_index")
+    macro_remaining = metadata.get("exploration_macro_remaining")
     return {
         "action": np.clip(values / limits, -1.0, 1.0).astype(np.float32),
         "action_valid": np.asarray(valid, np.bool_),
+        "policy_action": np.clip(policy_action, -1.0, 1.0),
+        "policy_action_valid": np.asarray(policy_valid, np.bool_),
+        "exploration_macro_index": np.asarray(
+            -1 if macro_index is None else int(macro_index), np.int16),
+        "exploration_macro_remaining": np.asarray(
+            0 if macro_remaining is None else int(macro_remaining), np.uint8),
+        "exploration_scale": np.asarray(
+            float(metadata.get("exploration_scale", 0.0)), np.float32),
+        "collector_policy_step": np.asarray(
+            int(metadata.get("collector_policy_step", -1)), np.int64),
     }
 
 
@@ -246,6 +308,14 @@ def privileged_to_arrays(snapshot: Mapping[str, Any] | None,
         "priv_human_mask": np.zeros(count, np.bool_),
         "priv_human_position_world": np.zeros((count, 3), np.float32),
         "priv_human_velocity_world": np.zeros((count, 3), np.float32),
+        # Simulator-only animation-skeleton truth. These audit targets must
+        # never enter the deployment observation encoder.
+        "priv_human_pelvis_world": np.zeros((count, 3), np.float32),
+        "priv_human_pelvis_valid": np.zeros(count, np.bool_),
+        "priv_collision_joints_world": np.zeros(
+            (count, PRIVILEGED_COLLISION_JOINT_COUNT, 3), np.float32),
+        "priv_collision_joint_valid": np.zeros(
+            (count, PRIVILEGED_COLLISION_JOINT_COUNT), np.bool_),
     }
     people = snapshot.get("people") if isinstance(snapshot.get("people"), Sequence) else ()
     for slot, person in enumerate(people[:count]):
@@ -257,6 +327,19 @@ def privileged_to_arrays(snapshot: Mapping[str, Any] | None,
             person, "position", ("x", "y", "z"))
         output["priv_human_velocity_world"][slot] = _vec(
             person, "velocity", ("vx", "vy", "vz"))
+        pelvis = np.asarray(person.get("pelvis", ()), np.float32).reshape(-1)
+        if pelvis.size >= 3 and np.isfinite(pelvis[:3]).all():
+            output["priv_human_pelvis_world"][slot] = pelvis[:3]
+            output["priv_human_pelvis_valid"][slot] = True
+        joints = np.asarray(person.get("collision_joints", ()), np.float32)
+        joint_valid = np.asarray(
+            person.get("collision_joint_valid", ()), np.bool_)
+        if joints.shape == (PRIVILEGED_COLLISION_JOINT_COUNT, 3):
+            if joint_valid.shape != (PRIVILEGED_COLLISION_JOINT_COUNT,):
+                joint_valid = np.isfinite(joints).all(axis=-1)
+            joint_valid &= np.isfinite(joints).all(axis=-1)
+            output["priv_collision_joints_world"][slot] = np.nan_to_num(joints)
+            output["priv_collision_joint_valid"][slot] = joint_valid
     return output
 
 
@@ -277,6 +360,10 @@ def validate_chunk(arrays: Mapping[str, np.ndarray]) -> None:
         "frame_index", "simulation_time_s", "skeleton_timestamp_ns", "skeleton_fresh",
         "ego_state", "ego_altitude_valid", "ego_state_source", "human_xyz",
         "human_confidence", "human_joint_valid", "human_track_id", "action",
+        "human_root_velocity", "human_velocity_valid",
+        "human_velocity_sigma_mps", "human_measurement_age_s",
+        "human_track_age_frames", "human_prediction_run_frames",
+        "human_identity_confidence",
         "action_valid", "reward", "reward_components", "is_first", "is_terminal",
         "success", "termination_code", "is_last",
         "priv_human_id", "priv_human_mask", "priv_human_position_world",
@@ -287,6 +374,14 @@ def validate_chunk(arrays: Mapping[str, np.ndarray]) -> None:
     missing = required.difference(arrays)
     if missing:
         raise ValueError(f"Missing v3 chunk arrays: {sorted(missing)}")
+    privileged_geometry = {
+        "priv_human_pelvis_world", "priv_human_pelvis_valid",
+        "priv_collision_joints_world", "priv_collision_joint_valid",
+    }
+    present_privileged_geometry = privileged_geometry.intersection(arrays)
+    if present_privileged_geometry and present_privileged_geometry != privileged_geometry:
+        raise ValueError(
+            "privileged pelvis/collision-joint fields must appear together")
     length = int(np.asarray(arrays["frame_index"]).shape[0])
     if length <= 0:
         raise ValueError("Empty dataset chunk")
@@ -305,12 +400,65 @@ def validate_chunk(arrays: Mapping[str, np.ndarray]) -> None:
         raise ValueError("human_confidence must be [T,N,12]")
     if np.asarray(arrays["human_joint_valid"]).shape != (length, people, JOINT_COUNT):
         raise ValueError("human_joint_valid must be [T,N,12]")
+    if present_privileged_geometry:
+        privileged_people = np.asarray(arrays["priv_human_id"]).shape[1]
+        if np.asarray(arrays["priv_human_pelvis_world"]).shape != (
+            length, privileged_people, 3
+        ):
+            raise ValueError("priv_human_pelvis_world must be [T,P,3]")
+        if np.asarray(arrays["priv_human_pelvis_valid"]).shape != (
+            length, privileged_people
+        ):
+            raise ValueError("priv_human_pelvis_valid must be [T,P]")
+        if np.asarray(arrays["priv_collision_joints_world"]).shape != (
+            length, privileged_people, PRIVILEGED_COLLISION_JOINT_COUNT, 3
+        ):
+            raise ValueError("priv_collision_joints_world has invalid shape")
+        if np.asarray(arrays["priv_collision_joint_valid"]).shape != (
+            length, privileged_people, PRIVILEGED_COLLISION_JOINT_COUNT
+        ):
+            raise ValueError("priv_collision_joint_valid has invalid shape")
+    quality_fields = {"human_joint_measured", "human_joint_predicted"}
+    present_quality = quality_fields.intersection(arrays)
+    if present_quality and present_quality != quality_fields:
+        raise ValueError("measured/predicted joint fields must appear together")
+    if present_quality:
+        measured = np.asarray(arrays["human_joint_measured"], np.bool_)
+        predicted = np.asarray(arrays["human_joint_predicted"], np.bool_)
+        valid = np.asarray(arrays["human_joint_valid"], np.bool_)
+        if measured.shape != valid.shape or predicted.shape != valid.shape:
+            raise ValueError("joint quality fields must be [T,N,12]")
+        if np.any(measured & predicted):
+            raise ValueError("a joint cannot be measured and predicted")
+        if np.any(valid != (measured | predicted)):
+            raise ValueError("every valid joint needs one measurement source")
     if np.asarray(arrays["human_track_id"]).shape != (length, people):
         raise ValueError("human_track_id must be [T,N]")
+    if np.asarray(arrays["human_root_velocity"]).shape != (length, people, 3):
+        raise ValueError("human_root_velocity must be [T,N,3]")
+    for name in (
+        "human_velocity_valid", "human_velocity_sigma_mps",
+        "human_measurement_age_s", "human_track_age_frames",
+        "human_prediction_run_frames", "human_identity_confidence",
+    ):
+        if np.asarray(arrays[name]).shape != (length, people):
+            raise ValueError(f"{name} must be [T,N]")
     if np.asarray(arrays["action"]).shape != (length, len(ACTION_KEYS)):
         raise ValueError("action must be [T,4]")
     if np.any(np.abs(np.asarray(arrays["action"])) > 1.00001):
         raise ValueError("normalized action must lie in [-1,1]")
+    if (
+        "policy_action" in arrays
+        and np.asarray(arrays["policy_action"]).shape != (length, 3)
+    ):
+        raise ValueError("policy_action must be [T,3]")
+    for name in (
+        "policy_action_valid", "exploration_macro_index",
+        "exploration_macro_remaining", "exploration_scale",
+        "collector_policy_step",
+    ):
+        if name in arrays and np.asarray(arrays[name]).shape != (length,):
+            raise ValueError(f"{name} must be [T]")
     for name in (
         "action_valid", "reward", "is_first", "success",
         "termination_code", "is_last", "is_terminal",

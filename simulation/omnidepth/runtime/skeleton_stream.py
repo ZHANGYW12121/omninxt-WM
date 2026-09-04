@@ -127,6 +127,16 @@ def build_skeleton_packet(people, stamp_ns, sequence, joint_names,
             "time_since_observation_ms": round(max(0.0, _finite(
                 person.get("time_since_observation_ms", 0.0))), 3),
             "id_uncertain": bool(person.get("id_uncertain", False)),
+            "root_velocity_base_link_mps": [
+                round(_finite(value), 6) for value in person.get(
+                    "root_velocity_base_link_mps", (0.0, 0.0, 0.0))
+            ],
+            "velocity_valid": bool(person.get("velocity_valid", False)),
+            "velocity_sigma_mps": (
+                None if person.get("velocity_sigma_mps") is None else
+                round(max(0.0, _finite(person["velocity_sigma_mps"])), 6)),
+            "consecutive_prediction_frames": max(
+                0, int(person.get("consecutive_prediction_frames", 0))),
             "joints": joints,
         })
     return {
