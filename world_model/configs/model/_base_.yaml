@@ -18,6 +18,12 @@ warmup: 1000
 slow_target_update: 1
 slow_target_fraction: 0.02
 
+# Ampere/Ada GPUs support BF16, whose FP32-sized exponent range is more stable
+# than FP16 for the joint RSSM + actor/critic backward pass.  GradScaler is
+# enabled only when this is explicitly changed to float16.
+amp_dtype: bfloat16  # bfloat16 / float16 / float32 (float32 disables autocast)
+amp_init_scale: 1.0  # used only by float16 GradScaler
+
 loss_scales:
   barlow: 0.05
   infonce: 1.0
@@ -28,6 +34,7 @@ loss_scales:
   dyn: 1.0
   rep: 0.1
   policy: 1.0
+  behavior_clone: 0.0
   value: 1.0
   repval: 0.3
   swav: 1.0
@@ -69,7 +76,10 @@ rssm:
   act: ${model.act}
   norm: ${model.norm}
   unimix_ratio: 0.01
-  initial: 'learned'
+  # Historical RSSM code emitted zero reset states. New objectives that use
+  # the implemented learned categorical prior must opt in explicitly and bind
+  # that semantic change in their checkpoint architecture version.
+  initial: 'zeros'
   device: ${device}
   structured_posterior:
     hidden: ${model.hidden}

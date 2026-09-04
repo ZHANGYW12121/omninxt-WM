@@ -25,6 +25,16 @@ class FactorizedEncoderConfig:
     human_root_dim: int = 10
     human_feat_dim: int = 7
     human_hidden_dim: int = 128
+    human_quality_dim: int = 7
+    # Fresh online/offline runs use the same fixed physical scaling.  The old
+    # Ego path standardized and then applied a per-row LayerNorm, making it
+    # invariant to part of the metric position/velocity magnitude and giving
+    # live identity-normalized runs a different representation from offline.
+    ego_metric_scaling: bool = False
+    # Compatibility defaults to the historical per-sample LayerNorm. v18 turns
+    # this on so absolute metric root distances and velocities are identifiable.
+    human_root_metric_scaling: bool = False
+    human_quality_metric_scaling: bool = False
     use_stgcn: bool = True
     pose_history: int = 8
     observation_heads: int = 4
@@ -35,7 +45,8 @@ class FactorizedEncoderConfig:
 class Ego14Encoder(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int,
                  mean: tuple[float, ...] | None = None,
-                 std: tuple[float, ...] | None = None) -> None:
+                 std: tuple[float, ...] | None = None,
+                 *, metric_scaling: bool = False) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
         mean_tensor = torch.zeros(in_dim) if mean is None else torch.tensor(mean, dtype=torch.float32)
@@ -44,15 +55,37 @@ class Ego14Encoder(nn.Module):
             raise ValueError("ego training mean/std must contain one valid value per input dimension")
         self.register_buffer("input_mean", mean_tensor)
         self.register_buffer("input_std", std_tensor)
-        self.net = nn.Sequential(
-            nn.LayerNorm(in_dim), nn.Linear(in_dim, hidden_dim), nn.SiLU(),
-            nn.Linear(hidden_dim, out_dim), nn.LayerNorm(out_dim),
-        )
+        self.metric_scaling = bool(metric_scaling)
+        if self.metric_scaling:
+            if self.in_dim != 14:
+                raise ValueError("metric Ego scaling requires Ego14")
+            # episode xyz; body/world velocity; body/world acceleration; AGL;
+            # roll, pitch, sin(yaw), cos(yaw).  Scales cover the audited task
+            # contract while clipping only corrupt/extreme recorder spikes.
+            self.register_buffer("metric_scale", torch.tensor((
+                32.0, 12.0, 1.0,
+                3.0, 3.0, 2.0,
+                8.0, 8.0, 8.0,
+                2.0, 1.0, 1.0, 1.0, 1.0,
+            )))
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, hidden_dim), nn.SiLU(),
+                nn.Linear(hidden_dim, out_dim), nn.LayerNorm(out_dim),
+            )
+        else:
+            self.net = nn.Sequential(
+                nn.LayerNorm(in_dim), nn.Linear(in_dim, hidden_dim), nn.SiLU(),
+                nn.Linear(hidden_dim, out_dim), nn.LayerNorm(out_dim),
+            )
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         if state.shape[-1] != self.in_dim:
             raise ValueError(f"ego_state must end in {self.in_dim}, got {tuple(state.shape)}")
-        normalized = (state.float() - self.input_mean) / self.input_std.clamp_min(1e-6)
+        normalized = (
+            (state.float() / self.metric_scale).clamp(-5.0, 5.0)
+            if self.metric_scaling else
+            (state.float() - self.input_mean) / self.input_std.clamp_min(1e-6)
+        )
         return self.net(normalized)
 
 
@@ -196,24 +229,93 @@ class HumanRootPoseEncoder(nn.Module):
     def __init__(self, config: FactorizedEncoderConfig) -> None:
         super().__init__()
         d = int(config.model_dim)
-        self.root = nn.Sequential(
-            nn.LayerNorm(config.human_root_dim),
-            nn.Linear(config.human_root_dim, config.human_hidden_dim), nn.SiLU(),
-            nn.Linear(config.human_hidden_dim, d), nn.LayerNorm(d),
-        )
+        self.metric_root_enabled = bool(config.human_root_metric_scaling)
+        self.metric_quality_enabled = bool(
+            config.human_quality_metric_scaling)
+        self.human_quality_dim = int(config.human_quality_dim)
+        if self.metric_root_enabled and int(config.human_root_dim) != 10:
+            raise ValueError(
+                "metric Human root encoding requires the compact-v3 "
+                "[position,velocity,extent,confidence] 10-D contract")
+        # A LayerNorm directly over these ten heterogeneous physical fields is
+        # invariant to a per-person affine transform.  It can therefore map
+        # physically different distances and speeds to the same normalized
+        # input, which made the per-slot Human latent unable to retain absolute
+        # root x/y.  Fixed, documented metric scales preserve both magnitude
+        # and sign; LayerNorm is safe only after the learned projection.
+        if self.metric_root_enabled:
+            self.register_buffer(
+                "root_metric_scale",
+                torch.tensor(
+                    (6.0, 6.0, 3.0, 3.0, 3.0, 3.0, 2.0, 2.0, 2.0, 1.0),
+                    dtype=torch.float32,
+                ),
+            )
+            self.root = nn.Sequential(
+                nn.Linear(config.human_root_dim, config.human_hidden_dim),
+                nn.SiLU(), nn.Linear(config.human_hidden_dim, d),
+                nn.LayerNorm(d),
+            )
+        else:
+            self.root = nn.Sequential(
+                nn.LayerNorm(config.human_root_dim),
+                nn.Linear(config.human_root_dim, config.human_hidden_dim),
+                nn.SiLU(), nn.Linear(config.human_hidden_dim, d),
+                nn.LayerNorm(d),
+            )
         pose_cls = CausalSTGCNHumanEncoder if config.use_stgcn else CausalPerPersonGRUEncoder
         pose_kwargs = {"history": config.pose_history} if config.use_stgcn else {}
         self.pose = pose_cls(config.human_feat_dim, config.human_hidden_dim, d, **pose_kwargs)
+        if self.metric_quality_enabled:
+            if self.human_quality_dim != 7:
+                raise ValueError(
+                    "metric Human quality encoding requires the compact-v3 "
+                    "seven-field contract")
+            self.register_buffer("quality_metric_scale", torch.tensor(
+                (1.0, 1.0, 10.0, 2.0, 20.0, 3.0, 1.0),
+                dtype=torch.float32,
+            ))
+            self.quality = nn.Sequential(
+                nn.Linear(config.human_quality_dim, config.human_hidden_dim),
+                nn.SiLU(), nn.Linear(config.human_hidden_dim, d),
+                nn.LayerNorm(d),
+            )
+            quality_output_index = 2
+        else:
+            self.quality = nn.Sequential(
+                nn.LayerNorm(config.human_quality_dim),
+                nn.Linear(config.human_quality_dim, config.human_hidden_dim),
+                nn.SiLU(), nn.Linear(config.human_hidden_dim, d),
+                nn.LayerNorm(d),
+            )
+            quality_output_index = 3
         self.fusion = nn.Sequential(
             nn.LayerNorm(2 * d), nn.Linear(2 * d, d), nn.SiLU(), nn.LayerNorm(d),
         )
+        nn.init.zeros_(self.quality[quality_output_index].weight)
+        nn.init.zeros_(self.quality[quality_output_index].bias)
 
     def forward(self, root: torch.Tensor, joints: torch.Tensor,
                 human_mask: torch.Tensor, joint_mask: torch.Tensor,
-                human_is_first: torch.Tensor | None) -> torch.Tensor:
-        root_token = self.root(root.float())
+                human_is_first: torch.Tensor | None,
+                observation_quality: torch.Tensor | None = None) -> torch.Tensor:
+        metric_root = root.float()
+        if self.metric_root_enabled:
+            metric_root = (metric_root / self.root_metric_scale).clamp(-5.0, 5.0)
+        root_token = self.root(metric_root)
         pose_token = self.pose(joints, human_mask, joint_mask, human_is_first)
-        token = self.fusion(torch.cat((root_token, pose_token), dim=-1))
+        if observation_quality is None:
+            observation_quality = root.new_zeros(
+                (*root.shape[:-1], self.human_quality_dim))
+        quality_input = observation_quality.float()
+        if self.metric_quality_enabled:
+            quality_input = (
+                quality_input / self.quality_metric_scale).clamp(-5.0, 5.0)
+        quality_token = self.quality(quality_input)
+        # Residual injection preserves the previously trained root/pose fusion
+        # at migration time; the zero-initialized quality projection learns
+        # only when measurement reliability is predictive.
+        token = self.fusion(torch.cat((root_token, pose_token), dim=-1)) + quality_token
         return token.masked_fill(~human_mask.bool()[..., None], 0.0)
 
 
@@ -227,6 +329,7 @@ class FactorizedObservationEncoder(nn.Module):
         self.ego_encoder = Ego14Encoder(
             self.config.ego_state_dim, self.config.ego_hidden_dim, d,
             self.config.ego_state_mean, self.config.ego_state_std,
+            metric_scaling=self.config.ego_metric_scaling,
         )
         self.human_encoder = HumanRootPoseEncoder(self.config)
         self.observation_attention = SparseEgoHumanAttention(
@@ -257,6 +360,7 @@ class FactorizedObservationEncoder(nn.Module):
         ego = self.ego_encoder(batch["ego_state"])[..., None, :]
         human = self.human_encoder(
             root, joints, human_mask, joint_mask, batch.get("human_is_first"),
+            batch.get("human_observation_quality"),
         )
         b, t, n, d = human.shape
         attended = self.observation_attention(

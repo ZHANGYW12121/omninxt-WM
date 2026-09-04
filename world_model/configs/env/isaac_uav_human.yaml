@@ -18,7 +18,7 @@ observation:
   ego_state_dim: 14
   goal_feature_dim: 8
   goal_position_dim: 3
-  max_people: 20
+  max_people: 23
   num_joints: 12
   human_root_dim: 10
   human_feature_dim: 7

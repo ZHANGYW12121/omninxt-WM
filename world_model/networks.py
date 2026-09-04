@@ -356,6 +356,13 @@ class MLPHead(nn.Module):
         elif self._dist_name == "symexp_twohot":
             self.last = nn.Linear(self.mlp.out_dim, config.shape[0], bias=True)
             kwargs = {"device": torch.device(config.device), "bin_num": int(config.dist.bin_num)}
+        elif self._dist_name == "linear_twohot":
+            self.last = nn.Linear(self.mlp.out_dim, config.shape[0], bias=True)
+            kwargs = {
+                "bin_num": int(config.dist.bin_num),
+                "low": float(config.dist.low),
+                "high": float(config.dist.high),
+            }
         elif self._dist_name in ("binary", "identity"):
             self.last = nn.Linear(self.mlp.out_dim, config.shape[0], bias=True)
             kwargs = {}
@@ -363,6 +370,7 @@ class MLPHead(nn.Module):
             raise NotImplementedError
 
         self._dist = partial(self._dist, **kwargs)
+        self._dist_kwargs = dict(kwargs)
 
         self.mlp.apply(weight_init_)
         self.last.apply(weight_init_)

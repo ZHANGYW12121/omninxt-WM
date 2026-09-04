@@ -77,25 +77,8 @@ class TwoHot:
 
     def mode(self):
         # (..., N_bins), (N_bins,) -> (..., 1)
-        n = self.logits.shape[-1]
-        if n % 2 == 1:
-            m = (n - 1) // 2
-            p1 = self.probs[..., :m]
-            p2 = self.probs[..., m : m + 1]
-            p3 = self.probs[..., m + 1 :]
-            b1 = self.bins[..., :m]
-            b2 = self.bins[..., m : m + 1]
-            b3 = self.bins[..., m + 1 :]
-            wavg = (p2 * b2).sum(dim=-1, keepdim=True) + ((p1 * b1).flip(dims=(-1,)) + (p3 * b3)).sum(
-                dim=-1, keepdim=True
-            )
-            return self.unsquash(wavg)
-        p1 = self.probs[..., : n // 2]
-        p2 = self.probs[..., n // 2 :]
-        b1 = self.bins[..., : n // 2]
-        b2 = self.bins[..., n // 2 :]
-        wavg = ((p1 * b1).flip(dims=(-1,)) + (p2 * b2)).sum(dim=-1, keepdim=True)
-        return self.unsquash(wavg)
+        expected = (self.probs * self.bins).sum(dim=-1, keepdim=True)
+        return self.unsquash(expected)
 
     def log_prob(self, target):
         # (..., 1)
@@ -214,12 +197,124 @@ class Bound:
         return self._dist.log_prob(x)
 
 
+class TanhNormal:
+    """Reparameterized Normal followed by one bijective ``tanh`` transform.
+
+    The historical ``bounded_normal`` squashed only the Normal mean and then
+    clamped samples at the controller boundary.  Its reported log probability
+    therefore described a different random variable from the action executed
+    by the environment.  This small wrapper keeps sampling, mode and
+    ``log_prob`` on the same transformed distribution while preserving the
+    lightweight distribution interface used by the Dreamer code.
+
+    ``entropy()`` is the standard one-sample Monte-Carlo estimate of the
+    transformed entropy.  There is no closed form after the tanh transform.
+    """
+
+    def __init__(self, mean: torch.Tensor, std: torch.Tensor,
+                 *, epsilon: float = 1.0e-6) -> None:
+        self._mean = to_f32(mean)
+        self._std = to_f32(std)
+        self._base = torchd.Normal(self._mean, self._std)
+        self._epsilon = float(epsilon)
+
+    @property
+    def mode(self) -> torch.Tensor:
+        return torch.tanh(self._mean)
+
+    @property
+    def mean(self) -> torch.Tensor:
+        # The exact transformed mean has no elementary closed form.  Dreamer
+        # uses this field as the deterministic policy action, i.e. the mode.
+        return self.mode
+
+    @property
+    def stddev(self) -> torch.Tensor:
+        return self._std
+
+    def rsample_with_pre_tanh(
+        self, sample_shape=torch.Size(),
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pre_tanh = self._base.rsample(sample_shape)
+        return torch.tanh(pre_tanh), pre_tanh
+
+    def rsample_with_pre_tanh_antithetic_pairs(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample adjacent batch rows with opposite standard-Normal noise.
+
+        Callers must duplicate every source state into adjacent rows before
+        constructing this distribution. Each row retains the exact TanhNormal
+        marginal; pairing only reduces Monte-Carlo variance when their losses
+        are averaged.
+        """
+        if self._mean.ndim < 1 or self._mean.shape[0] % 2:
+            raise ValueError(
+                "antithetic TanhNormal sampling requires adjacent row pairs")
+        epsilon = torch.randn_like(self._mean[0::2])
+        paired_epsilon = torch.stack(
+            (epsilon, -epsilon), dim=1).reshape_as(self._mean)
+        pre_tanh = self._mean + self._std * paired_epsilon
+        return torch.tanh(pre_tanh), pre_tanh
+
+    def rsample(self, sample_shape=torch.Size()) -> torch.Tensor:
+        action, _ = self.rsample_with_pre_tanh(sample_shape)
+        return action
+
+    def sample(self, sample_shape=torch.Size()) -> torch.Tensor:
+        return torch.tanh(self._base.sample(sample_shape))
+
+    @staticmethod
+    def _log_abs_det_jacobian(pre_tanh: torch.Tensor) -> torch.Tensor:
+        # Algebraically equal to log(1 - tanh(u)^2), but stable for large |u|.
+        return 2.0 * (
+            torch.log(pre_tanh.new_tensor(2.0))
+            - pre_tanh
+            - F.softplus(-2.0 * pre_tanh)
+        )
+
+    def log_prob(self, value: torch.Tensor) -> torch.Tensor:
+        value = to_f32(value)
+        bounded = value.clamp(
+            -1.0 + self._epsilon, 1.0 - self._epsilon)
+        pre_tanh = torch.atanh(bounded)
+        return self.log_prob_from_pre_tanh(pre_tanh)
+
+    def log_prob_from_pre_tanh(
+        self, pre_tanh: torch.Tensor,
+    ) -> torch.Tensor:
+        """Stable transformed log-probability for a stored latent sample.
+
+        ``tanh`` maps sufficiently large float32 inputs to exactly +/-1, so
+        recovering a latent with ``atanh(clamp(action))`` is not invertible at
+        the boundary.  Dreamer imagination can retain the original latent and
+        use this method for an exact score-function objective.
+        """
+        pre_tanh = to_f32(pre_tanh)
+        elementwise = (
+            self._base.log_prob(pre_tanh)
+            - self._log_abs_det_jacobian(pre_tanh)
+        )
+        return elementwise.sum(dim=-1)
+
+    def entropy(self) -> torch.Tensor:
+        # Keep the original pre-tanh sample for the Monte-Carlo change of
+        # variables estimate.  Going through ``tanh`` and then ``atanh`` is
+        # numerically wrong once float32 tanh saturates to exactly +/-1: the
+        # clamped inverse no longer equals the sampled latent and can report a
+        # huge *positive* entropy for a nearly deterministic boundary action.
+        pre_tanh = self._base.rsample()
+        elementwise_log_prob = (
+            self._base.log_prob(pre_tanh)
+            - self._log_abs_det_jacobian(pre_tanh)
+        )
+        return -elementwise_log_prob.sum(dim=-1)
+
+
 def bounded_normal(x, min_std, max_std, **kwargs):
     mean, std = torch.chunk(x, 2, dim=-1)
     std = (max_std - min_std) * torch.sigmoid(std + 2.0) + min_std
-    # NOTE: Bound can be added
-    dist = torchd.normal.Normal(torch.tanh(to_f32(mean)), to_f32(std))
-    return torchd.independent.Independent(dist, 1)
+    return TanhNormal(to_f32(mean), to_f32(std))
 
 
 def normal_std_fixed(mean, std, **kwargs):
@@ -240,14 +335,46 @@ def binary(logits, **kwargs):
 
 
 def symexp_twohot(logits, bin_num, **kwargs):
-    if bin_num % 2 == 1:
-        half = torch.linspace(-20, 0, (bin_num - 1) // 2 + 1, dtype=torch.float32, device=logits.device)
-        half = symexp(half)
-        bins = torch.concatenate([half, -half[:-1].flip(dims=(0,))], 0)
-    else:
-        half = torch.linspace(-20, 0, bin_num // 2, dtype=torch.float32, device=logits.device)
-        half = symexp(half)
-        bins = torch.concatenate([half, -half.flip(dims=(0,))], 0)
+    """Dreamer symlog two-hot distribution.
+
+    The categorical support lives in *symlog space*.  Targets are transformed
+    before their two-hot interpolation and the probability-weighted support is
+    transformed back only after taking its expectation.  Building bins in raw
+    ``symexp`` space instead makes tiny, otherwise harmless probabilities on
+    the +/-4.8e8 endpoint bins dominate the decoded reward or value.
+    """
+    if int(bin_num) < 2:
+        raise ValueError("symexp_twohot requires at least two bins")
+    bins = torch.linspace(
+        -20.0,
+        20.0,
+        int(bin_num),
+        dtype=torch.float32,
+        device=logits.device,
+    )
+    return TwoHot(
+        to_f32(logits), bins, squash=symlog, unsquash=symexp)
+
+
+def linear_twohot(logits, bin_num, low, high, **kwargs):
+    """Two-hot distribution whose decoded mode is an expected raw return.
+
+    Symlog support is useful for unbounded generic rewards, but
+    ``symexp(E[symlog(return)])`` is not ``E[return]``.  In a safety task a
+    policy-conditioned mixture containing a small probability of a -120
+    terminal can therefore bootstrap near zero even when its expected raw
+    return is strongly negative.  Pure Dreamer has an explicit finite reward
+    guard and uses this bounded raw support for its Critic so lambda-return
+    bootstrapping retains the task's actual expected-reward semantics.
+    """
+    count = int(bin_num)
+    lower, upper = float(low), float(high)
+    if count < 2:
+        raise ValueError("linear_twohot requires at least two bins")
+    if not torch.isfinite(torch.tensor((lower, upper))).all() or lower >= upper:
+        raise ValueError("linear_twohot requires finite low < high")
+    bins = torch.linspace(
+        lower, upper, count, dtype=torch.float32, device=logits.device)
     return TwoHot(to_f32(logits), bins)
 
 
@@ -263,9 +390,38 @@ def identity(logits, **kwargs):
     return logits
 
 
-def kl(logits_left, logits_right):
+def kl(logits_left, logits_right, unimix_ratio=0.0):
+    """Categorical KL under the same unimix law used for RSSM sampling.
+
+    DreamerV3's categorical latent mixes every softmax distribution with a
+    small uniform component.  Applying that mixture only while sampling but
+    not in the KL objective gives the forward state and the optimized
+    distribution different semantics, and leaves the KL derivative
+    effectively unbounded as logits polarize.
+    """
     # (..., K), (..., K)
-    logprob_left = torch.log_softmax(logits_left, -1)
-    logprob_right = torch.log_softmax(logits_right, -1)
-    prob = torch.softmax(logits_left, -1)
-    return (prob * (logprob_left - logprob_right)).sum(-1)  # (...)
+    ratio = float(unimix_ratio)
+    if not 0.0 <= ratio < 1.0:
+        raise ValueError("unimix_ratio must lie in [0,1)")
+    if ratio == 0.0:
+        logprob_left = torch.log_softmax(logits_left, -1)
+        logprob_right = torch.log_softmax(logits_right, -1)
+        prob_left = torch.softmax(logits_left, -1)
+    else:
+        categories = logits_left.shape[-1]
+        if logits_right.shape[-1] != categories or categories <= 0:
+            raise ValueError("categorical KL logits must share a final axis")
+        uniform = ratio / categories
+        prob_left = (
+            torch.softmax(logits_left.float(), -1) * (1.0 - ratio)
+            + uniform
+        )
+        prob_right = (
+            torch.softmax(logits_right.float(), -1) * (1.0 - ratio)
+            + uniform
+        )
+        logprob_left = torch.log(prob_left)
+        logprob_right = torch.log(prob_right)
+    return (
+        prob_left * (logprob_left - logprob_right)
+    ).sum(-1)  # (...)

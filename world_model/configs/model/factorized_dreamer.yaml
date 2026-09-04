@@ -9,16 +9,239 @@ rep_loss: dreamer
 
 factorized:
   enabled: true
+  v62:
+    enabled: true
+    actor_hidden_dim: 256
+    actor_lr: 4.0e-5
+    critic_lr: 4.0e-5
+    residual_bound: 0.75
+    initial_gate_bias: -4.0
+    action_adapter:
+      target_altitude_agl_m: 1.0
+      altitude_kp: 0.8
+      vertical_velocity_kd: 0.15
+      maximum_vertical_action: 0.20
+  v63:
+    enabled: true
+    objective_version: factorized_dreamer_v6.3_competing_risk
+    event_hidden_dim: 256
+    clearance_hidden_dim: 256
+    explicit_human_geometry: false
+    # These heads are new at v6.3 migration and must not inherit the 1000-step
+    # warmup intended for the already-pretrained RSSM/world representation.
+    event_lr: 3.0e-4
+    safety_critic_hidden_dim: 256
+    safety_gamma: 1.0
+    # Initial imagination support matches the 10 Hz collection macro scale
+    # (0.05, 0.12, 0.03). It may expand only on the Actor-local update clock.
+    std_min: [0.01, 0.02, 0.005]
+    std_initial: [0.03, 0.06, 0.015]
+    std_max: [0.08, 0.16, 0.05]
+    std_schedule_steps: 5000
+    # A deterministic actuator state shared by collection and imagination.
+    # It smooths Actor targets; it never selects a direction or changes the
+    # reward and is therefore not a safety/planning layer.
+    action_smoothing:
+      enabled: false
+      time_step_s: 0.1
+      time_constant_s: 0.35
+      slew_rate_per_s: [1.2, 1.0, 0.45]
+    support_delta_limits: [0.05, 0.12, 0.03]
+    support_violation_limit: 0.10
+    # Inequality support around the factual action at the same posterior
+    # state. This constrains a drifting mode without forcing failure actions
+    # to be copied exactly.
+    behavior_mode_support_delta_limits: [0.15, 0.25, 0.10]
+    # Human collision is deliberately zero in task return; the episode-level
+    # probability constraint is its only Actor penalty.
+    task_event_rewards:
+      reached_goal: 100.0
+      static_collision: -120.0
+      other_task_terminal: -100.0
   # Kept as private_dim for Hydra/checkpoint compatibility; it now simply
   # means the normally encoded token dimension (there is no relation split).
   private_dim: 128
   goal_dim: 8
-  max_people: 20
+  # The scene may contain more people globally. This is the capacity of the
+  # deployable 6 m local Human observation, whose overflow is audited exactly.
+  max_people: 23
   num_joints: 12
   pose_history: 8
   human_feature_dim: 7
   human_root_dim: 10
   human_slot_reset: true
+
+  # Offline Actor training must remain inside the behavior distribution.
+  # First fit the demonstrated NavRL actions, then introduce only a small,
+  # gradual imagination objective.  Without this constraint both the 6k and
+  # 20k policies exploit model error with saturated vertical/lateral commands.
+  offline_actor:
+    # The learned task return and explicit safety constraint must not count
+    # human proximity twice. The raw recorded reward (including corridor/TTC
+    # shaping) remains a supervised diagnostic head, while Actor imagination
+    # composes its task reward from the interpretable component head below.
+    policy_reward_component_weights:
+      event: 1.0
+      progress: 1.0
+      human_clearance: 0.0
+      smoothness: 1.0
+      height: 1.0
+      time: 1.0
+    behavior_warmup_steps: 3000
+    policy_ramp_steps: 5000
+    # Offline-to-online Dreamer starts from a competent imitation policy, then
+    # lets imagined returns take over instead of permanently anchoring Actor to
+    # NavRL. Zero decay steps preserves the historical fixed-scale behavior.
+    behavior_clone_decay_steps: 0
+    behavior_clone_final_scale: 1.0
+    # BC is a non-negative Smooth-L1 mean over normalized action dimensions.
+    # This avoids the unbounded negative Gaussian NLL that previously made the
+    # total loss hard to interpret and let BC dominate every safety term.
+    behavior_clone_beta: 0.1
+    # Successful episodes can still contain centimetre-clearance near misses.
+    # Do not turn those individual transitions into positive BC targets.
+    # Match the closed-loop benchmark's intrusion boundary. A trajectory may
+    # reach the goal while briefly entering this tube; those transitions are
+    # useful risk examples, not positive actions for the Actor to imitate.
+    behavior_clone_min_clearance_m: 0.50
+    safety:
+      risk_horizon_s: 2.5
+      risk_hidden_dim: 256
+      # With the 50/25/25 sampler, roughly 10% of transitions are positive;
+      # 4x makes misses costly without letting positives dominate the BCE.
+      collision_positive_weight: 4.0
+      # Online calibration uses a separate optimizer and a dual replay view:
+      # uniform replay preserves probabilities, while a lower-weight balanced
+      # batch keeps rare collision precursors visible.
+      online_positive_weight_max: 8.0
+      online_calibration_scale: 1.0
+      online_balanced_scale: 0.5
+      # Safety regression focuses on the range where avoidance decisions
+      # change. Farther clearance is clipped instead of dominating the loss.
+      clearance_normalization_m: 2.0
+      # Danger and safe regression are normalized separately. A 1:1 group
+      # weight prevents either class frequency from controlling calibration.
+      clearance_danger_weight: 2.0
+      clearance_near_weight: 2.0
+      # Far/safe examples must retain enough mass to prevent the conservative
+      # collapse observed in v5 (2.894 m truth predicted as 0.47 m).
+      clearance_far_weight: 1.0
+      clearance_overestimate_weight: 3.0
+      clearance_safe_margin_m: 1.0
+      safe_clearance_m: 0.7
+      # Kept separate from the ground-truth label boundary so online
+      # calibration can adjust planning conservatism without relabeling data.
+      planning_safe_clearance_m: 0.7
+      clearance_temperature_m: 0.1
+      # Normalized by 2.15 m/s; 0.30 is about 0.65 m/s near people.
+      safe_forward_action: 0.30
+      imagination_collision_cost: 1.0
+      imagination_clearance_cost: 0.5
+      imagination_speed_cost: 0.25
+      return_lambda: 0.8
+      # Compare sampled futures from the same latent start. This removes state
+      # difficulty from the score-function baseline and gives causal action
+      # credit without differentiating through the frozen world model.
+      rollout_samples: 2
+      # Directional teacher used only on privileged-danger replay states.
+      # Commands are normalized: +/-0.35 vy is about +/-0.75 m/s and the
+      # counterfactual command is committed for 0.2 s, then the frozen Actor
+      # continues each branch for a total 1 s lookahead at recorded 10 Hz.
+      lateral_candidate_action: 0.35
+      lateral_candidate_slow_forward_action: 0.10
+      lateral_candidate_rollout_steps: 10
+      lateral_candidate_commit_steps: 2
+      lateral_candidate_collision_cost: 1.0
+      lateral_candidate_clearance_cost: 0.5
+      lateral_candidate_progress_cost: 0.25
+      # Closed-loop v12 showed repeated left/right candidate flips at 10 Hz
+      # with 0.05. A direction reversal must now provide a material safety
+      # gain rather than reacting to small frame-to-frame score noise.
+      lateral_candidate_action_change_cost: 0.20
+      lateral_candidate_min_score_margin: 0.01
+      lateral_candidate_min_hold_improvement: 0.02
+      # Lateral avoidance is local to an imminent pedestrian conflict. It is
+      # not a command to leave the crowd or fly along a warehouse wall.
+      lateral_candidate_local_clearance_m: 1.20
+      lateral_candidate_imminent_ttc_s: 1.50
+      lateral_candidate_geometry_steps: 5
+      lateral_candidate_step_duration_s: 0.10
+      # Center-to-joint proxy used where per-joint radii are unavailable:
+      # 0.17 m OmniNxt envelope + 0.08 m default human joint sphere.
+      lateral_candidate_surface_radius_m: 0.25
+      lateral_candidate_geometry_cost: 1.0
+      risk_counterfactual_scale: 0.5
+      # In open space follow the direct body-relative goal vector. Danger
+      # states are excluded and remain under the local candidate teacher.
+      goal_directed_forward_action: 0.42
+      goal_directed_lateral_action: 0.42
+      goal_directed_slow_radius_m: 3.0
+      goal_directed_deadband: 0.03
+      # Preserve lateral smoothness in open space while retaining 20% of that
+      # penalty in predicted danger, where rapid avoidance can be necessary.
+      danger_lateral_smoothness_scale: 0.20
+      online_planner:
+        # Closed-loop v14 showed the former 0.60 m / 0.25 thresholds reacted
+        # only about 1.6 s before contact. Enter caution earlier; the Actor can
+        # still steer laterally while forward speed is capped.
+        collision_trigger: 0.15
+        clearance_trigger_m: 0.80
+        # Hard stop at the former intervention threshold. The 302 v14
+        # regression showed that 0.10 normalized vx still covered 0.35 m
+        # after the first trigger and contacted a pedestrian's forearm.
+        emergency_collision_trigger: 0.25
+        emergency_clearance_m: 0.60
+        emergency_forward_action: 0.0
+        # Use the outer band only as a forward-speed governor.  The former
+        # 2.4 m band plus a fixed two-second extrapolation dominated the Actor
+        # in dense crowds and pushed otherwise valid routes toward the walls.
+        observed_caution_clearance_m: 1.8
+        observed_emergency_clearance_m: 1.0
+        # At the barrier target itself, live geometry is non-vetoable even if
+        # the learned risk head is under-confident.
+        observed_forced_escape_clearance_m: 0.70
+        # Once live geometry is this close, remove motion toward the nearest
+        # observed body capsule. Add explicit repulsion in the critical band.
+        observed_hard_stop_clearance_m: 0.50
+        observed_critical_clearance_m: 0.25
+        critical_repulsion_blend: 0.35
+        # Begin with a small 0.43 m/s sidestep and increase continuously to
+        # about 1.18 m/s only at critical clearance. This retains hard-contact
+        # recovery without replacing every near-crowd Actor action.
+        emergency_escape_min_action: 0.20
+        emergency_escape_action: 0.55
+        min_score_improvement: 0.03
+        # Until left/right counterfactual predictions are calibrated in
+        # closed loop, use imagined risk as a speed governor. It caps vx while
+        # retaining the Actor's vy/vz/yaw instead of executing noisy turns.
+        speed_governor: true
+      # First fit the new privileged risk head, then progressively let its
+      # detached-parameter prediction shape Actor actions.
+      warmup_steps: 100
+      ramp_steps: 400
+    selection_weights:
+      world: 1.0
+      action_mae: 4.0
+      forward_mae: 2.0
+      saturation: 4.0
+      unsafe_vertical: 8.0
+      risk_collision: 2.0
+      risk_clearance: 1.0
+      lateral_candidate: 0.5
+      goal_directed: 1.0
+      imagined_safety: 1.0
+      imagined_reward: 0.5
+      human_fde_5: 0.25
+      human_fde_10: 0.25
+      clearance_mae: 0.5
+
+  # Phase-two factual overshooting. Each rollout starts from a real posterior,
+  # then receives recorded actions but no future observations. One regular and
+  # one danger-prioritized start per sequence keep the gradient memory bounded.
+  overshooting:
+    enabled: true
+    horizons: [5, 10]
+    starts_per_sequence: 2
   ego_state_mean: null
   ego_state_std: null
 
@@ -69,11 +292,82 @@ loss_scales:
   ego_pred: 1.0
   yaw_unit: 0.1
   human_root: 1.0
+  human_velocity: 0.5
   human_mpjpe: 1.0
   human_presence: 0.2
+  human_birth: 0.05
+  # Start conservatively: measured raw Human FDE is roughly 0.43 m at h=5 and
+  # 0.78 m at h=10. These weights keep each new term below the existing joint
+  # world loss while making the longer, safety-critical rollout matter more.
+  human_overshoot_5: 0.5
+  human_overshoot_10: 0.75
+  # Articulated joint trajectories are an independent safety target.  They
+  # must be weighted explicitly because the trainer rejects any emitted loss
+  # that is absent from Hydra instead of silently dropping it.
+  human_joint_overshoot_1: 0.25
+  human_joint_overshoot_5: 0.5
+  human_joint_overshoot_10: 0.75
+  human_joint_overshoot_15: 1.0
+  human_gt_displacement_1: 0.25
+  human_gt_displacement_5: 0.5
+  human_gt_displacement_10: 0.75
+  human_gt_displacement_15: 1.0
+  ego_overshoot_1: 0.25
+  ego_overshoot_5: 0.5
+  ego_overshoot_10: 0.75
+  ego_overshoot_15: 1.0
+  human_joint_clearance_1: 0.25
+  human_joint_clearance_5: 0.5
+  human_joint_clearance_10: 0.75
+  human_joint_clearance_15: 1.0
   rew: 1.0
   con: 1.0
-  policy: 1.0
+  transition_event: 1.0
+  transition_event_balanced: 0.5
+  next_clearance: 1.0
+  next_clearance_false_safe: 1.0
+  next_clearance_false_danger: 0.25
+  risk_collision: 1.0
+  risk_clearance: 1.0
+  # Missing danger is more costly than conservative braking. Explicit
+  # boundary losses prevent aggregate clearance MAE from hiding either error.
+  risk_false_safe: 1.0
+  risk_false_danger: 0.25
+  risk_collision_overshoot_5: 0.5
+  risk_collision_overshoot_10: 0.75
+  risk_clearance_overshoot_5: 0.5
+  risk_clearance_overshoot_10: 0.75
+  risk_false_safe_overshoot_5: 0.5
+  risk_false_safe_overshoot_10: 0.75
+  risk_false_danger_overshoot_5: 0.125
+  risk_false_danger_overshoot_10: 0.1875
+  policy: 0.1
+  safety_value: 1.0
+  gate_teacher: 0.25
+  support_policy: 1.0
+  mode_support: 2.0
+  behavior_clone: 2.0
+  # The observational risk head cannot rank counterfactual actions reliably.
+  # Direct risk/barrier gradients are disabled; imagined state cost-to-go
+  # supplies causal credit through RSSM transitions instead.
+  safety_policy: 0.1
+  collision_risk: 0.0
+  clearance_barrier: 0.0
+  unsafe_speed: 1.0
+  replay_unsafe_speed: 2.0
+  # Zero by default for checkpoint compatibility; online Actor refinement
+  # enables it explicitly to prevent accumulated vertical-velocity drift.
+  vertical_action: 0.0
+  # Raw candidate regression is about 0.11 on the validation danger states;
+  # 0.25 keeps its weighted magnitude near the 2x behavior-cloning term.
+  lateral_candidate: 0.25
+  goal_directed: 0.50
+  action_smoothness: 0.05
   value: 1.0
   repval: 0.3
   rew_components: 0.2
+
+# The risk head sees deliberately rebalanced labels, so its AdamW state is
+# isolated from the joint LaProp optimizer used by the world model and policy.
+risk_lr: 1.0e-5
+risk_weight_decay: 1.0e-4

@@ -16,7 +16,9 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from modules.goal_conditioning import GOAL_FEATURE_DIM, goal_features_numpy
-from modules.skeleton_topology import hip_joint_indices
+from modules.skeleton_topology import (
+    COCO12_BODY_JOINT_COUNT, coco12_robust_root_numpy, hip_joint_indices,
+)
 
 try:
     from torch.utils.data import Dataset
@@ -181,7 +183,17 @@ def human_root_and_relative_joints_numpy(
     mean_pos = (xyz * weight).sum(axis=-2) / denom
     mean_vel = (velocity * weight).sum(axis=-2) / denom
     hips = hip_joint_indices(skel.shape[-2])
-    if hips is not None:
+    if skel.shape[-2] == COCO12_BODY_JOINT_COUNT:
+        root_pos = coco12_robust_root_numpy(xyz, jmask)
+        left_hip, right_hip = 6, 7
+        hips_valid = jmask[..., left_hip] & jmask[..., right_hip]
+        hip_pos = 0.5 * (xyz[..., left_hip, :] + xyz[..., right_hip, :])
+        hip_vel = 0.5 * (
+            velocity[..., left_hip, :] + velocity[..., right_hip, :])
+        robust_hips = hips_valid & (
+            np.linalg.norm(root_pos - hip_pos, axis=-1) <= 1.0e-5)
+        root_vel = np.where(robust_hips[..., None], hip_vel, mean_vel)
+    elif hips is not None:
         left_hip, right_hip = hips
         hips_valid = jmask[..., left_hip] & jmask[..., right_hip]
         hip_pos = 0.5 * (xyz[..., left_hip, :] + xyz[..., right_hip, :])
@@ -392,6 +404,62 @@ def validate_factorized_batch(batch: Mapping[str, np.ndarray]) -> None:
     for key in ("action", "reward"):
         if key in batch and not np.isfinite(np.asarray(batch[key])).all():
             raise ValueError(f"{key} contains NaN/Inf")
+    if "priv_collision_human_id" in batch:
+        collision_human_id = np.asarray(batch["priv_collision_human_id"])
+        if collision_human_id.shape != (t_len, 1):
+            raise ValueError("priv_collision_human_id must have shape [T,1]")
+    optional_shapes = {
+        "human_joint_measured": data.joint_mask.shape,
+        "human_joint_predicted": data.joint_mask.shape,
+        "measured_joint_target_valid": data.joint_mask.shape,
+        "measured_root_target_valid": data.human_mask.shape,
+        "measured_velocity_target_valid": data.human_mask.shape,
+        "human_motion_valid": data.human_mask.shape,
+        "human_survival_valid": data.human_mask.shape,
+        "human_survival_target": data.human_mask.shape,
+        "human_birth_target": data.human_mask.shape,
+        "human_birth_valid": data.human_mask.shape,
+        "human_persistence_mask": data.human_mask.shape,
+        "human_gt_id": data.human_mask.shape,
+        "human_gt_match_valid": data.human_mask.shape,
+        "human_gt_match_error_m": data.human_mask.shape,
+        "human_gt_match_confidence": data.human_mask.shape,
+        "human_gt_identity_id": data.human_mask.shape,
+        "human_gt_identity_valid": data.human_mask.shape,
+        "human_gt_identity_age_s": data.human_mask.shape,
+    }
+    for key, expected in optional_shapes.items():
+        if key in batch and np.asarray(batch[key]).shape != expected:
+            raise ValueError(f"{key} must have shape {expected}")
+    if "human_gt_identity_age_s" in batch:
+        identity_age = np.asarray(batch["human_gt_identity_age_s"])
+        if not np.isfinite(identity_age).all() or np.any(identity_age < 0.0):
+            raise ValueError(
+                "human_gt_identity_age_s must be finite and non-negative")
+    if "human_observation_quality" in batch:
+        quality = np.asarray(batch["human_observation_quality"])
+        if quality.shape != (*data.human_mask.shape, 7) or not np.isfinite(quality).all():
+            raise ValueError("human_observation_quality must be finite [T,N,7]")
+    for key in ("human_gt_pelvis_body", "human_gt_pelvis_episode"):
+        if key in batch:
+            value = np.asarray(batch[key])
+            if value.shape != (*data.human_mask.shape, 3) or not np.isfinite(value).all():
+                raise ValueError(f"{key} must be finite [T,N,3]")
+    if "measured_root_target" in batch:
+        root = np.asarray(batch["measured_root_target"])
+        if root.shape != (*data.human_mask.shape, 6) or not np.isfinite(root).all():
+            raise ValueError("measured_root_target must be finite [T,N,6]")
+    if "measured_joint_target" in batch:
+        joints_target = np.asarray(batch["measured_joint_target"])
+        if joints_target.shape != (*data.joint_mask.shape, 3) or not np.isfinite(joints_target).all():
+            raise ValueError("measured_joint_target must be finite [T,N,J,3]")
+    if "human_joint_measured" in batch and "human_joint_predicted" in batch:
+        measured = np.asarray(batch["human_joint_measured"], np.bool_)
+        predicted = np.asarray(batch["human_joint_predicted"], np.bool_)
+        if np.any(measured & predicted):
+            raise ValueError("a Human joint cannot be measured and predicted simultaneously")
+        if np.any((measured | predicted) & ~data.joint_mask):
+            raise ValueError("measurement provenance cannot mark an invalid joint")
 
 
 class FactorizedIsaacAdapter(Dataset):  # type: ignore[misc]

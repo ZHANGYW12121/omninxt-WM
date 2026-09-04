@@ -92,6 +92,9 @@ class RSSM(nn.Module):
         act = getattr(torch.nn, config.act)
         self._unimix_ratio = float(config.unimix_ratio)
         self._initial = str(config.initial)
+        if self._initial not in {"zeros", "learned"}:
+            raise ValueError(
+                "RSSM initial state must be either 'zeros' or 'learned'")
         self._device = torch.device(config.device)
         self._act_dim = act_dim
         self._obs_layers = int(config.obs_layers)
@@ -162,13 +165,37 @@ class RSSM(nn.Module):
             "img_net_lambda",
             LambdaLayer(lambda x: x.reshape(*x.shape[:-1], self._stoch, self._discrete)),
         )
+        # ``initial: learned`` is part of the configured Dreamer state
+        # contract. The previous implementation stored the option but always
+        # returned an all-zero deterministic and stochastic state. A zero
+        # stochastic tensor is outside the one-hot support used everywhere
+        # else by this RSSM, and repeated Human-slot resets drove that invalid
+        # state through zero-initialized Linear -> RMSNorm stacks. Learn the
+        # deterministic prior state and draw its categorical state from the
+        # same prior network used by imagination.
+        self._initial_deter = (
+            nn.Parameter(torch.zeros(self._deter, dtype=torch.float32))
+            if self._initial == "learned" else None
+        )
         self.apply(weight_init_)
 
-    def initial(self, batch_size):
+    def initial(self, batch_size, *, sample: bool = True):
         """Return an initial latent state."""
         # (B, D), (B, S, K)
-        deter = torch.zeros(batch_size, self._deter, dtype=torch.float32, device=self._device)
-        stoch = torch.zeros(batch_size, self._stoch, self._discrete, dtype=torch.float32, device=self._device)
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise ValueError("RSSM initial batch size must be positive")
+        if self._initial_deter is None:
+            deter = torch.zeros(
+                batch_size, self._deter, dtype=torch.float32,
+                device=self._device)
+            stoch = torch.zeros(
+                batch_size, self._stoch, self._discrete,
+                dtype=torch.float32, device=self._device)
+        else:
+            deter = torch.tanh(self._initial_deter).to(
+                device=self._device)[None].expand(batch_size, -1)
+            stoch, _ = self.prior(deter, sample=sample)
         return stoch, deter
 
     def observe(self, embed, action, initial, reset):
@@ -195,11 +222,21 @@ class RSSM(nn.Module):
             return {key: embed[key][:, index] for key in keys}
         return embed[:, index]
 
-    def obs_step(self, stoch, deter, prev_action, embed, reset):
+    def obs_step(
+        self, stoch, deter, prev_action, embed, reset, *, sample: bool = True,
+    ):
         """Single posterior step."""
         # (B, S, K), (B, D), (B, A), (B, E) or mapping of (B, E_i), (B,)
-        stoch = torch.where(rpad(reset, stoch.dim() - int(reset.dim())), torch.zeros_like(stoch), stoch)
-        deter = torch.where(rpad(reset, deter.dim() - int(reset.dim())), torch.zeros_like(deter), deter)
+        reset = reset.bool()
+        if bool(reset.any()):
+            initial_stoch, initial_deter = self.initial(
+                stoch.shape[0], sample=sample)
+            stoch = torch.where(
+                rpad(reset, stoch.dim() - int(reset.dim())),
+                initial_stoch.to(stoch), stoch)
+            deter = torch.where(
+                rpad(reset, deter.dim() - int(reset.dim())),
+                initial_deter.to(deter), deter)
         prev_action = torch.where(
             rpad(reset, prev_action.dim() - int(reset.dim())), torch.zeros_like(prev_action), prev_action
         )
@@ -220,26 +257,31 @@ class RSSM(nn.Module):
         # (B, S, K)
         logit = self._obs_net(x)
 
-        # Sample discrete stochastic state via straight-through Gumbel-Softmax.
+        # Training samples the categorical posterior through straight-through
+        # Gumbel-Softmax. Deterministic deployment must instead use its mode;
+        # selecting only the Actor mean while still sampling this state made
+        # supposedly fixed closed-loop evaluations depend on process RNG.
         # (B, S, K)
-        stoch = self.get_dist(logit).rsample()
+        distribution = self.get_dist(logit)
+        stoch = distribution.rsample() if sample else distribution.mode
         return stoch, deter, logit
 
-    def img_step(self, stoch, deter, prev_action):
+    def img_step(self, stoch, deter, prev_action, *, sample: bool = True):
         """Single prior step (no observation)."""
 
         # (B, D)
         deter = self._deter_net(stoch, deter, prev_action)
         # (B, S, K)
-        stoch, _ = self.prior(deter)
+        stoch, _ = self.prior(deter, sample=sample)
         return stoch, deter
 
-    def prior(self, deter):
+    def prior(self, deter, *, sample: bool = True):
         """Compute prior distribution parameters and sample stoch."""
 
         # (B, S, K)
         logit = self._img_net(deter)
-        stoch = self.get_dist(logit).rsample()
+        distribution = self.get_dist(logit)
+        stoch = distribution.rsample() if sample else distribution.mode
         return stoch, logit
 
     def imagine_with_action(self, stoch, deter, actions):
@@ -269,8 +311,12 @@ class RSSM(nn.Module):
 
     def kl_loss(self, post_logit, prior_logit, free):
         kld = dists.kl
-        rep_loss = kld(post_logit, prior_logit.detach()).sum(-1)
-        dyn_loss = kld(post_logit.detach(), prior_logit).sum(-1)
+        rep_loss = kld(
+            post_logit, prior_logit.detach(), self._unimix_ratio,
+        ).sum(-1)
+        dyn_loss = kld(
+            post_logit.detach(), prior_logit, self._unimix_ratio,
+        ).sum(-1)
         # Clipped gradients are not backpropagated using torch.clip.
         rep_loss = torch.clip(rep_loss, min=free)
         dyn_loss = torch.clip(dyn_loss, min=free)

@@ -1,0 +1,487 @@
+defaults:
+  - factorized_dreamer
+  - _self_
+
+# v7.8 implements the learned deterministic prior plus a categorical initial
+# stochastic state, restores both on resets, and uses posterior modes for
+# deterministic evaluation while collection/training keep sampled states.
+rssm:
+  initial: learned
+
+# Clean scheme-one implementation.  The factorized encoder/RSSM, skeleton
+# contract, altitude adapter and stateful smoothing are unchanged.  These
+# values are consumed only by pure_dreamer/trainer.py.
+pure_dreamer:
+  objective_version: factorized_pure_dreamer_v67_action_exogenous_human_trajectory
+  amp_dtype: ${..amp_dtype}
+  imagination_horizon: 15
+  # Keep the 128-trajectory compute envelope, but spend it on independent
+  # replay states.  The v48 64x2 antithetic layout reduced conditional state
+  # coverage and learned the audited retreat/following shortcut even though
+  # the World ranked forward+lateral alternatives higher on most CPA rows.
+  max_imagination_starts: 128
+  # Preserve coverage of the sparse collision windows with and without enough
+  # measured actuator response time. Per-start importance weights restore the
+  # uniform valid-replay-state Dreamer expectation exactly; labels never enter
+  # the Actor state, reward, or deployment path.
+  actionable_collision_start_target: 16
+  imminent_collision_start_target: 16
+  # Collision is still 1.5--2.5 seconds away: this is where a smooth
+  # lateral-plus-forward pass remains physically achievable.
+  preemptive_collision_start_target: 16
+  near_goal_start_target: 16
+  near_goal_start_distance_m: 5.0
+  # Sample exact in-bounds states before either lateral or yMax escape. This
+  # is deployable geometry and changes compute allocation, not the objective.
+  near_boundary_start_target: 16
+  near_boundary_start_clearance_m: 1.5
+  # One ordinary reparameterized sample per independent state is standard
+  # stochastic Dreamer and doubles conditional coverage at unchanged rollout
+  # count. Deployment remains the same stochastic Actor distribution.
+  actor_imagination_samples: 1
+  imagination_window_burn_in: 8
+  discount: 0.997
+  return_lambda: 0.95
+  actor_entropy: 3.0e-4
+  # tanh(4)=0.999329 already reaches the actuator extreme while preserving a
+  # >=1.34e-3 local derivative. Larger logits only destroy Dreamer gradients.
+  actor_pre_tanh_abs_max_limit: 4.0
+  # The bounded mean is invertible, so an actuator-extreme optimum can still
+  # make Adam grow its otherwise redundant raw logit forever.  The v56
+  # replay-calibrated head moved the audited seed-6032 forward raw mean from
+  # 9.54 to 5.52 without changing its action, but ordinary Dreamer updates
+  # drove it back to 8.79 by step 8750.  Penalize only raw magnitude beyond
+  # the calibrated support: raw=6 already maps to a 0.994 normalized command,
+  # so this preserves useful speed while keeping failure-state pathwise
+  # gradients reachable.  This is numerical policy-parameter headroom, not a
+  # behavior label, risk target, MPC term, or deployment-time intervention.
+  actor_raw_pre_tanh_soft_limit: 6.0
+  actor_raw_pre_tanh_headroom_scale: 3.0e-3
+  # Audited 10 Hz replay lies inside approximately [-121,101]. This wide
+  # margin rejects model exploitation instead of silently clipping gradients.
+  imagined_reward_abs_max_limit: 150.0
+  imagined_explicit_human_event: true
+  # Replay has no positive PhysX static-contact transitions. Keep that learned
+  # classifier diagnostic-only. The conservative preinflated AABBs instead
+  # define an explicit analytic forbidden-set terminal shared by Isaac and
+  # imagination, plus terminal-aware potential shaping outside the set.
+  imagined_learned_static_event: false
+  # Known applied-action kinematics are more accurate than the learned Ego
+  # residual on the audited h15/collision distributions.  The RSSM and Ego
+  # heads remain trained, but task return uses this differentiable structured
+  # state until a learned residual beats the analytic baseline.
+  authoritative_analytic_ego: true
+  require_multistep_geometry_supervision: true
+  progress_weight_per_m: 2.0
+  max_progress_speed_mps: 3.0
+  # Radius affects reward/termination but is not an Actor input. Keep it a
+  # validated global task constant so identical states never alias two MDPs.
+  goal_radius_m: 1.0
+  # This replay covers one-way warehouse traversals: takeoff at the lower
+  # staging strip and a random point in the upper goal strip.  Goal features
+  # can interpolate within these generator bounds; reverse/arbitrary goals
+  # are a different task and must be rejected until represented in replay.
+  task_goal_world_x_min_m: -3.0
+  task_goal_world_x_max_m: 4.0
+  task_goal_world_y_min_m: 27.0
+  task_goal_world_y_max_m: 29.0
+  task_initial_world_x_min_m: -3.0
+  task_initial_world_x_max_m: 4.0
+  task_initial_world_y_min_m: -8.5
+  task_initial_world_y_max_m: -5.0
+  # Valid nonterminal replay maximum is 3.0712 m/s. This explicit invariant
+  # yields a 4.65 m h15 boundary/static reachable-set lookahead instead of the
+  # old single-axis 3.225 m underestimate.
+  task_maximum_horizontal_speed_mps: 3.1
+  human_clearance_weight_per_sec: 4.0
+  human_hard_clearance_m: 0.10
+  human_safe_clearance_m: 0.70
+  human_predictive_safe_clearance_m: 0.90
+  human_ttc_horizon_s: 2.5
+  human_corridor_half_width_m: 0.75
+  human_corridor_lookahead_m: 4.0
+  drone_collision_radius_m: 0.17
+  pelvis_collision_radius_m: 0.14
+  # Serialized PhysX contactOffset on every Human joint sphere. Imagined
+  # Human termination is the first swept learned-joint contact with this
+  # exact shell; the learned Event classifier remains diagnostic/world-only.
+  human_collision_contact_offset_m: 0.02
+  # v86 measured about 0.03 m mean false-safe bias and 0.23 m one-sided h15
+  # p95 clearance error. A 0.07 m logistic residual scale exposes
+  # P(true PhysX contact | learned swept gap) to the standard Dreamer return.
+  human_collision_prediction_bias_m: 0.03
+  human_collision_prediction_scale_m: 0.07
+  # Recursive false-safe distance grows from h1 to h15. Treat that as model
+  # uncertainty; the physical Human radii/contact rule remain unchanged.
+  human_collision_prediction_bias_growth_m_per_step: 0.004
+  imagination_dt_s: 0.10
+  # Exact warehouse floor coordinate. Legacy replay is normalized in memory
+  # from the old raised-support/closest-hit AGL into this task frame.
+  task_static_ground_z_world: 0.0
+  # Crash termination depends on this threshold, but it is intentionally not
+  # an episode-varying Actor input. Reject replay/environment drift instead.
+  task_crash_altitude_world_m: 0.15
+  # Exact simulator predictive Human envelope:
+  # 0.90 m safe surface gap + 0.17 m UAV + 0.14 m pelvis.
+  route_cross_track_tolerance_m: 1.21
+  # Same reward/metre as factual progress; used in a discounted potential.
+  route_potential_scale: 2.0
+  # Potential shaping telescopes and cannot by itself make staying near the
+  # traversal route part of the optimized task. Outside the exact 1.21 m
+  # Human-avoidance allowance, charge two reward units per metre-second. This
+  # equals the factual two reward units per metre of goal progress: a one-metre
+  # detour may be worthwhile briefly for safety, but not indefinitely.
+  route_deviation_weight_per_m_per_sec: 2.0
+  # v83 learned alternating saturated yaw circles because the first 1.5 s of
+  # an arc still makes progress while the factual yaw cost is only ~0.02 over
+  # the complete imagination horizon.  This bounded state potential makes
+  # turning away from the exact point goal visible inside h15 and rewards
+  # recovery toward it.  It is terminal-aware imagined shaping, not an action
+  # target, runtime override, planner, or second policy branch.
+  route_heading_potential_scale: 8.0
+  # Keep the exact out-of-bounds event, but charge time spent inside its H15
+  # reachable band instead of a refundable discounted potential. The old
+  # potential returned positive reward at an absorbing boundary terminal.
+  # Two reward units/second at the wall remains small beside the exact -60
+  # boundary Event and +100 goal Event, while exposing a pre-exit gradient.
+  boundary_proximity_weight_per_sec: 2.0
+  static_proxy_clearance_margin_m: 1.0
+  static_proxy_potential_scale: 2.0
+  cruise_height_m: 1.0
+  height_tolerance_m: 0.15
+  height_scale_m: 0.50
+  height_weight_per_sec: 0.5
+  time_cost_per_sec: 0.10
+  acceleration_weight_per_sec: 0.15
+  acceleration_scale_mps2: 3.0
+  jerk_weight_per_sec: 0.10
+  jerk_scale_mps3: 10.0
+  yaw_rate_weight_per_sec: 0.05
+  yaw_rate_scale_rps: 1.5
+  smooth_term_clip: 4.0
+  acceleration_filter_alpha: 0.25
+  # Replay begins only after takeoff validation. Crash is therefore immediate;
+  # the five-second eligibility below applies to stuck detection alone.
+  crash_min_elapsed_s: 0.0
+  watchdog_min_elapsed_s: 5.0
+  watchdog_no_progress_timeout_s: 30.0
+  watchdog_progress_epsilon_m: 0.25
+  watchdog_stuck_max_horizontal_speed_mps: 0.15
+  # World-model-only h15 continuous-action supervision. Each update retains
+  # one early-warning start and one minimum-gap start, and fits the exact
+  # task-terminal-censored swept geometry consumed by Actor return in addition
+  # to endpoint pose. The five trajectories are supervised World probes only;
+  # none is an Actor target or online candidate search. Unit scale keeps this
+  # task-critical loss comparable to the other selected World losses.
+  counterfactual_safety_aux_scale: 1.0
+  # A global two-start top-k repeatedly supervised only the most severe rows
+  # when several replay windows contained an h15 danger.  The step-3600
+  # collision audit then measured a 0.174 m factual false-safe bias and found
+  # three consecutive late reactions.  Four starts first cover distinct
+  # sequences at their earliest warning source, then spend any remainder on
+  # severity.  This remains a World-only variance/coverage change; Actor
+  # training is still the standard joint Dreamer dynamics gradient.
+  counterfactual_safety_max_starts: 4
+  # V65's unnormalized mean + CVaR lowered average false-safe bias but made
+  # clearance/return ordering worse and increased the worst false-safe error.
+  # Keep the original ranking coefficient fixed: 75% population mean plus
+  # 25% equal-per-state worst-quartile risk. The historical `_scale` name is
+  # retained for checkpoint/config stability and now denotes the tail blend.
+  counterfactual_pairwise_cvar_fraction: 0.25
+  counterfactual_pairwise_cvar_scale: 0.25
+  # Human observations live in the moving UAV body frame, so the Human RSSM
+  # still needs action. In the simulator, however, pedestrians do not react
+  # to UAV commands. After transforming predictions back into the fixed
+  # episode frame, all counterfactual candidates therefore share one
+  # root/joint trajectory. This symmetric World-only consistency term prevents
+  # clearance learning from fitting candidate-specific fictitious limbs.
+  counterfactual_human_exogeneity_scale: 1.0
+  counterfactual_lateral_policy: 0.50
+  counterfactual_fast_forward_policy: 0.65
+  counterfactual_mild_forward_policy: 0.20
+  # The learned Human Event head is factual World calibration/diagnostics,
+  # not the Actor's counterfactual terminal. Keep its natural replay NLL
+  # population optimum; Actor/Critic use learned articulated rollouts plus the
+  # deterministic swept PhysX contact rule above.
+  rare_event_aux_scale: 0.0
+  rare_reward_aux_scale: 0.25
+  rare_event_focal_gamma: 2.0
+  rare_event_class_weights: [1.0, 8.0, 4.0, 2.0, 2.0]
+  world_lr: 3.0e-4
+  actor_lr: 4.0e-5
+  critic_lr: 4.0e-5
+  world_weight_decay: 0.0
+  actor_weight_decay: 0.0
+  critic_weight_decay: 0.0
+  # The common ceiling remains part of the checkpoint contract.  Separate
+  # shock caps keep one recurrent Human outlier from rotating the World/Actor
+  # update while leaving their observed steady gradient bands untouched.
+  grad_clip: 100.0
+  world_grad_clip: 50.0
+  actor_grad_clip: 5.0
+  critic_grad_clip: 100.0
+  slow_value_fraction: 0.02
+  # Production pure-Dreamer loss ownership. Keep every emitted loss explicit
+  # in the resolved run config and checkpoint hash; model.loss_scales belongs
+  # to the historical trainer and is intentionally not inherited here.
+  world_loss_scales:
+    dyn_ego: 1.0
+    rep_ego: 0.1
+    dyn_human: 1.0
+    rep_human: 0.1
+    ego_recon: 1.0
+    ego_pred: 0.0
+    yaw_unit: 0.1
+    human_root: 1.0
+    human_velocity: 0.5
+    human_mpjpe: 1.0
+    human_presence: 0.2
+    human_birth: 0.05
+    human_overshoot_1: 0.25
+    human_overshoot_5: 0.5
+    human_overshoot_10: 0.75
+    human_overshoot_15: 1.0
+    # Per-sample regret prevents the learned recursive root trajectory from
+    # becoming worse than the causal constant-velocity reference.  V61 uses
+    # privileged source-relative pelvis displacement rather than the noisy
+    # detector root as this World-only target; it is never a deployment input
+    # or fallback prediction.
+    human_cv_regret_1: 0.25
+    human_cv_regret_5: 0.5
+    human_cv_regret_10: 0.75
+    human_cv_regret_15: 1.0
+    human_joint_overshoot_1: 0.25
+    human_joint_overshoot_5: 0.5
+    human_joint_overshoot_10: 0.75
+    human_joint_overshoot_15: 1.0
+    human_gt_displacement_1: 0.25
+    human_gt_displacement_5: 0.5
+    human_gt_displacement_10: 0.75
+    human_gt_displacement_15: 1.0
+    ego_overshoot_1: 0.25
+    ego_overshoot_5: 0.5
+    ego_overshoot_10: 0.75
+    ego_overshoot_15: 1.0
+    human_joint_clearance_1: 0.25
+    human_joint_clearance_5: 0.5
+    human_joint_clearance_10: 0.75
+    human_joint_clearance_15: 1.0
+    # Actual contact rows are extremely sparse inside the ordinary clearance
+    # mean. Give their false-safe tail its own normalized loss so one contact
+    # cannot be diluted by hundreds of non-contact rollout rows.
+    human_joint_collision_tail_1: 0.25
+    human_joint_collision_tail_5: 0.5
+    human_joint_collision_tail_10: 0.75
+    human_joint_collision_tail_15: 1.0
+    rew: 1.0
+    rew_components: 0.2
+    con: 1.0
+    # The compatibility five-class head is frozen. The deployable Human
+    # hazard is the identity-attributed noisy-OR geometry likelihood below;
+    # non-Human task events are analytic in the Actor return. The residual
+    # static head is factual world-model supervision/diagnostics only; replay
+    # static collisions are valid and do not change that return contract.
+    transition_event: 0.0
+    transition_human_geometry: 1.0
+    transition_non_human_event: 1.0
+    next_clearance: 1.0
+    next_clearance_false_safe: 1.0
+    next_clearance_false_danger: 0.25
+
+# Unlike the generic unbounded-reward default, this task has an audited
+# finite return support. Decode the Critic as E[raw return]; symlog's
+# symexp(E[symlog return]) suppresses low-probability catastrophic terminals
+# and made the 1.5 s bootstrap nearly blind to future collision/boundary cost.
+critic:
+  shape: [255]
+  dist:
+    name: linear_twohot
+    bin_num: 255
+    low: -256.0
+    high: 256.0
+
+factorized:
+  # Goal8 mixes metres and dimensionless directions. Fixed scales preserve
+  # remaining-distance magnitude instead of normalizing it per sample.
+  goal_metric_scaling: true
+  ego_metric_scaling: true
+  # Fixed physical scaling replaces the information-destroying samplewise
+  # LayerNorm used by older per-person root encoders.
+  human_root_metric_scaling: true
+  human_quality_metric_scaling: true
+  v62:
+    enabled: true
+    # One ordinary Dreamer Actor reads Goal, authoritative Ego/task metadata,
+    # coupled joint state and complete explicit Human geometry. There is no
+    # gate-times-residual product and no asymmetric partial-state reflection.
+    unified_policy: true
+    # The raw mean remains one ordinary full-state Actor output. Softly bound
+    # its Normal location before the action tanh: tanh(3)=0.995 already spans
+    # the actuator, while avoiding the unbounded emergency logits that made
+    # the v92 learner fail at step 3083 on a genuine 0.066 m Human gap.
+    # The v55 bound was introduced after the already-trained output head had
+    # developed raw logits as large as 18.  Although its algebraic derivative
+    # never became exactly zero, failure-state raw->action derivatives still
+    # fell below 3e-4.  The v56 checkpoint migration regresses this same
+    # unified head onto its old bounded means, then uses the slightly wider
+    # 3.3 contract.  Current actions are preserved while the logits are
+    # recentered and the rare saturated-state Dreamer gradient is restored.
+    pre_tanh_mean_bound: 3.3
+    # The historical inner tanh rounded to an exact +/-3 under bfloat16 once
+    # raw logits exceeded about 10.5, silently zeroing the Actor gradient in
+    # the very failure states that needed correction. This algebraic bound has
+    # the same finite range and unit local slope, but a strictly positive,
+    # polynomially decaying derivative computed in float32.
+    pre_tanh_mean_parameterization: algebraic_sqrt
+    critic_full_state: true
+    # Entity order is not physical state. Shared masked encoders make both
+    # Actor and Critic invariant to Human/obstacle slot permutations and keep
+    # padded capacity exactly inert.
+    permutation_invariant_entities: true
+    decision_entity_encoder_contract: clearance_cpa_exact_interaction_context_query_v3
+    initial_gate_bias: 0.0
+    human_conditioned_residual: false
+    human_reflection_equivariant: false
+    # Preserve every configured perception slot. Per person the direct state
+    # is Root10 + Quality7 + lifecycle + signed clearance + COCO12 x
+    # [valid,xyz,vxyz] = 103 fields. Each person also keeps its aligned 116-D
+    # learned motion/history suffix, after the contiguous 2369-D physical
+    # prefix; no global pool may erase body-to-intent association.
+    human_physical_slots: 23
+    human_physical_fields_per_slot: 103
+    human_physical_presence_state: true
+    # The return uses exact world bounds, the altitude ceiling and conservative
+    # static AABBs. Expose all recorder/deployment slots directly instead of
+    # asking eight rays or an RSSM token to reconstruct omitted obstacles.
+    task_physical_obstacle_slots: 256
+    # The coupled Ego RSSM is allowed to attend to Humans for prediction, but
+    # that makes its so-called private Ego token Human-dependent.  Build the
+    # Actor's goal/Ego branch from the measured (or analytically imagined)
+    # Ego14 state instead, so Human influence has exactly one auditable route:
+    # the explicit unified full-state policy input below.
+    authoritative_ego_token: true
+    # Preserve Ego14, geometry8 and memory9 as three independent exact blocks;
+    # summing their projections is not an injective complete-state encoding.
+    direct_ego_task_state: true
+  v63:
+    enabled: true
+    deterministic_evaluation_state: true
+    explicit_human_geometry: true
+    explicit_joint_kinematics: true
+    explicit_human_presence_physical: true
+    # The Event transition likelihood receives the same exact per-person
+    # articulated fields as Actor/Critic instead of relying on a nearest-joint
+    # scalar plus an opaque latent.
+    event_full_articulated_state: true
+    # Keep every person's learned motion/history suffix aligned with its 103
+    # exact physical fields. A global pool cannot identify which learned
+    # intent belongs to which articulated body.
+    actor_full_learned_per_slot: true
+    direct_task_geometry: true
+    # Explicit history variables close the Markov state for crash/stuck and
+    # the filtered-acceleration smoothness reward. They are replay-derived,
+    # recursively imagined and maintained by the deployment runtime.
+    task_memory: true
+    direct_task_memory: true
+    analytic_task_memory_events: true
+    # Ten signed-gap-sorted people each expose root xy/vxy, persistent
+    # existence, signed sphere gap, and nearest articulated sphere
+    # xyz/velocity: 120/128 exact physical dimensions, plus an eight-dimensional
+    # learned population suffix.
+    geometry_topk_physical_slots: 10
+    # A smooth sigmoid scale makes std genuinely state-dependent and trainable.
+    # v89-v92 instead hard-clamped every axis to a shrinking schedule cap; at
+    # step 3050 all samples were exactly [0.0687,0.1181,0.0731] and the std
+    # head had zero clamp gradient.  The v51 3000->3250 same-state audit found
+    # that the deterministic mean improved while lateral/yaw std expanded by
+    # 57%/47%, producing slow loops and both x/y boundary failures in the exact
+    # stochastic collection policy.  Keep the learned smooth distribution,
+    # but bound those two axes to the empirical step-3000 operating envelope.
+    std_parameterization: learned_bounded
+    std_min: [0.03, 0.05, 0.02]
+    # With reachable-interval action coordinates these values reproduce the
+    # approximate executed initial perturbation scale of the former
+    # alpha-filtered target distribution without a clamp dead zone.
+    std_initial: [0.25, 0.2722222222, 0.3672413793]
+    std_max: [0.30, 0.30, 0.40]
+    # Identified exclusively from the 35,552 valid transitions in the
+    # manifest's 301 train episodes. Training re-hashes those exact numeric
+    # inputs against configs/data/pure_dreamer_analytic_ego_formal_v4.json before any
+    # optimizer step; validation/test episodes cannot tune this Actor-return
+    # dynamics model.
+    analytic_ego_velocity_response:
+      [0.12493031982083251, 0.12591422103206915, 0.15295344121428722]
+    # Train-only OLS ARX attitude response under the same input fingerprint.
+    # Rows are [bias, roll, pitch, forward action, left action,
+    # forward velocity, left velocity]; columns are next roll/pitch.
+    analytic_ego_attitude_coefficients:
+      - [-0.0006541756170943833, -0.0009621963586703529]
+      - [ 0.8170982846142882,    -0.07310315615514394]
+      - [ 0.01689415760887306,    0.8883319829810087]
+      - [-0.061443421941449326,  -0.0032278865807951495]
+      - [-0.01993252777157044,   -0.04645001563900564]
+      - [ 0.025002969849140303,  -0.0012451754954564684]
+      - [ 0.008649108419148972,   0.023552820005860998]
+    task_event_rewards:
+      human_collision: -120.0
+      stuck_timeout: -20.0
+    action_smoothing:
+      enabled: true
+      time_step_s: 0.1
+      # v104's former tau=0.35 s and horizontal slew=[1.2,1.0]/s left
+      # only 54% of a lateral velocity step realized after the complete h15
+      # Actor horizon. The policy therefore learned to postpone contact with
+      # braking before a lateral command could become physically effective.
+      # The identified vehicle loop remains the authoritative 0.75 s-scale
+      # physical response; this software target filter now preserves 80% of
+      # the complete horizontal step response inside h15. Yaw slew remains
+      # unchanged so this repair does not reopen the historical yaw-circle
+      # failure.
+      time_constant_s: 0.10
+      slew_rate_per_s: [3.0, 3.0, 0.45]
+      # Actor output is an absolute normalized velocity/yaw-rate target. The
+      # differentiable rational limiter is mean-reverting, slew-bounded, and
+      # keeps a positive reversal gradient at exact +/-1 command bounds.
+      parameterization: soft_absolute_target
+  overshooting:
+    enabled: true
+    human_only: true
+    collision_tail_regret: true
+    horizons: [1, 5, 10, 15]
+    starts_per_sequence: 2
+    # Privileged simulator identity/displacement is a world-only target.  It
+    # is never exposed to Actor/Critic, but the current task replay must carry
+    # it so occlusion/perception bias cannot masquerade as Human dynamics.
+    require_gt_displacement_labels: true
+  human_dynamics:
+    kinematic_velocity_only: true
+    # Train-only audits separate pelvis translation from articulated motion.
+    # 0.70 m/s per nominal 100 ms covers >99% of stable measured root-velocity
+    # targets and about 92% of simulator-GT displacement corrections while
+    # retaining a bounded pedestrian-acceleration prior. The head scales this
+    # bound by actual exposure on force-written terminal rows.
+    max_velocity_residual_mps: 0.70
+    # Train-only GT root speed peaks at 1.88 m/s; the simulator controller can
+    # reach at most about 2.30 m/s including group catch-up.  This vector-norm
+    # cap prevents recursive residual accumulation without clipping supported
+    # pedestrian motion.
+    max_root_speed_mps: 2.50
+    # Every joint follows the same exact frame transform and measured velocity
+    # baseline. The shared Human latent learns only bounded per-joint velocity
+    # corrections integrated over actual dt; zero initialization is exactly
+    # constant velocity.
+    kinematic_joint_velocity_only: true
+    # The former 0.35 cap excluded 69.3% of measured next-joint position
+    # corrections and structurally collapsed learned articulation toward CV.
+    # 1.50 covers roughly the train-only 95th-percentile per-axis limb
+    # correction; remaining outliers stay bounded and are judged by the fixed
+    # GT-clearance/CV holdout rather than fitted by an unbounded decoder.
+    max_joint_velocity_residual_mps: 1.50
+    # The train-only articulated finite-difference distribution has a 99.9th
+    # percentile below 4.7 m/s.  Six m/s preserves that support while ruling
+    # out an h15 rollout that accelerates every joint without bound.
+    max_joint_speed_mps: 6.00
+    # CV remains reported side by side in audits. It must not be hidden inside
+    # the optimized return via min(learned,CV), which changes model semantics
+    # and can route gradients through a different world than the one reported.
+    conservative_cv_clearance: false

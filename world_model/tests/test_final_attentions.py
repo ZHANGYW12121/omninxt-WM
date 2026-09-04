@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import torch
+from torch import nn
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -44,6 +45,34 @@ class FinalAttentionTest(unittest.TestCase):
         torch.testing.assert_close(out["joint_feat"], changed["joint_feat"])
         self.assertEqual(out["goal_token"].shape, (2, 16))
         self.assertEqual(out["latent_tokens"].shape[1], 3 + human.shape[1])
+
+    def test_metric_goal_path_preserves_remaining_distance(self):
+        torch.manual_seed(9)
+        model = ActionTokenLatentAttention(
+            20, 20, 8,
+            LatentPolicyAttentionConfig(
+                model_dim=16, num_heads=4, dropout=0.0,
+                goal_metric_scaling=True),
+        ).eval()
+        self.assertIsInstance(model.goal_projector, nn.Linear)
+        goal = torch.tensor([
+            [5.0, 0.0, 0.0, 5.0, 1.0, 0.0, 0.0, 0.0],
+            [20.0, 0.0, 0.0, 20.0, 1.0, 0.0, 0.0, 0.0],
+        ])
+        output = model(
+            goal,
+            torch.zeros(2, 20),
+            torch.zeros(2, 1, 20),
+            torch.zeros(2, 1, dtype=torch.bool),
+        )
+        torch.testing.assert_close(
+            output["private_goal_token"][:, :8],
+            goal / model.goal_metric_scale,
+        )
+        self.assertGreater(float(
+            torch.linalg.vector_norm(
+                output["private_goal_token"][0]
+                - output["private_goal_token"][1])), 1.0e-4)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,12 @@ from .compact_skeleton_v3 import (
     derive_relative_joint_velocity,
     discover_compact_episodes,
 )
+from .episode_splits import (
+    EpisodeSplitManifest,
+    episode_seed,
+    load_episode_split_manifest,
+    split_compact_dataset_windows,
+)
 
 __all__ = [
     "ACTION_KEYS",
@@ -60,4 +66,8 @@ __all__ = [
     "CompactSkeletonV3Dataset",
     "derive_relative_joint_velocity",
     "discover_compact_episodes",
+    "EpisodeSplitManifest",
+    "episode_seed",
+    "load_episode_split_manifest",
+    "split_compact_dataset_windows",
 ]

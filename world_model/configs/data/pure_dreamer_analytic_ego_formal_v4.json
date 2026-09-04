@@ -1,0 +1,75 @@
+{
+  "schema": "omninxt.analytic-ego.train-only.v1",
+  "transition_selection": "episode-source-to-destination.applied-action-destination.v1",
+  "fit_method": "bounded_least_squares_first_order_velocity_and_ols_arx_attitude",
+  "nominal_dt_s": 0.1,
+  "split_manifest_name": "pure_dreamer_prospective_seed_1200_5264_v4",
+  "split_manifest_sha256": "2fc79ad4aeb9a3c1eaaafb0120ab2dfad3e4dafb363de09b9feb6b56fb1ff664",
+  "split_evaluation_protocol": "prospective_actor_independent_validation_v2",
+  "training_seed_count": 301,
+  "training_seed_sha256": "4efd8aca01df844a6b55387bc7e9e90275e214a69c19287dd942a3b06c8afca1",
+  "transition_count": 35552,
+  "transition_sha256": "770146f216cd9e4b3c2141a6c1b425c325d23b63bb64bb4f24d049bc973ac2c8",
+  "dt_range_s": [
+    0.01600000075995922,
+    0.11200000531971455
+  ],
+  "velocity_response": [
+    0.12493031982083251,
+    0.12591422103206915,
+    0.15295344121428722
+  ],
+  "attitude_coefficients": [
+    [
+      -0.0006541756170943833,
+      -0.0009621963586703529
+    ],
+    [
+      0.8170982846142882,
+      -0.07310315615514394
+    ],
+    [
+      0.01689415760887306,
+      0.8883319829810087
+    ],
+    [
+      -0.061443421941449326,
+      -0.0032278865807951495
+    ],
+    [
+      -0.01993252777157044,
+      -0.04645001563900564
+    ],
+    [
+      0.025002969849140303,
+      -0.0012451754954564684
+    ],
+    [
+      0.008649108419148972,
+      0.023552820005860998
+    ]
+  ],
+  "fit_metrics": {
+    "velocity_source_heading_rmse_mps": [
+      0.11423016586127084,
+      0.14665243637935813,
+      0.022964334279036606
+    ],
+    "attitude_nominal_target_rmse_rad": [
+      0.009479870008043996,
+      0.009391292517798076
+    ]
+  },
+  "prospective_holdout_audit": {
+    "workspace_metadata_maximum_seen_seed": 5064,
+    "validation_seed_range": [
+      5065,
+      5114
+    ],
+    "test_seed_range": [
+      5115,
+      5264
+    ],
+    "audited_before_holdout_collection": true
+  }
+}

@@ -11,11 +11,35 @@ sys.path.insert(0, str(ROOT))
 
 from modules.factorized_encoders import (
     FactorizedEncoderConfig, FactorizedObservationEncoder,
+    HumanRootPoseEncoder,
     root_and_root_relative_joints,
 )
 
 
 class FactorizedEncoderTest(unittest.TestCase):
+    def test_metric_root_scaling_preserves_absolute_distance_and_speed(self):
+        torch.manual_seed(3)
+        encoder = HumanRootPoseEncoder(FactorizedEncoderConfig(
+            model_dim=16,
+            human_hidden_dim=24,
+            human_root_metric_scaling=True,
+        ))
+        first = torch.tensor(
+            [1.0, -0.5, 0.8, 0.2, -0.1, 0.0, 0.4, 0.5, 1.7, 0.9])
+        # Samplewise LayerNorm maps positive affine transforms to the same row.
+        second = 2.0 * first + 3.0
+        torch.testing.assert_close(
+            torch.nn.functional.layer_norm(first, (10,)),
+            torch.nn.functional.layer_norm(second, (10,)),
+            rtol=3.0e-5,
+            atol=3.0e-5,
+        )
+        metric_first = first / encoder.root_metric_scale
+        metric_second = second / encoder.root_metric_scale
+        self.assertFalse(torch.equal(metric_first, metric_second))
+        self.assertFalse(torch.equal(
+            encoder.root(metric_first), encoder.root(metric_second)))
+
     def test_coco12_root_uses_body_hip_indices(self):
         skeleton = torch.zeros(1, 1, 1, 12, 7)
         skeleton[..., 6] = 1.0

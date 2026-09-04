@@ -15,6 +15,10 @@ class LatentPolicyAttentionConfig:
     num_layers: int = 1
     ff_mult: int = 4
     dropout: float = 0.0
+    # Goal8 contains metric deltas/distance together with unit directions.
+    # A samplewise LayerNorm over those heterogeneous fields can make two
+    # different remaining distances unnecessarily hard to distinguish.
+    goal_metric_scaling: bool = False
 
 
 class _LatentAttentionBlock(nn.Module):
@@ -56,7 +60,23 @@ class ActionTokenLatentAttention(nn.Module):
         self.config = config or LatentPolicyAttentionConfig()
         d = self.config.model_dim
         self.goal_dim = int(goal_dim)
-        self.goal_projector = nn.Sequential(nn.LayerNorm(self.goal_dim), nn.Linear(self.goal_dim, d))
+        self.goal_metric_scaling = bool(self.config.goal_metric_scaling)
+        if self.goal_metric_scaling:
+            if self.goal_dim != 8:
+                raise ValueError("fixed metric Goal scaling requires Goal8")
+            if d < self.goal_dim:
+                raise ValueError(
+                    "metric Goal token must fit the eight physical fields")
+            # [dx_body,dy_body,dz,distance,unit_xyz,heading/pi].  These scales
+            # cover the current warehouse routes without mixing physical
+            # magnitudes with dimensionless direction fields.
+            self.register_buffer("goal_metric_scale", torch.tensor((
+                40.0, 40.0, 3.0, 50.0, 1.0, 1.0, 1.0, 1.0,
+            )))
+            self.goal_projector = nn.Linear(self.goal_dim, d)
+        else:
+            self.goal_projector = nn.Sequential(
+                nn.LayerNorm(self.goal_dim), nn.Linear(self.goal_dim, d))
         self.ego_projector = nn.Sequential(nn.LayerNorm(ego_dim), nn.Linear(ego_dim, d))
         self.human_projector = nn.Sequential(nn.LayerNorm(human_dim), nn.Linear(human_dim, d))
         self.action_token = nn.Parameter(torch.empty(1, 1, d))
@@ -82,13 +102,35 @@ class ActionTokenLatentAttention(nn.Module):
             raise ValueError("human_feat/mask must be [B,N,D]/[B,N]")
         b = ego_feat.shape[0]
         action = self.action_token.to(ego_feat).expand(b, -1, -1)
-        goal_token = self.goal_projector(goal)
+        goal_input = goal.float()
+        if self.goal_metric_scaling:
+            goal_input = (
+                goal_input / self.goal_metric_scale.to(goal_input)
+            ).clamp(-5.0, 5.0)
+        goal_token = self.goal_projector(goal_input)
         ego_token = self.ego_projector(ego_feat)
         human_tokens = self.human_projector(human_feat)
         action = action + self.modality_embedding[0].to(action)
         goal_token = goal_token + self.modality_embedding[1].to(goal_token)
         ego_token = ego_token + self.modality_embedding[2].to(ego_token)
         human_tokens = human_tokens + self.modality_embedding[3].to(human_tokens)
+        # Preserve private Goal/Ego readouts before dense Human attention.  The
+        # goal branch of the factorized Actor consumes these two tensors, while
+        # interaction-aware tokens remain available to avoidance and all world
+        # heads.  Cloning is unnecessary: the attention blocks are functional
+        # and do not mutate their inputs in-place.
+        private_goal_token = self.final_norm(goal_token)
+        if self.goal_metric_scaling:
+            # The Actor/Critic private Goal token must retain exact remaining
+            # distance and signed body-frame deltas. A learned projection
+            # followed by LayerNorm alone can still attenuate those magnitudes.
+            # Reserve the prefix exactly, mirroring the explicit Human/task
+            # geometry contract; the remaining dimensions stay learned.
+            private_goal_token = torch.cat((
+                goal_input,
+                private_goal_token[..., self.goal_dim:],
+            ), -1)
+        private_ego_token = self.final_norm(ego_token)
         tokens = torch.cat((action, goal_token, ego_token, human_tokens), dim=1)
         mask = torch.cat((
             torch.ones(b, 3, dtype=torch.bool, device=tokens.device), human_mask.bool(),
@@ -103,6 +145,8 @@ class ActionTokenLatentAttention(nn.Module):
             "joint_feat": output[:, 0],
             "goal_token": output[:, 1],
             "ego_token": output[:, 2],
+            "private_goal_token": private_goal_token[:, 0],
+            "private_ego_token": private_ego_token[:, 0],
             "human_tokens": output[:, 3:],
             "latent_tokens": output,
             "latent_mask": mask,
